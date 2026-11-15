@@ -32,6 +32,28 @@ summary; [benchmarks.md](benchmarks.md) is the authoritative measurement record.
 If this plan changes a documented kernel contract, update the owning document
 in the same change.
 
+### 1.2 Implementation status (2026-11-15)
+
+| Stage | Status | Evidence |
+| --- | --- | --- |
+| A1-A3 | Implemented | Recurrent chunk 551 → 67.6 ms |
+| A4 | Not needed | A1-A3 met the 150 ms gate |
+| B1-B2 | Partially implemented | 64x64/K64 tile for wide rows; chunk GEMM 944 → 895 ms before fusion |
+| B3 | Rejected | M-first CTA order regressed the chunk total |
+| B4 | Rejected | FP16 and INT8 WMMA issue at the same rate; kernel is not operand bound |
+| B5 gate/up | Implemented | Chunk 994 → 938 ms; 512-token 515.9 → 549.8 tok/s |
+| B5 other fusions | Not started | Lower priority; no measured case after B4 |
+| C1-C2 | Implemented | Position-7680 attention 2030 → 643 ms |
+| C3 | Measured, not default | F16 KV 657.5 ms vs F32 643.1 ms at position 7680 |
+| C4 | Not used | Native tile path met the F32 gate; no rocWMMA attention |
+| D | Implemented | Path names, per-op profile, no autotuner |
+
+The full 512-token chunk is 938 ms wall at position 0, down from 1553 ms. The
+512-token prefill rate is 549.8 tok/s, the 8192 rate is 412.6 tok/s, and the
+32768 rate is 209.3 tok/s. The 450 ms step-4 chunk target and the 250 tok/s
+32768 target are not met; the remaining gap is the GEMM kernel structure, not
+the stages implemented here.
+
 ## 2. Baseline attribution
 
 ### 2.1 Measurement conditions
