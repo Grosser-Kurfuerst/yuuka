@@ -175,10 +175,20 @@ The main design axes to benchmark:
 Q4_0 and Q5_0 use 32-value blocks. Q4_0 stores one FP16 scale and sixteen packed
 nibble bytes; values are `d * (q - 8)`. Q5_0 adds a four-byte high-bit plane;
 values are `d * (q - 16)`. Both are supported by the CPU reference, single and
-batched HIP GEMV, embedding, and WMMA prefill. Q4_1/Q5_1 and the IQ families are
-still capability failures.
+batched HIP GEMV, embedding, and WMMA prefill.
 
-### 5.5 Precision
+### 5.5 IQ2 and IQ3 reference support
+
+The CPU reference dequantizes `IQ2_XXS`, `IQ2_S`, and `IQ3_S` blocks with the
+ggml codebooks and sign tables. `IQ2_XXS` and `IQ3_S` derive sub-block scales
+from packed auxiliary words; `IQ2_S` uses one 4-bit scale pair per 32 values.
+`tensor.DequantizeRow` and `tensor.Matrix.MatVec` use the same block decoders,
+so the reference path never expands a whole model to FP16. These types are not
+implemented in HIP kernels yet; a HIP plan rejects them during validation.
+`Q4_1`, `Q5_1`, `Q2_K`, `Q3_K`, `Q8_K`, `IQ1`, `IQ2_XS`, `IQ3_XXS`, `IQ4_NL`,
+and `IQ4_XS` remain capability failures.
+
+### 5.6 Precision
 
 For FP16/BF16 inputs, accumulate in FP32 unless a measured, documented
 tradeoff justifies otherwise. Quantization scales and mins must be applied

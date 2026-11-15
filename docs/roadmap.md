@@ -396,6 +396,13 @@ NPU support is a future task and is intentionally not part of Phase 5; see
 - Q4_0 and Q5_0 are supported by the GGUF reader, CPU reference, HIP GEMV,
   embedding, and WMMA GEMM. Q4_1/Q5_1/Q2_K/Q3_K/quantized K-cache remain
   unsupported.
+- `qwen35moe` adds a CPU reference path for the Qwen3.6 hybrid MoE layout:
+  routed experts with top-k routing plus a sigmoid-gated shared expert. The
+  path is validated on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf against llama.cpp greedy
+  tokens. HIP execution for this architecture remains open.
+- `IQ2_XXS`, `IQ2_S`, and `IQ3_S` are supported by the GGUF reader and CPU
+  reference dequantization/MatVec. The HIP backend rejects them explicitly and
+  has no IQ kernels yet.
 
 ### Risks and dependencies
 

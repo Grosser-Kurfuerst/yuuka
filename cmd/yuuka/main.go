@@ -118,7 +118,7 @@ func load(path string) (*loadedModel, error) {
 	}
 	loaded := &loadedModel{reader: r, tokenizer: tok, arch: arch}
 	switch arch {
-	case qwen35.Architecture:
+	case qwen35.Architecture, qwen35.MoEArchitecture:
 		loaded.qwen, err = qwen35.Load(r)
 	case dense.Llama, dense.Qwen3, dense.Qwen3MoE:
 		loaded.dense, err = dense.Load(r)
@@ -190,13 +190,21 @@ func runInspect(args []string) error {
 		cfg := l.qwen.Config
 		fmt.Printf("layers: %d (full_attention=%d, recurrent=%d)\n",
 			cfg.BlockCount, len(cfg.FullAttentionLayers()), cfg.BlockCount-len(cfg.FullAttentionLayers()))
-		fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
+		if cfg.IsMoE() {
+			fmt.Printf("hidden: %d  vocab: %d\n", cfg.HiddenSize, cfg.VocabSize)
+		} else {
+			fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
+		}
 		fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d\n",
 			cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim)
 		fmt.Printf("ssm: conv=%d state=%d groups=%d time_step_rank=%d inner=%d\n",
 			cfg.SSMConvKernel, cfg.SSMStateSize, cfg.SSMGroupCount, cfg.SSMTimeStepRank, cfg.SSMInnerSize)
 		fmt.Printf("context: %d  rms_eps: %g  rope_base: %g\n",
 			cfg.ContextLength, cfg.RMSNormEps, cfg.RoPEFreqBase)
+		if cfg.IsMoE() {
+			fmt.Printf("moe: experts=%d used=%d expert_ffn=%d shared_ffn=%d\n",
+				cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNSize, cfg.SharedFFNSize)
+		}
 	} else {
 		cfg := l.dense.Config
 		fmt.Printf("layers: %d (dense full attention)\n", cfg.BlockCount)
@@ -279,7 +287,7 @@ func runGenerate(args []string) error {
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
 	topP := fs.Float64("top-p", 0.95, "nucleus sampling cutoff")
 	seed := fs.Int64("seed", 0, "sampling seed")
-	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 and qwen3moe HIP: f32, f16, or q8_0")
+	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 CPU/HIP, qwen35moe CPU, and qwen3moe HIP: f32, f16, or q8_0")
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
@@ -383,7 +391,7 @@ func runBench(args []string) error {
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
-	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 and qwen3moe HIP: f32, f16, or q8_0")
+	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 CPU/HIP, qwen35moe CPU, and qwen3moe HIP: f32, f16, or q8_0")
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")

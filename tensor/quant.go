@@ -49,6 +49,12 @@ func DequantizeRow(dst []float32, dtype DType, src []byte) error {
 		dequantizeQ5K(dst, src)
 	case Q6_K:
 		dequantizeQ6K(dst, src)
+	case IQ2XXS:
+		dequantizeIQ2XXS(dst, src)
+	case IQ2S:
+		dequantizeIQ2S(dst, src)
+	case IQ3S:
+		dequantizeIQ3S(dst, src)
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedDType, dtype)
 	}
@@ -147,6 +153,107 @@ func dequantizeQ5K(dst []float32, src []byte) {
 			}
 			ql = ql[32:]
 			is += 2
+		}
+	}
+}
+
+// dequantizeIQ2XXS expands one 256-value IQ2_XXS block. The codebook and sign
+// tables are shared with the ggml reference implementation.
+func dequantizeIQ2XXS(dst []float32, src []byte) {
+	d := Float16ToFloat32(binary.LittleEndian.Uint16(src))
+	for ib32 := 0; ib32 < 8; ib32++ {
+		base := 2 + 8*ib32
+		aux0 := binary.LittleEndian.Uint32(src[base:])
+		aux1 := binary.LittleEndian.Uint32(src[base+4:])
+		db := d * (0.5 + float32(aux1>>28)) * 0.25
+		for l := 0; l < 4; l++ {
+			grid := iq2xxs_grid[(aux0>>(8*l))&0xff]
+			signs := ksigns_iq2xs[(aux1>>(7*l))&127]
+			out := ib32*32 + l*8
+			for j := 0; j < 8; j++ {
+				sign := float32(1)
+				if signs&(1<<uint(j)) != 0 {
+					sign = -1
+				}
+				dst[out+j] = db * float32(uint8(grid>>(8*j))) * sign
+			}
+		}
+	}
+}
+
+// dequantizeIQ2S expands one 256-value IQ2_S block.
+func dequantizeIQ2S(dst []float32, src []byte) {
+	d := Float16ToFloat32(binary.LittleEndian.Uint16(src))
+	qs := src[2:66]
+	qh := src[66:74]
+	scales := src[74:82]
+	signs := qs[32:64]
+	for ib32 := 0; ib32 < 8; ib32++ {
+		db0 := d * (0.5 + float32(scales[ib32]&0xf)) * 0.25
+		db1 := d * (0.5 + float32(scales[ib32]>>4)) * 0.25
+		for l := 0; l < 4; l++ {
+			idx := uint16(qs[4*ib32+l]) | ((uint16(qh[ib32]) << (8 - 2*l)) & 0x300)
+			grid := iq2s_grid[idx]
+			signsByte := signs[4*ib32+l]
+			db := db0
+			if l >= 2 {
+				db = db1
+			}
+			out := ib32*32 + l*8
+			for j := 0; j < 8; j++ {
+				sign := float32(1)
+				if signsByte&(1<<uint(j)) != 0 {
+					sign = -1
+				}
+				dst[out+j] = db * float32(uint8(grid>>(8*j))) * sign
+			}
+		}
+	}
+}
+
+// dequantizeIQ3S expands one 256-value IQ3_S block.
+func dequantizeIQ3S(dst []float32, src []byte) {
+	d := Float16ToFloat32(binary.LittleEndian.Uint16(src))
+	qs := src[2:66]
+	qh := src[66:74]
+	signs := src[74:106]
+	scales := src[106:110]
+	for ib32 := 0; ib32 < 8; ib32 += 2 {
+		db1 := d * (1 + 2*float32(scales[ib32/2]&0xf))
+		db2 := d * (1 + 2*float32(scales[ib32/2]>>4))
+		qsOff := ib32 * 8
+		signsOff := ib32 * 4
+		qhOff := ib32
+		for half := 0; half < 2; half++ {
+			db := db1
+			if half == 1 {
+				db = db2
+			}
+			for l := 0; l < 4; l++ {
+				idx1 := uint16(qs[qsOff+2*l]) | ((uint16(qh[qhOff]) << (8 - 2*l)) & 256)
+				idx2 := uint16(qs[qsOff+2*l+1]) | ((uint16(qh[qhOff]) << (7 - 2*l)) & 256)
+				grid1 := iq3s_grid[idx1]
+				grid2 := iq3s_grid[idx2]
+				signsByte := signs[signsOff+l]
+				out := ib32*32 + half*32 + l*8
+				for j := 0; j < 4; j++ {
+					sign := float32(1)
+					if signsByte&(1<<uint(j)) != 0 {
+						sign = -1
+					}
+					dst[out+j] = db * float32(uint8(grid1>>(8*j))) * sign
+				}
+				for j := 0; j < 4; j++ {
+					sign := float32(1)
+					if signsByte&(1<<uint(j+4)) != 0 {
+						sign = -1
+					}
+					dst[out+j+4] = db * float32(uint8(grid2>>(8*j))) * sign
+				}
+			}
+			qhOff++
+			qsOff += 8
+			signsOff += 4
 		}
 	}
 }
@@ -341,6 +448,12 @@ func (m Matrix) matmulRows(dst, x []float32, batch int, rowStart, rowEnd int64, 
 						dequantizeQ5K(values[:], block[:176])
 					case Q6_K:
 						dequantizeQ6K(values[:], block[:210])
+					case IQ2XXS:
+						dequantizeIQ2XXS(values[:], block[:66])
+					case IQ2S:
+						dequantizeIQ2S(values[:], block[:82])
+					case IQ3S:
+						dequantizeIQ3S(values[:], block[:110])
 					}
 					for i := 0; i < 256; i++ {
 						sum += xb[off+i] * values[i]

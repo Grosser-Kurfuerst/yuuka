@@ -1,5 +1,6 @@
-// Package qwen35 implements the Qwen3.5 dense hybrid decoder: gated delta-net
-// linear-attention layers interleaved with full GQA attention layers.
+// Package qwen35 implements the Qwen3.5/Qwen3.6 hybrid decoder: gated delta-net
+// linear-attention layers interleaved with full GQA attention layers. The
+// qwen35moe variant replaces the dense FFN with routed and shared experts.
 package qwen35
 
 import (
@@ -9,9 +10,12 @@ import (
 	"github.com/yuuka-ai/yuuka/gguf"
 )
 
-const Architecture = "qwen35"
+const (
+	Architecture    = "qwen35"
+	MoEArchitecture = "qwen35moe"
+)
 
-// Config is the validated runtime configuration for one Qwen3.5 model.
+// Config is the validated runtime configuration for one Qwen3.5/Qwen3.6 model.
 type Config struct {
 	Architecture          string
 	BlockCount            int
@@ -33,6 +37,12 @@ type Config struct {
 	SSMTimeStepRank       int
 	SSMInnerSize          int
 	FullAttentionInterval int
+	// MoE fields are set only for qwen35moe. ExpertFFNSize is one routed
+	// expert's SwiGLU width; SharedFFNSize is the shared expert's width.
+	ExpertCount     int
+	ExpertUsedCount int
+	ExpertFFNSize   int
+	SharedFFNSize   int
 }
 
 // LoadConfig reads and validates Qwen3.5 hyperparameters from GGUF metadata.
@@ -41,8 +51,8 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if arch != Architecture {
-		return nil, fmt.Errorf("model architecture %q is not %q", arch, Architecture)
+	if arch != Architecture && arch != MoEArchitecture {
+		return nil, fmt.Errorf("model architecture %q is not %q or %q", arch, Architecture, MoEArchitecture)
 	}
 	if value, ok := r.MetadataValue(arch + ".rope.scaling.type"); ok {
 		if err := validateRoPEScaling(arch+".rope.scaling.type", value); err != nil {
@@ -50,6 +60,7 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 		}
 	}
 	cfg := &Config{Architecture: arch}
+	metaKey := func(name string) string { return arch + "." + name }
 	intKey := func(key string) (int, error) {
 		value, err := r.Int(key)
 		if err != nil {
@@ -67,66 +78,83 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 		}
 		return value, nil
 	}
-	if cfg.BlockCount, err = intKey("qwen35.block_count"); err != nil {
+	if cfg.BlockCount, err = intKey(metaKey("block_count")); err != nil {
 		return nil, err
 	}
-	if cfg.ContextLength, err = intKey("qwen35.context_length"); err != nil {
+	if cfg.ContextLength, err = intKey(metaKey("context_length")); err != nil {
 		return nil, err
 	}
-	if cfg.HiddenSize, err = intKey("qwen35.embedding_length"); err != nil {
+	if cfg.HiddenSize, err = intKey(metaKey("embedding_length")); err != nil {
 		return nil, err
 	}
-	if cfg.FFNSize, err = intKey("qwen35.feed_forward_length"); err != nil {
+	if arch == MoEArchitecture {
+		if cfg.ExpertCount, err = intKey(metaKey("expert_count")); err != nil {
+			return nil, err
+		}
+		if cfg.ExpertUsedCount, err = intKey(metaKey("expert_used_count")); err != nil {
+			return nil, err
+		}
+		if cfg.ExpertFFNSize, err = loadExpertFFNSize(r, metaKey("expert_feed_forward_length")); err != nil {
+			return nil, err
+		}
+		if _, ok := r.MetadataValue(metaKey("expert_shared_feed_forward_length")); ok {
+			if cfg.SharedFFNSize, err = intKey(metaKey("expert_shared_feed_forward_length")); err != nil {
+				return nil, err
+			}
+		} else {
+			cfg.SharedFFNSize = cfg.ExpertFFNSize
+		}
+	} else if cfg.FFNSize, err = intKey(metaKey("feed_forward_length")); err != nil {
 		return nil, err
 	}
-	if cfg.HeadCount, err = intKey("qwen35.attention.head_count"); err != nil {
+	if cfg.HeadCount, err = intKey(metaKey("attention.head_count")); err != nil {
 		return nil, err
 	}
-	if cfg.KVHeadCount, err = intKey("qwen35.attention.head_count_kv"); err != nil {
+	if cfg.KVHeadCount, err = intKey(metaKey("attention.head_count_kv")); err != nil {
 		return nil, err
 	}
-	if cfg.HeadDim, err = intKey("qwen35.attention.key_length"); err != nil {
+	if cfg.HeadDim, err = intKey(metaKey("attention.key_length")); err != nil {
 		return nil, err
 	}
-	if cfg.ValueDim, err = intKey("qwen35.attention.value_length"); err != nil {
+	if cfg.ValueDim, err = intKey(metaKey("attention.value_length")); err != nil {
 		return nil, err
 	}
-	if cfg.RoPEDim, err = intKey("qwen35.rope.dimension_count"); err != nil {
+	if cfg.RoPEDim, err = intKey(metaKey("rope.dimension_count")); err != nil {
 		return nil, err
 	}
-	if cfg.RoPEFreqBase, err = floatKey("qwen35.rope.freq_base"); err != nil {
+	if cfg.RoPEFreqBase, err = floatKey(metaKey("rope.freq_base")); err != nil {
 		return nil, err
 	}
-	eps, err := floatKey("qwen35.attention.layer_norm_rms_epsilon")
+	eps, err := floatKey(metaKey("attention.layer_norm_rms_epsilon"))
 	if err != nil {
 		return nil, err
 	}
 	cfg.RMSNormEps = float32(eps)
-	if cfg.SSMConvKernel, err = intKey("qwen35.ssm.conv_kernel"); err != nil {
+	if cfg.SSMConvKernel, err = intKey(metaKey("ssm.conv_kernel")); err != nil {
 		return nil, err
 	}
-	if cfg.SSMStateSize, err = intKey("qwen35.ssm.state_size"); err != nil {
+	if cfg.SSMStateSize, err = intKey(metaKey("ssm.state_size")); err != nil {
 		return nil, err
 	}
-	if cfg.SSMGroupCount, err = intKey("qwen35.ssm.group_count"); err != nil {
+	if cfg.SSMGroupCount, err = intKey(metaKey("ssm.group_count")); err != nil {
 		return nil, err
 	}
-	if cfg.SSMTimeStepRank, err = intKey("qwen35.ssm.time_step_rank"); err != nil {
+	if cfg.SSMTimeStepRank, err = intKey(metaKey("ssm.time_step_rank")); err != nil {
 		return nil, err
 	}
-	if cfg.SSMInnerSize, err = intKey("qwen35.ssm.inner_size"); err != nil {
+	if cfg.SSMInnerSize, err = intKey(metaKey("ssm.inner_size")); err != nil {
 		return nil, err
 	}
-	if cfg.FullAttentionInterval, err = intKey("qwen35.full_attention_interval"); err != nil {
+	if cfg.FullAttentionInterval, err = intKey(metaKey("full_attention_interval")); err != nil {
 		return nil, err
 	}
-	if value, ok := r.MetadataValue("qwen35.rope.dimension_sections"); ok {
+	if value, ok := r.MetadataValue(metaKey("rope.dimension_sections")); ok {
 		sections, err := value.AsInts()
 		if err != nil {
-			return nil, fmt.Errorf("qwen35.rope.dimension_sections: %w", err)
+			return nil, fmt.Errorf("%s: %w", metaKey("rope.dimension_sections"), err)
 		}
 		if len(sections) != 4 {
-			return nil, fmt.Errorf("qwen35.rope.dimension_sections has %d entries, want 4", len(sections))
+			return nil, fmt.Errorf("%s has %d entries, want 4", metaKey("rope.dimension_sections"), len(sections))
 		}
 		for i, s := range sections {
 			if s < 0 || s > 1<<20 {
@@ -141,7 +169,7 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 			return nil, fmt.Errorf("tokenizer.ggml.tokens: %w", err)
 		}
 		cfg.VocabSize = len(tokens)
-	} else if cfg.VocabSize, err = intKey("qwen35.vocab_size"); err != nil {
+	} else if cfg.VocabSize, err = intKey(metaKey("vocab_size")); err != nil {
 		return nil, fmt.Errorf("vocabulary size is unavailable")
 	}
 	if err := cfg.validate(); err != nil {
@@ -163,6 +191,41 @@ func validateRoPEScaling(name string, value gguf.Value) error {
 	default:
 		return fmt.Errorf("%s %q is not supported", name, text)
 	}
+}
+
+// loadExpertFFNSize reads a scalar or per-layer expert width. The runtime
+// currently requires every layer to use the same width.
+func loadExpertFFNSize(r *gguf.Reader, key string) (int, error) {
+	value, ok := r.MetadataValue(key)
+	if !ok {
+		return 0, fmt.Errorf("missing required metadata %s", key)
+	}
+	var size int
+	if value.Type == gguf.MetaArray {
+		widths, err := value.AsInts()
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", key, err)
+		}
+		if len(widths) == 0 {
+			return 0, fmt.Errorf("%s is empty", key)
+		}
+		size = int(widths[0])
+		for i, width := range widths {
+			if width != widths[0] {
+				return 0, fmt.Errorf("%s varies at layer %d", key, i)
+			}
+		}
+	} else {
+		raw, err := value.AsInt()
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", key, err)
+		}
+		size = int(raw)
+	}
+	if size <= 0 || size > 1<<31 {
+		return 0, fmt.Errorf("%s has invalid value %d", key, size)
+	}
+	return size, nil
 }
 
 func (c *Config) validate() error {
@@ -190,11 +253,28 @@ func (c *Config) validate() error {
 	if c.SSMConvKernel < 2 {
 		return fmt.Errorf("invalid ssm conv kernel %d", c.SSMConvKernel)
 	}
+	if c.IsMoE() {
+		if c.ExpertUsedCount <= 0 || c.ExpertUsedCount > c.ExpertCount {
+			return fmt.Errorf("expert used count %d is outside 1..%d",
+				c.ExpertUsedCount, c.ExpertCount)
+		}
+		if c.ExpertFFNSize <= 0 {
+			return fmt.Errorf("invalid expert feed-forward size %d", c.ExpertFFNSize)
+		}
+		if c.SharedFFNSize <= 0 {
+			return fmt.Errorf("invalid shared expert feed-forward size %d", c.SharedFFNSize)
+		}
+	} else if c.FFNSize <= 0 {
+		return fmt.Errorf("invalid feed-forward size %d", c.FFNSize)
+	}
 	if c.ContextLength <= 0 || c.VocabSize <= 0 {
 		return fmt.Errorf("invalid context or vocabulary size")
 	}
 	return nil
 }
+
+// IsMoE reports whether the model uses routed and shared expert FFN layers.
+func (c *Config) IsMoE() bool { return c.ExpertCount > 0 }
 
 // IsRecurrent reports whether layer uses gated delta-net linear attention.
 func (c *Config) IsRecurrent(layer int) bool {

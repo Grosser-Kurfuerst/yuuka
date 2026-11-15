@@ -29,11 +29,18 @@ type scratch struct {
 	gdn     []float32
 	ffnGate []float32
 	ffnUp   []float32
-	scores  []float32
-	sk      []float32
-	d       []float32
-	kvRow   []float32
-	logits  []float32
+	router  []float32
+	// MoE scratch is populated only for qwen35moe.
+	expertGate    []float32
+	expertUp      []float32
+	expertOut     []float32
+	expertIDs     []int32
+	expertWeights []float32
+	scores        []float32
+	sk            []float32
+	d             []float32
+	kvRow         []float32
+	logits        []float32
 }
 
 // State holds the per-request block table, recurrent convolution/state tensors,
@@ -148,6 +155,15 @@ func NewPagedState(cfg *Config, pool *KVPool, table *memory.Table, capacity int)
 		d:       make([]float32, cfg.SSMStateSize),
 		kvRow:   make([]float32, cfg.KVHeadCount*cfg.HeadDim),
 		logits:  make([]float32, cfg.VocabSize),
+	}
+	if cfg.IsMoE() {
+		width := max(cfg.ExpertFFNSize, cfg.SharedFFNSize)
+		st.scratch.router = make([]float32, cfg.ExpertCount)
+		st.scratch.expertGate = make([]float32, width)
+		st.scratch.expertUp = make([]float32, width)
+		st.scratch.expertOut = make([]float32, cfg.HiddenSize)
+		st.scratch.expertIDs = make([]int32, cfg.ExpertUsedCount)
+		st.scratch.expertWeights = make([]float32, cfg.ExpertUsedCount)
 	}
 	return st, nil
 }

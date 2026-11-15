@@ -44,6 +44,7 @@ func TestConfigValidate(t *testing.T) {
 		{"zero attention interval", func(c *Config) { c.FullAttentionInterval = 0 }},
 		{"ssm inner mismatch", func(c *Config) { c.SSMInnerSize = 8 }},
 		{"short conv kernel", func(c *Config) { c.SSMConvKernel = 1 }},
+		{"zero feed-forward", func(c *Config) { c.FFNSize = 0 }},
 		{"zero context", func(c *Config) { c.ContextLength = 0 }},
 		{"zero vocabulary", func(c *Config) { c.VocabSize = 0 }},
 	}
@@ -53,6 +54,47 @@ func TestConfigValidate(t *testing.T) {
 			tc.mutate(&cfg)
 			if err := cfg.validate(); err == nil {
 				t.Fatal("invalid config was accepted")
+			}
+		})
+	}
+}
+
+func TestMoEConfigValidate(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Architecture = MoEArchitecture
+	cfg.FFNSize = 0
+	cfg.ExpertCount = 4
+	cfg.ExpertUsedCount = 2
+	cfg.ExpertFFNSize = 16
+	cfg.SharedFFNSize = 16
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("valid MoE config: %v", err)
+	}
+	if !cfg.IsMoE() {
+		t.Fatal("MoE config was not detected")
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"zero experts", func(c *Config) { c.ExpertCount = 0 }},
+		{"used exceeds experts", func(c *Config) { c.ExpertUsedCount = 5 }},
+		{"zero used", func(c *Config) { c.ExpertUsedCount = 0 }},
+		{"zero expert width", func(c *Config) { c.ExpertFFNSize = 0 }},
+		{"zero shared width", func(c *Config) { c.SharedFFNSize = 0 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validTestConfig()
+			cfg.Architecture = MoEArchitecture
+			cfg.FFNSize = 0
+			cfg.ExpertCount = 4
+			cfg.ExpertUsedCount = 2
+			cfg.ExpertFFNSize = 16
+			cfg.SharedFFNSize = 16
+			tc.mutate(&cfg)
+			if err := cfg.validate(); err == nil {
+				t.Fatal("invalid MoE config was accepted")
 			}
 		})
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func validateMatrix(name string, matrix tensor.Matrix) error {
-	if !matrix.DType.Supported() {
+	if !matrix.DType.HIPSupported() {
 		return fmt.Errorf("tensor %q uses unsupported HIP dtype %s", name, matrix.DType)
 	}
 	if _, err := matrix.DType.RowBytes(matrix.Cols); err != nil {
@@ -24,6 +24,9 @@ func validateMatrix(name string, matrix tensor.Matrix) error {
 func validateModelSupport(model *qwen35.Model) error {
 	if model == nil || model.Config == nil {
 		return fmt.Errorf("nil model")
+	}
+	if model.Config.IsMoE() {
+		return fmt.Errorf("HIP backend does not implement %q yet", model.Config.Architecture)
 	}
 	if err := validateMatrix("token_embd.weight", model.Embedding); err != nil {
 		return err

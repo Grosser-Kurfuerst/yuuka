@@ -70,7 +70,7 @@ Implementation mapping:
 | Request state machine, sampling, stops, prefix insertion | `serving` |
 | Admission, continuous batching, timeouts, lifecycle metrics | `scheduler` |
 | Block allocator, block table, reference counting, prefix cache | `memory` |
-| CPU model execution | `model/qwen35`, `serving.Qwen35Backend` |
+| CPU model execution | `model/qwen35` (`qwen35`, `qwen35moe`), `serving.Qwen35Backend` |
 | HIP model execution, paged kernels, graph replay | `engine/gpu`, `serving.Qwen35GPUBackend` |
 
 `serving.Request` carries an optional `Submitted` callback. It runs after the
@@ -217,10 +217,10 @@ Requirements and current behavior:
 ### 7.1 Configuration
 
 - F32 keys and values by default. `--kv-type f16` and `--kv-type q8_0` select
-  opt-in F16 and Q8_0 pools for the `qwen35` CPU and HIP backends and for the
-  `qwen3moe` HIP backend. Dense CPU runtimes implement F32 only and reject
-  other values explicitly. The prefix-cache model key includes the format, and
-  the F32 path remains the numerical baseline.
+  opt-in F16 and Q8_0 pools for the `qwen35` CPU and HIP backends, the
+  `qwen35moe` CPU backend, and the `qwen3moe` HIP backend. Dense CPU runtimes
+  implement F32 only and reject other values explicitly. The prefix-cache model
+  key includes the format, and the F32 path remains the numerical baseline.
 - Configurable block size; the server and benchmark default to 16 tokens.
 - One allocator per model with a fixed block count derived from context and
   concurrency, or set explicitly with `--kv-blocks`.
@@ -316,10 +316,11 @@ shapes where host launch overhead is measured to matter.
 The CLI supports loading a GGUF model, single-prompt generation (including
 stdin input), inspection, benchmark, and a diagnostic NPU-probe mode.
 `yuuka run` and `yuuka bench` accept
-`--kv-type f32|f16|q8_0` for `qwen35` and `qwen3moe` HIP; dense CPU paths reject
-`f16`/`q8_0`. They also accept `--speculative`, `--spec-max-draft`, and
-`--spec-min-match`. `--npu` records the NPU capability result and falls back to
-the selected backend; it is diagnostic only, and NPU support is a future task.
+`--kv-type f32|f16|q8_0` for `qwen35` CPU/HIP, `qwen35moe` CPU, and `qwen3moe`
+HIP; dense CPU paths reject `f16`/`q8_0`. They also accept `--speculative`,
+`--spec-max-draft`, and `--spec-min-match`. `--npu` records the NPU capability
+result and falls back to the selected backend; it is diagnostic only, and NPU
+support is a future task.
 Serving uses `yuuka-server`, which also accepts `--kv-type` and `--npu`.
 
 ### 9.2 HTTP

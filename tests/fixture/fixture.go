@@ -230,6 +230,28 @@ func f32Vector(name string, values []float32) tensorSpec {
 	}
 }
 
+func f32RandomVector(rng *rand.Rand, name string, count int, scale float32) tensorSpec {
+	values := make([]float32, count)
+	for i := range values {
+		values[i] = (rng.Float32()*2 - 1) * scale
+	}
+	return f32Vector(name, values)
+}
+
+func f32Rank3(rng *rand.Rand, name string, cols, rows, depth int, scale float32) tensorSpec {
+	data := make([]byte, cols*rows*depth*4)
+	for i := range cols * rows * depth {
+		value := (rng.Float32()*2 - 1) * scale
+		binary.LittleEndian.PutUint32(data[i*4:], math.Float32bits(value))
+	}
+	return tensorSpec{
+		name:  name,
+		dims:  []uint64{uint64(cols), uint64(rows), uint64(depth)},
+		dtype: tensor.F32,
+		data:  data,
+	}
+}
+
 func repeatVector(name string, count int, value float32) tensorSpec {
 	values := make([]float32, count)
 	for i := range values {
@@ -242,10 +264,20 @@ func repeatVector(name string, count int, value float32) tensorSpec {
 // zero uses gated delta-net recurrence and layer one uses full GQA attention,
 // so both decoder paths are covered. All tensors are F32 and the LM head is
 // tied to the embedding.
-func WriteTinyQwen35(path string) error {
+func WriteTinyQwen35(path string) error { return writeTinyQwen35(path, false) }
+
+// WriteTinyQwen35MoE writes the same two-layer hybrid model with routed and
+// shared experts instead of a dense FFN.
+func WriteTinyQwen35MoE(path string) error { return writeTinyQwen35(path, true) }
+
+func writeTinyQwen35(path string, moe bool) error {
 	const (
 		hidden      = 32
 		ffn         = 64
+		expertFFN   = 16
+		sharedFFN   = 16
+		expertCount = 4
+		expertUsed  = 2
 		heads       = 2
 		kvHeads     = 1
 		headDim     = 8
@@ -260,6 +292,13 @@ func WriteTinyQwen35(path string) error {
 		layerCount  = 2
 		specialBase = 256
 	)
+	arch := "qwen35"
+	name := "yuuka-tiny-qwen35"
+	if moe {
+		arch = "qwen35moe"
+		name = "yuuka-tiny-qwen35moe"
+	}
+	key := func(s string) string { return arch + "." + s }
 	qDim := heads * headDim * 2
 	oDim := heads * headDim
 	kvDim := kvHeads * headDim
@@ -276,29 +315,36 @@ func WriteTinyQwen35(path string) error {
 	}
 
 	b := newBuilder()
-	b.addMetadata("general.architecture", stringValue("qwen35"))
-	b.addMetadata("general.name", stringValue("yuuka-tiny-qwen35"))
+	b.addMetadata("general.architecture", stringValue(arch))
+	b.addMetadata("general.name", stringValue(name))
 	b.addMetadata("general.alignment", uintValue(alignment))
 	b.addMetadata("general.quantization_version", uintValue(2))
 	b.addMetadata("general.file_type", uintValue(0))
-	b.addMetadata("qwen35.block_count", uintValue(layerCount))
-	b.addMetadata("qwen35.context_length", uintValue(context))
-	b.addMetadata("qwen35.embedding_length", uintValue(hidden))
-	b.addMetadata("qwen35.feed_forward_length", uintValue(ffn))
-	b.addMetadata("qwen35.attention.head_count", uintValue(heads))
-	b.addMetadata("qwen35.attention.head_count_kv", uintValue(kvHeads))
-	b.addMetadata("qwen35.attention.key_length", uintValue(headDim))
-	b.addMetadata("qwen35.attention.value_length", uintValue(headDim))
-	b.addMetadata("qwen35.attention.layer_norm_rms_epsilon", floatValue(1e-6))
-	b.addMetadata("qwen35.rope.dimension_count", uintValue(ropeDim))
-	b.addMetadata("qwen35.rope.dimension_sections", intArrayValue([]int64{2, 2, 0, 0}))
-	b.addMetadata("qwen35.rope.freq_base", floatValue(10000))
-	b.addMetadata("qwen35.ssm.conv_kernel", uintValue(ssmConv))
-	b.addMetadata("qwen35.ssm.state_size", uintValue(ssmState))
-	b.addMetadata("qwen35.ssm.group_count", uintValue(ssmGroups))
-	b.addMetadata("qwen35.ssm.time_step_rank", uintValue(ssmRank))
-	b.addMetadata("qwen35.ssm.inner_size", uintValue(ssmInner))
-	b.addMetadata("qwen35.full_attention_interval", uintValue(fullEvery))
+	b.addMetadata(key("block_count"), uintValue(layerCount))
+	b.addMetadata(key("context_length"), uintValue(context))
+	b.addMetadata(key("embedding_length"), uintValue(hidden))
+	if moe {
+		b.addMetadata(key("expert_count"), uintValue(expertCount))
+		b.addMetadata(key("expert_used_count"), uintValue(expertUsed))
+		b.addMetadata(key("expert_feed_forward_length"), uintValue(expertFFN))
+		b.addMetadata(key("expert_shared_feed_forward_length"), uintValue(sharedFFN))
+	} else {
+		b.addMetadata(key("feed_forward_length"), uintValue(ffn))
+	}
+	b.addMetadata(key("attention.head_count"), uintValue(heads))
+	b.addMetadata(key("attention.head_count_kv"), uintValue(kvHeads))
+	b.addMetadata(key("attention.key_length"), uintValue(headDim))
+	b.addMetadata(key("attention.value_length"), uintValue(headDim))
+	b.addMetadata(key("attention.layer_norm_rms_epsilon"), floatValue(1e-6))
+	b.addMetadata(key("rope.dimension_count"), uintValue(ropeDim))
+	b.addMetadata(key("rope.dimension_sections"), intArrayValue([]int64{2, 2, 0, 0}))
+	b.addMetadata(key("rope.freq_base"), floatValue(10000))
+	b.addMetadata(key("ssm.conv_kernel"), uintValue(ssmConv))
+	b.addMetadata(key("ssm.state_size"), uintValue(ssmState))
+	b.addMetadata(key("ssm.group_count"), uintValue(ssmGroups))
+	b.addMetadata(key("ssm.time_step_rank"), uintValue(ssmRank))
+	b.addMetadata(key("ssm.inner_size"), uintValue(ssmInner))
+	b.addMetadata(key("full_attention_interval"), uintValue(fullEvery))
 	b.addMetadata("tokenizer.ggml.model", stringValue("gpt2"))
 	b.addMetadata("tokenizer.ggml.pre", stringValue("qwen35"))
 	b.addMetadata("tokenizer.ggml.tokens", stringArrayValue(tokens))
@@ -336,9 +382,20 @@ func WriteTinyQwen35(path string) error {
 			b.addTensor(repeatVector(prefix+"attn_q_norm.weight", headDim, 1))
 			b.addTensor(repeatVector(prefix+"attn_k_norm.weight", headDim, 1))
 		}
-		b.addTensor(f32Matrix(rng, prefix+"ffn_gate.weight", ffn, hidden, 0.03))
-		b.addTensor(f32Matrix(rng, prefix+"ffn_up.weight", ffn, hidden, 0.03))
-		b.addTensor(f32Matrix(rng, prefix+"ffn_down.weight", hidden, ffn, 0.03))
+		if moe {
+			b.addTensor(f32Matrix(rng, prefix+"ffn_gate_inp.weight", expertCount, hidden, 0.03))
+			b.addTensor(f32RandomVector(rng, prefix+"ffn_gate_inp_shexp.weight", hidden, 0.03))
+			b.addTensor(f32Matrix(rng, prefix+"ffn_gate_shexp.weight", sharedFFN, hidden, 0.03))
+			b.addTensor(f32Matrix(rng, prefix+"ffn_up_shexp.weight", sharedFFN, hidden, 0.03))
+			b.addTensor(f32Matrix(rng, prefix+"ffn_down_shexp.weight", hidden, sharedFFN, 0.03))
+			b.addTensor(f32Rank3(rng, prefix+"ffn_gate_exps.weight", hidden, expertFFN, expertCount, 0.03))
+			b.addTensor(f32Rank3(rng, prefix+"ffn_up_exps.weight", hidden, expertFFN, expertCount, 0.03))
+			b.addTensor(f32Rank3(rng, prefix+"ffn_down_exps.weight", expertFFN, hidden, expertCount, 0.03))
+		} else {
+			b.addTensor(f32Matrix(rng, prefix+"ffn_gate.weight", ffn, hidden, 0.03))
+			b.addTensor(f32Matrix(rng, prefix+"ffn_up.weight", ffn, hidden, 0.03))
+			b.addTensor(f32Matrix(rng, prefix+"ffn_down.weight", hidden, ffn, 0.03))
+		}
 	}
 	return b.write(path)
 }

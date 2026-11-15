@@ -2,6 +2,7 @@ package tensor
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"math"
 	"testing"
 )
@@ -170,9 +171,87 @@ func TestDequantizeQ6K(t *testing.T) {
 	}
 }
 
+func TestIQDTypeCapabilities(t *testing.T) {
+	for _, dtype := range []DType{IQ2XXS, IQ2S, IQ3S} {
+		if !dtype.Supported() {
+			t.Fatalf("%s has no CPU decoder", dtype)
+		}
+		if dtype.HIPSupported() {
+			t.Fatalf("%s incorrectly reports a HIP kernel", dtype)
+		}
+		if _, err := dtype.BlockLayout(); err != nil {
+			t.Fatalf("%s block layout: %v", dtype, err)
+		}
+	}
+	for _, dtype := range []DType{F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K} {
+		if !dtype.HIPSupported() {
+			t.Fatalf("%s lost HIP support", dtype)
+		}
+	}
+}
+
+func TestDequantizeIQReference(t *testing.T) {
+	// Reference values were produced by ggml's dequantize_row_iq2_xxs,
+	// dequantize_row_iq3_s, and dequantize_row_iq2_s on the first block of
+	// each type from Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf.
+	cases := []struct {
+		name  string
+		dtype DType
+		raw   string
+		first []float32
+		sum   float32
+	}{
+		{
+			name:  "IQ2_XXS",
+			dtype: IQ2XXS,
+			raw:   "2f0c070067cad0a4b8adba52aa0456f20f7b013a0c004f7332f58f6651311d43d68b23eba5d2ece74da21c8c5623474cc08e59d71e0d6377b69c22ec15786a8338bb",
+			first: []float32{0.005362272262573242, 0.005362272262573242, 0.028822213411331177, 0.005362272262573242, -0.005362272262573242, 0.005362272262573242, -0.005362272262573242, 0.005362272262573242},
+			sum:   -0.09559527039527893,
+		},
+		{
+			name:  "IQ3_S",
+			dtype: IQ3S,
+			raw:   "76051fd85942b4e46e38b10d380fbc2ca7c5c61373867fed8a59c099a3df55e617fe8e574dd8282e7e8d3f9c002844e737e27987199ddc6f21c6d1f4a1213f94106899a002a7dd78845721b9846cec02ee3f5e044832ff7cabb771788225979696dd19b7214cf9b6a9638b8a999f",
+			first: []float32{-0.0057495832443237305, 0.013415694236755371, 0.0019165277481079102, 0.013415694236755371, 0.0019165277481079102, -0.028747916221618652, 0.0019165277481079102, 0.00958263874053955},
+			sum:   -0.0661618709564209,
+		},
+		{
+			name:  "IQ2_S",
+			dtype: IQ2S,
+			raw:   "57099f38722503000d3a00c3f51de39e4c4a0e193e06d87f1b3f001d4f7f4900b602489e7a4b8a3a5ea690784a9e256b50e3007be615268e7d57c371164b0f34398a00c024c1000d70b0999ba959fb9c8ee7",
+			first: []float32{0.016642197966575623, 0.0030962228775024414, 0.0030962228775024414, -0.0030962228775024414, 0.0030962228775024414, 0.016642197966575623, -0.0030962228775024414, 0.0030962228775024414},
+			sum:   -0.14647985994815826,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := hex.DecodeString(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst := make([]float32, 256)
+			if err := DequantizeRow(dst, tc.dtype, raw); err != nil {
+				t.Fatal(err)
+			}
+			for i, want := range tc.first {
+				if diff := math.Abs(float64(dst[i] - want)); diff > 1e-6 {
+					t.Fatalf("index %d: got %v want %v", i, dst[i], want)
+				}
+			}
+			var sum float32
+			for _, value := range dst {
+				sum += value
+			}
+			if diff := math.Abs(float64(sum - tc.sum)); diff > 1e-5 {
+				t.Fatalf("sum: got %v want %v", sum, tc.sum)
+			}
+		})
+	}
+}
+
 func TestMatMulMatchesDequantizedDot(t *testing.T) {
 	const rows, cols = 3, 256
-	cases := []DType{F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}
+	cases := []DType{F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ2XXS, IQ2S, IQ3S}
 	for _, dtype := range cases {
 		t.Run(dtype.String(), func(t *testing.T) {
 			block, err := dtype.BlockLayout()
@@ -220,6 +299,14 @@ func TestMatMulMatchesDequantizedDot(t *testing.T) {
 				case Q6_K:
 					for i := 0; i < len(row); i += 210 {
 						putHalf(row, i+208, 0.25)
+					}
+				case IQ2XXS, IQ2S, IQ3S:
+					blockBytes, err := dtype.BlockLayout()
+					if err != nil {
+						t.Fatal(err)
+					}
+					for i := 0; i < len(row); i += int(blockBytes.Bytes) {
+						putHalf(row, i, 0.25)
 					}
 				}
 			}

@@ -37,6 +37,10 @@ The repository contains an end-to-end single-node implementation:
 - Pure Go GGUF reader with validation and mmap-backed tensor storage.
 - Qwen3.5 (`qwen35`) tokenizer, chat rendering, CPU reference forward pass, and
   golden token tests.
+- CPU reference forward pass for the Qwen3.6 hybrid MoE layout (`qwen35moe`),
+  including top-k routed experts and a shared expert, validated on a real
+  Qwen3.6-35B-A3B IQ2_XXS GGUF. CPU dequantization for `IQ2_XXS`, `IQ2_S`, and
+  `IQ3_S` is included; HIP kernels for these types are not.
 - HIP C ABI, plan executor, and kernels for the full `qwen35` decode and chunked
   prefill graphs, plus `qwen3moe` expert routing and grouped kernels.
 - rocWMMA/rocBLAS prefill GEMM, causal GQA Flash Attention, and chunked prefill.
@@ -46,11 +50,12 @@ The repository contains an end-to-end single-node implementation:
 - Native CTest coverage for the ABI, quantized GEMV, operators, GEMM, prefill,
   paged KV/graph, embedding, and MoE kernels.
 
-Not yet implemented: HIP execution for dense Llama/Qwen3 models, real-model
-`qwen3moe` validation (synthetic fixtures only), NPU execution (the probe is
-diagnostic), quantization presets outside the documented set, speculative
-decoding for non-greedy sampling or the MoE HIP runtime, and fused mixed-shape
-multi-request batching. See `docs/README.md` for the full status.
+Not yet implemented: HIP execution for dense Llama/Qwen3 models, HIP execution
+and IQ2/IQ3 kernels for `qwen35moe`, real-model `qwen3moe` validation (synthetic
+fixtures only), NPU execution (the probe is diagnostic), quantization presets
+outside the documented set, speculative decoding for non-greedy sampling or the
+MoE HIP runtime, and fused mixed-shape multi-request batching. See
+`docs/README.md` for the full status.
 
 Therefore:
 

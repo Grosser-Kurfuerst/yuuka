@@ -25,6 +25,22 @@ func TestValidateModelSupportRejectsUnsupportedDType(t *testing.T) {
 	}
 }
 
+func TestValidateModelSupportRejectsQwen35MoE(t *testing.T) {
+	model := &qwen35.Model{
+		Config: &qwen35.Config{
+			Architecture: qwen35.MoEArchitecture,
+			ExpertCount:  4,
+		},
+	}
+	err := validateModelSupport(model)
+	if err == nil {
+		t.Fatal("qwen35moe was accepted by the HIP validator")
+	}
+	if !strings.Contains(err.Error(), "does not implement") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestValidateModelSupportRejectsBadRowWidth(t *testing.T) {
 	model := &qwen35.Model{
 		Config:    &qwen35.Config{},

@@ -11,21 +11,28 @@ import (
 type DType uint32
 
 const (
-	F32   DType = 0
-	F16   DType = 1
-	Q4_0  DType = 2
-	Q4_1  DType = 3
-	Q5_0  DType = 6
-	Q5_1  DType = 7
-	Q8_0  DType = 8
-	Q8_1  DType = 9
-	Q2_K  DType = 10
-	Q3_K  DType = 11
-	Q4_K  DType = 12
-	Q5_K  DType = 13
-	Q6_K  DType = 14
-	Q8_K  DType = 15
-	IQ2XS DType = 16
+	F32    DType = 0
+	F16    DType = 1
+	Q4_0   DType = 2
+	Q4_1   DType = 3
+	Q5_0   DType = 6
+	Q5_1   DType = 7
+	Q8_0   DType = 8
+	Q8_1   DType = 9
+	Q2_K   DType = 10
+	Q3_K   DType = 11
+	Q4_K   DType = 12
+	Q5_K   DType = 13
+	Q6_K   DType = 14
+	Q8_K   DType = 15
+	IQ2XXS DType = 16
+	IQ2XS  DType = 17
+	IQ3XXS DType = 18
+	IQ1S   DType = 19
+	IQ4NL  DType = 20
+	IQ3S   DType = 21
+	IQ2S   DType = 22
+	IQ4XS  DType = 23
 )
 
 // ErrUnsupportedDType is returned when a dtype has no reader or kernel in the
@@ -63,8 +70,22 @@ func (d DType) String() string {
 		return "Q6_K"
 	case Q8_K:
 		return "Q8_K"
-	case IQ2XS:
+	case IQ2XXS:
 		return "IQ2_XXS"
+	case IQ2XS:
+		return "IQ2_XS"
+	case IQ3XXS:
+		return "IQ3_XXS"
+	case IQ1S:
+		return "IQ1_S"
+	case IQ4NL:
+		return "IQ4_NL"
+	case IQ3S:
+		return "IQ3_S"
+	case IQ2S:
+		return "IQ2_S"
+	case IQ4XS:
+		return "IQ4_XS"
 	default:
 		return fmt.Sprintf("DType(%d)", uint32(d))
 	}
@@ -108,8 +129,22 @@ func (d DType) BlockLayout() (Block, error) {
 		return Block{256, 210}, nil
 	case Q8_K:
 		return Block{256, 292}, nil
-	case IQ2XS:
+	case IQ2XXS:
 		return Block{256, 66}, nil
+	case IQ2XS:
+		return Block{256, 74}, nil
+	case IQ3XXS:
+		return Block{256, 98}, nil
+	case IQ1S:
+		return Block{256, 50}, nil
+	case IQ4NL:
+		return Block{32, 18}, nil
+	case IQ3S:
+		return Block{256, 110}, nil
+	case IQ2S:
+		return Block{256, 82}, nil
+	case IQ4XS:
+		return Block{256, 136}, nil
 	default:
 		return Block{}, fmt.Errorf("%w: %s", ErrUnsupportedDType, d)
 	}
@@ -135,8 +170,19 @@ func (d DType) RowBytes(columns int64) (uint64, error) {
 	return uint64(blocks) * uint64(block.Bytes), nil
 }
 
-// Supported reports whether this build has a decoding kernel for the dtype.
+// Supported reports whether this build has a CPU reference decoding kernel for
+// the dtype.
 func (d DType) Supported() bool {
+	switch d {
+	case F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ2XXS, IQ2S, IQ3S:
+		return true
+	default:
+		return false
+	}
+}
+
+// HIPSupported reports whether the HIP backend has kernels for the dtype.
+func (d DType) HIPSupported() bool {
 	switch d {
 	case F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K:
 		return true

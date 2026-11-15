@@ -204,12 +204,13 @@ requests on one model stream. HIP Graph capture and replay are implemented per
 session but opt-in; the plain stream path is the default because the measured
 decode gain was within noise.
 
-The CPU reference also covers dense Llama, dense Qwen3, and `qwen3moe`. The HIP
-backend executes `qwen35` and `qwen3moe`; MoE uses top-k routing, assignment
-bucketing, and grouped expert kernels that reuse one packed weight row across
-the tokens assigned to an expert. Speculative decoding is an opt-in greedy
-generation mode that verifies prompt-lookup drafts through an all-position
-prefill plan and restores session state on a partial rejection.
+The CPU reference also covers `qwen35moe`, dense Llama, dense Qwen3, and
+`qwen3moe`. The HIP backend executes `qwen35` and `qwen3moe`; `qwen35moe` is
+CPU-only for now and is rejected by the HIP planner. MoE uses top-k routing,
+assignment bucketing, and grouped expert kernels that reuse one packed weight
+row across the tokens assigned to an expert. Speculative decoding is an opt-in
+greedy generation mode that verifies prompt-lookup drafts through an
+all-position prefill plan and restores session state on a partial rejection.
 
 Key rules:
 
@@ -218,8 +219,8 @@ Key rules:
 3. HIP prefill and decode share the KV cache but use different operator paths.
    HIP prefill uses chunked batched plans; decode uses the single-token GEMV
    and per-head attention graph. The CPU reference processes tokens one at a
-   time for both phases. Dense models have no HIP execution path and run on the
-   CPU reference.
+   time for both phases. Dense models and `qwen35moe` have no HIP execution path
+   and run on the CPU reference.
 4. Sampling may run on the GPU or on the host through a low-overhead path; the
    choice is a plan decision, not a per-token branch in model code.
 5. Request cancellation releases KV blocks and scratch through the scheduler
@@ -308,8 +309,9 @@ paged HIP KV-write and attention kernels. Recurrent convolution and matrix
 state stay contiguous per session and are snapshotted for prefix reuse. The
 default block size is 16 tokens. F32 is the default KV storage; opt-in F16 and
 Q8_0 formats use the same block table and are selected through `--kv-type` for
-the `qwen35` CPU and HIP runtimes and for the `qwen3moe` HIP runtime. Dense CPU
-runtimes implement F32 only and reject other formats explicitly.
+the `qwen35` CPU and HIP runtimes, the `qwen35moe` CPU runtime, and the
+`qwen3moe` HIP runtime. Dense CPU runtimes implement F32 only and reject other
+formats explicitly.
 The logical KV view exposed to model code does not expose physical block layout. Block allocation, reference counting, prefix sharing, cancellation, and
 eviction are specified in [serving.md](serving.md).
 
@@ -317,8 +319,8 @@ eviction are specified in [serving.md](serving.md).
 
 | Backend | Role | Status |
 | --- | --- | --- |
-| HIP GPU | Primary execution path | Implemented for `qwen35` single and concurrent requests over a shared paged KV pool, and for `qwen3moe` single requests; opt-in graph replay |
-| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`, dense Llama/Qwen3, and `qwen3moe`; default backend; concurrent paged serving for `qwen35` |
+| HIP GPU | Primary execution path | Implemented for `qwen35` single and concurrent requests over a shared paged KV pool, and for `qwen3moe` single requests; `qwen35moe` is rejected; opt-in graph replay |
+| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`, `qwen35moe`, dense Llama/Qwen3, and `qwen3moe`; default backend; concurrent paged serving for `qwen35` |
 | XDNA NPU | Optional heterogeneous acceleration | Diagnostic capability probe and explicit GPU fallback only; execution is a future task; see [npu.md](npu.md) |
 
 The concrete planners validate supported dtypes, quantization types, batch
@@ -357,7 +359,7 @@ yuuka/
 ├── tensor/                    # Dtypes, block layouts, CPU reference math
 ├── model/
 │   ├── dense/                 # Llama and Qwen3 CPU reference decoders
-│   └── qwen35/                # Config, weights, CPU reference decoder, state
+│   └── qwen35/                # qwen35 and qwen35moe CPU reference decoders
 ├── engine/
 │   ├── engine.go              # Single-request generation loop
 │   ├── sampling.go            # Greedy, top-k, nucleus sampling

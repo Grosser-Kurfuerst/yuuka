@@ -402,7 +402,7 @@ func (p *Plan) check(buffers ...*Buffer) error {
 // satisfy the quantization block layout. It mirrors the C ABI validation so the
 // Go planner fails before submission.
 func checkGemvDType(dtype tensor.DType, nIn int64) error {
-	if !dtype.Supported() {
+	if !dtype.HIPSupported() {
 		return fmt.Errorf("hip: GEMV dtype %s is not supported", dtype)
 	}
 	if _, err := dtype.RowBytes(nIn); err != nil {
@@ -701,7 +701,7 @@ func (p *Plan) AddEmbedding(weights, out *Buffer, cols, rowBytes int64, dtype te
 	if cols <= 0 || rowBytes <= 0 {
 		return fmt.Errorf("hip: invalid embedding dimensions cols=%d row_bytes=%d", cols, rowBytes)
 	}
-	if !dtype.Supported() {
+	if !dtype.HIPSupported() {
 		return fmt.Errorf("hip: embedding dtype %s is not supported", dtype)
 	}
 	want, err := dtype.RowBytes(cols)
@@ -1284,7 +1284,7 @@ func (p *Plan) AddEmbeddingBatchAt(weights, out, tokens *Buffer, outOff uint64, 
 	if rows <= 0 || cols <= 0 || rowBytes <= 0 || vocab <= 0 {
 		return errors.New("hip: invalid batch embedding dimensions")
 	}
-	if !dtype.Supported() {
+	if !dtype.HIPSupported() {
 		return fmt.Errorf("hip: batch embedding dtype %s is not supported", dtype)
 	}
 	if want, err := dtype.RowBytes(cols); err != nil || int64(want) != rowBytes {

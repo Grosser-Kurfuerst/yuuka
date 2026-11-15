@@ -35,6 +35,9 @@ func newTestHarness(t *testing.T) *testHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if model.Config.Architecture != Architecture {
+		t.Skipf("YUUKA_TEST_MODEL is %q, want %q", model.Config.Architecture, Architecture)
+	}
 	return &testHarness{reader: r, tokenizer: tok, model: model}
 }
 

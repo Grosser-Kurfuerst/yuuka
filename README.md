@@ -314,7 +314,11 @@ Real-model and HIP/CPU agreement tests:
 
 ```bash
 YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./... -count=1
+YUUKA_TEST_MOE_MODEL="$MOE_MODEL" go test ./model/qwen35 -run Qwen35MoE -count=1
 ```
+
+Without `YUUKA_TEST_MODEL`, model-dependent Go tests are skipped. Native tests
+skip with exit code 77 when the requested HIP device is unavailable.
 
 Serving throughput and latency:
 
@@ -324,17 +328,15 @@ go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
   --concurrency 4 --requests 8 --prompt-tokens 64 --decode-tokens 16
 ```
 
-Without `YUUKA_TEST_MODEL`, model-dependent Go tests are skipped. Native tests
-skip with exit code 77 when the requested HIP device is unavailable.
-
 ## Limitations
 
-- `qwen35` is the only architecture with HIP execution and real-model
-  validation. `qwen3moe` has HIP execution validated on F32 and Q4_K synthetic
+- `qwen35` has CPU and HIP execution validated on a real model. `qwen35moe`
+  has a CPU reference validated on a real Qwen3.6 GGUF; its HIP path is not
+  implemented. `qwen3moe` has HIP execution validated on F32 and Q4_K synthetic
   fixtures; Llama and Qwen3 dense have CPU reference paths only. Gemma and
   multimodal adapters are not implemented.
-- The server loads `qwen35` only; dense and MoE models are available through the
-  CLI and Go packages.
+- The server loads `qwen35` and `qwen35moe` on the CPU backend; dense models are
+  available through the CLI and Go packages.
 - The tokenizer implementation covers Qwen byte-level BPE and Llama-family
   SentencePiece vocabularies. Non-Qwen chat templates are not implemented.
 - Unexpected extra tensors are not rejected or warned about. The HIP loader
@@ -344,10 +346,10 @@ skip with exit code 77 when the requested HIP device is unavailable.
   Attention. The attention kernel supports head dimensions up to 256. Chunks are
   bounded at 4096 rows.
 - KV cache is paged and defaults to `F32` with a block size of 16 tokens.
-  `F16` and `Q8_0` are opt-in memory optimizations for `qwen35` CPU and HIP and
-  for `qwen3moe` HIP; dense CPU runtimes implement only `F32` and reject other
-  `--kv-type` values. Q8_0 changes logits slightly and is not a performance win
-  at short context.
+  `F16` and `Q8_0` are opt-in memory optimizations for `qwen35` CPU and HIP,
+  `qwen35moe` CPU, and `qwen3moe` HIP; dense CPU runtimes implement only `F32`
+  and reject other `--kv-type` values. Q8_0 changes logits slightly and is not a
+  performance win at short context.
 - Continuous batching is iteration-level: requests are interleaved on one model
   stream, but mixed-shape batched kernels are not implemented, so aggregate
   decode throughput does not scale with concurrency.

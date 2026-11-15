@@ -86,6 +86,9 @@ Initial native kernel coverage targets:
 | `Q6_K` | K-quant superblock layout | Decode and prefill |
 | `Q4_K` | 256-weight superblock with scale/min encoding | Primary decode target |
 | `Q5_K` | K-quant layout related to Q4_K/Q6_K | Decode and prefill |
+| `IQ2_XXS` | 256-weight codebook block, 66 bytes | CPU reference only |
+| `IQ2_S` | 256-weight codebook block with 8-bit scales, 82 bytes | CPU reference only |
+| `IQ3_S` | 256-weight codebook block, 110 bytes | CPU reference only |
 
 The reader validates block-size divisibility where the format requires it, but
 must not reject a tensor merely because a particular kernel does not support its
@@ -116,6 +119,10 @@ family, so each architecture adapter maps its metadata into a common
 | RMS norm epsilon | `<arch>.attention.layer_norm_rms_epsilon` |
 | Context length | `<arch>.context_length` |
 | Vocabulary size | Token array length; `<arch>.vocab_size` only when the token array is absent |
+| Expert count | `<arch>.expert_count` |
+| Experts per token | `<arch>.expert_used_count` |
+| Routed expert width | `<arch>.expert_feed_forward_length` |
+| Shared expert width | `<arch>.expert_shared_feed_forward_length` |
 | BOS / EOS token IDs | `tokenizer.ggml.bos_token_id`, `tokenizer.ggml.eos_token_id` |
 | Tokenizer model | `tokenizer.ggml.model` |
 | Token list / merges / scores | `tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, `tokenizer.ggml.scores` |
@@ -195,16 +202,17 @@ same string while producing different model behavior.
 | Architecture | Key features | Execution paths | Status |
 | --- | --- | --- | --- |
 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU | CPU reference, HIP | Adapted and validated on a real Qwen3.5-4B Q4_K_M GGUF |
+| Qwen3.6 MoE hybrid (`qwen35moe`) | The `qwen35` hybrid attention and recurrent state with top-k routed experts and a sigmoid-gated shared expert | CPU reference | Adapted and validated on a real Qwen3.6-35B-A3B IQ2_XXS GGUF; HIP pending |
 | Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU | CPU reference | Implemented with a generated fixture; real-model adaptation and validation pending |
 | Llama Dense | RMSNorm, RoPE, GQA, SwiGLU | CPU reference | Implemented with a generated fixture cross-checked against llama.cpp; real-model adaptation and validation pending |
 | Qwen3 MoE (`qwen3moe`) | Routing, experts, grouped expert kernels | CPU reference, HIP decode/prefill | Implemented with F32 and Q4_K synthetic fixtures; real-model adaptation and validation pending |
 
-Only `qwen35` has been adapted and validated on a real model. An architecture
-must not be treated as supported merely because an adapter exists or a synthetic
-fixture passes. Adding an architecture requires adapting its metadata, tensor
-layouts, forward pass, and backend execution, then validating it on a real GGUF
-model. Architectures not listed above have no adapter and fail with an explicit
-unsupported-architecture error.
+`qwen35` and `qwen35moe` have been adapted and validated on real models. An
+architecture must not be treated as supported merely because an adapter exists
+or a synthetic fixture passes. Adding an architecture requires adapting its
+metadata, tensor layouts, forward pass, and backend execution, then validating
+it on a real GGUF model. Architectures not listed above have no adapter and
+fail with an explicit unsupported-architecture error.
 
 The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
 (`general.architecture = qwen35`). It uses full attention every fourth layer and
@@ -214,6 +222,14 @@ architecture. The HIP path keeps GGUF weights packed and executes the full
 decoder. `qwen35.rope.dimension_sections` is validated for the text-only
 configuration; because every position component is equal, the forward pass
 applies standard RoPE over the full RoPE dimension.
+
+`qwen35moe` reuses that hybrid attention and recurrent state and replaces the
+dense FFN with 256 routed experts, top-8 routing, and one shared expert. The
+adapter requires scalar or equal-width `expert_feed_forward_length` metadata and
+loads the rank-3 `ffn_{gate,up,down}_exps` tensors as packed expert slices.
+Greedy CPU output on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf matches the llama.cpp
+reference for the tested prompts. The current Qwen3.6 path is CPU-only; the HIP
+planner rejects `qwen35moe` instead of falling back silently.
 
 Dense Llama and Qwen3 CPU reference paths are implemented with generated
 fixtures. The Llama fixture is cross-checked against llama.cpp greedy tokens;
@@ -246,10 +262,12 @@ a correct reference path, a GPU kernel, and a benchmark entry.
 
 Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`,
 `Q5_K`, and `Q6_K` and quantized WMMA prefill GEMM for `F16`, `F32`, `Q4_0`,
-`Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_0` are implemented. The prefill dispatch
-table and benchmark evidence are in [kernels.md](kernels.md) and
-[benchmarks.md](benchmarks.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, and the IQ families
-remain capability failures.
+`Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_0` are implemented. The CPU reference
+additionally dequantizes and multiplies `IQ2_XXS`, `IQ2_S`, and `IQ3_S` blocks;
+there are no HIP kernels for those IQ types yet. The prefill dispatch table and
+benchmark evidence are in [kernels.md](kernels.md) and
+[benchmarks.md](benchmarks.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, IQ1, IQ2_XS,
+IQ3_XXS, IQ4_NL, and IQ4_XS remain capability failures.
 
 ## 10. Validation checklist
 

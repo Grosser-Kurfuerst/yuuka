@@ -21,6 +21,9 @@ func newHIPRuntime(l *loadedModel, capacity int, format qwen35.KVFormat) (engine
 		}
 		return runtime, nil
 	}
+	if l.qwen.Config.IsMoE() {
+		return nil, fmt.Errorf("HIP backend does not implement %q yet; use --backend cpu", l.arch)
+	}
 	runtime, err := gpu.NewWithKVType(l.reader, l.qwen, capacity, format.DType())
 	if err != nil {
 		return nil, fmt.Errorf("HIP runtime: %w", err)
