@@ -190,17 +190,21 @@ trusted reference implementation. The comparison set must include:
 A text-level match is insufficient: different tokenizations can decode to the
 same string while producing different model behavior.
 
-## 8. Architecture support plan
+## 8. Architecture support status
 
-| Priority | Architecture | Key features |
-| --- | --- | --- |
-| P0 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU |
-| P0 | Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU |
-| P0 | Llama Dense | RMSNorm, RoPE, GQA, SwiGLU |
-| P1 | Gemma | Architecture-specific norm, attention, and logit details |
-| P1 | Qwen3 MoE (`qwen3moe`) | Routing, experts, grouped expert kernels |
-| P2 | DeepSeek-like | MLA, MoE, specialized KV representation |
-| P2 | Hybrid attention/SSM | Separate state cache and state-space operators |
+| Architecture | Key features | Execution paths | Status |
+| --- | --- | --- | --- |
+| Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU | CPU reference, HIP | Adapted and validated on a real Qwen3.5-4B Q4_K_M GGUF |
+| Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU | CPU reference | Implemented with a generated fixture; real-model adaptation and validation pending |
+| Llama Dense | RMSNorm, RoPE, GQA, SwiGLU | CPU reference | Implemented with a generated fixture cross-checked against llama.cpp; real-model adaptation and validation pending |
+| Qwen3 MoE (`qwen3moe`) | Routing, experts, grouped expert kernels | CPU reference, HIP decode/prefill | Implemented with F32 and Q4_K synthetic fixtures; real-model adaptation and validation pending |
+
+Only `qwen35` has been adapted and validated on a real model. An architecture
+must not be treated as supported merely because an adapter exists or a synthetic
+fixture passes. Adding an architecture requires adapting its metadata, tensor
+layouts, forward pass, and backend execution, then validating it on a real GGUF
+model. Architectures not listed above have no adapter and fail with an explicit
+unsupported-architecture error.
 
 The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
 (`general.architecture = qwen35`). It uses full attention every fourth layer and
@@ -215,7 +219,8 @@ Dense Llama and Qwen3 CPU reference paths are implemented with generated
 fixtures. The Llama fixture is cross-checked against llama.cpp greedy tokens;
 Qwen3 fixture coverage is structural and determinism-based because no real
 Qwen3 dense weight file is part of the test matrix. HIP execution for dense
-Llama/Qwen3 is not implemented.
+Llama/Qwen3 is not implemented, and neither dense path has been validated on a
+real GGUF model.
 
 `qwen3moe` is implemented as a CPU reference and a HIP decode/prefill path.
 Expert tensors are rank-3 `ffn_{gate,up,down}_exps` tensors with the GGUF layout
@@ -224,8 +229,8 @@ adapter requires a scalar `expert_feed_forward_length` or a layer array whose
 entries are all equal; per-layer expert widths are rejected explicitly. Top-k routing
 and grouped expert kernels are shared by decode and chunked prefill. The HIP
 path is validated on F32 and Q4_K synthetic four-expert fixtures because no
-standard `qwen3moe` GGUF is available on the target host. Other architectures in the
-table remain planned.
+standard `qwen3moe` GGUF is available on the target host. Real-model adaptation
+and validation for `qwen3moe` remain open.
 
 ## 9. Quantization support by phase
 
