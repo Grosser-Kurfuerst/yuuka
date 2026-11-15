@@ -327,8 +327,10 @@ The 500 ms GEMM gate is not met. The isolated wide shapes sit at the same
 ordinary tile widening is not expected to close the gap. A 64x128 tile, a
 128x64 tile with 2x2 fragment waves, a padded LDS stride, and the M-first CTA
 order were all measured slower and are not in the kernel. B3's acceptance rule
-is therefore applied as written: it was not accepted. B4 and B5 remain future
-work. See [benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
+is therefore applied as written: it was not accepted. The gate/up part of B5 is
+implemented in section 4.8; B4 is rejected in section 4.9, and the remaining
+B5 fusions are unstarted. See
+[benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)
 
