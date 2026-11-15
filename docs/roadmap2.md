@@ -311,6 +311,25 @@ These are lower priority and should be evaluated only after B1-B4:
 Every fusion must be judged on end-to-end chunk time and resource usage, not
 on launch count alone.
 
+### 4.7 Status (2026-11-15)
+
+B1 and B2 are partially implemented. `gemm_wmma_kernel<DType, 64, 2>` adds a
+64x64 tile, two accumulator fragments per wave, a 64-wide K step, and
+double-buffered A/B staging. It is selected for `rows >= 64` with `K <= N`.
+The original 32x64 kernel remains for tall-K projections and smaller batches
+because the wider tile was slower there. B3 (M-first CTA order) was implemented,
+measured, and rejected.
+
+Measured result: wide 512-row Q4_K shapes improved 3-7%, the chunk GEMM total
+moved from 944 ms to 895 ms, and the wall chunk total from 1077 ms to 1025 ms.
+The 500 ms GEMM gate is not met. The isolated wide shapes sit at the same
+4.6-4.7 TFLOP/s ceiling as the rocBLAS FP16 baseline on this device, so further
+ordinary tile widening is not expected to close the gap. A 64x128 tile, a
+128x64 tile with 2x2 fragment waves, a padded LDS stride, and the M-first CTA
+order were all measured slower and are not in the kernel. B3's acceptance rule
+is therefore applied as written: it was not accepted. B4 and B5 remain future
+work. See [benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
+
 ## 5. Workstream C: prefill attention
 
 ### 5.1 Problem

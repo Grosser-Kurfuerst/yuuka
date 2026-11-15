@@ -211,7 +211,7 @@ int main() {
     }
     const yuuka_dtype dtypes[] = {YUUKA_DTYPE_F16, YUUKA_DTYPE_Q8_0, YUUKA_DTYPE_Q4_K,
                                   YUUKA_DTYPE_Q5_K, YUUKA_DTYPE_Q6_K};
-    const int64_t rows[] = {1, 4, 8, 16, 32, 64, 128};
+    const int64_t rows[] = {1, 4, 8, 16, 32, 64, 128, 256, 512};
     const struct {
         int64_t n_in;
         int64_t n_out;

@@ -435,6 +435,54 @@ An earlier one-column-per-lane variant kept all 128 state values in one thread
 and compiled to 192 VGPRs with 90 spills, so it was rejected; the four-lane
 column split is the accepted mapping.
 
+### Prefill GEMM tiles (2026-11-15)
+
+`bench/hip/prefill_sweep` now includes `M = 256` and `M = 512`. The 64x64,
+two-fragment, K=64 double-buffered tile was compared with the original 32x64,
+one-fragment, K=32 tile on the same binary build for the selected-shape sweep.
+Q4_K, milliseconds per submission, mean of five measured iterations after two
+warmups:
+
+| Shape | 32x64 K32 | Selected path | Change |
+| --- | ---: | ---: | ---: |
+| 2560 → 9216, M=512 | 5.94 | 5.76 (64x64) | 3.1% faster |
+| 2560 → 8192, M=512 | 5.46 | 5.07 (64x64) | 7.2% faster |
+| 9216 → 2560, M=512 | 5.49 | 5.59 (32x64, unchanged) | within noise |
+| 9216 → 2560, M=256 | 2.45 | 2.42 (32x64, unchanged) | within noise |
+
+The 64x64 tile is selected only for `rows >= 64` with `K <= N`. At `M <= 32`,
+and for every `K > N` shape, the original 32x64 tile remains selected because
+the wider tile was slower there: for example, 2560 → 9216 at `M=32` moved from
+0.383 ms to 0.622 ms, and 9216 → 2560 at `M=512` moved to 6.65 ms when the
+64x64 tile was forced. A 64-row tile with a 2x2 fragment wave, a 128-row tile,
+and a 64x128 tile were also measured and were slower than both selected
+variants; they are not present in the kernel.
+
+Chunk effect, same diagnostic protocol as the gated delta-net table:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| GEMM, 248 submissions, position 0 | 944 ms | 895 ms |
+| Recurrent chunk, 24 layers | 67.6 ms | 63.7 ms |
+| Prefill attention, position 0 | 50.2 ms | 48.3 ms |
+| Profiled chunk total, position 0 | 1086 ms | 1030 ms |
+| Wall chunk total, position 0 | 1077 ms | 1025 ms |
+
+The GEMM change is a 5% improvement on the chunk, not the 2-3x that workstream B
+targeted: the 500 ms gate is not met. The isolated wide shapes follow the same
+ceiling as the rocBLAS FP16 baseline, which measured 4.6-4.7 TFLOP/s at
+`M=512` in the same sweep, so ordinary tile widening is not the lever that
+closes the gap. The CTA-order experiment that mapped consecutive blocks to M
+tiles was rejected: it improved the tall-K isolated shape but raised the wide
+shape, and the chunk GEMM total regressed to 947 ms.
+
+Resource report for the two selected variants:
+
+| Kernel | VGPR | SGPR | LDS | Scratch | Occupancy | Spills |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gemm_wmma_kernel<Q4_K,64,2>` | 72 | 29 | 32,768 B | 0 | 16 waves/SIMD | 0 |
+| `gemm_wmma_k32_kernel<Q4_K>` | 48 | 30 | 14,336 B | 0 | 16 waves/SIMD | 0 |
+
 ### Short-prompt latency and correctness
 
 The Phase 2 baseline at the top of this document submitted 16 prompt tokens
@@ -476,12 +524,8 @@ zero VGPR spills, and 16 waves/SIMD occupancy.
 
 | Kernel | VGPR | SGPR | Static LDS | Dynamic LDS |
 | --- | ---: | ---: | ---: | ---: |
-| `gemm_wmma_kernel<F32>` | 43 | 26 | 14,336 B | 0 |
-| `gemm_wmma_kernel<F16>` | 43 | 26 | 14,336 B | 0 |
-| `gemm_wmma_kernel<Q8_0>` | 45 | 26 | 14,336 B | 0 |
-| `gemm_wmma_kernel<Q4_K>` | 47 | 33 | 14,336 B | 0 |
-| `gemm_wmma_kernel<Q5_K>` | 47 | 34 | 14,336 B | 0 |
-| `gemm_wmma_kernel<Q6_K>` | 39 | 34 | 14,336 B | 0 |
+| `gemm_wmma_kernel<*,64,2>` | 64-75 | 28-34 | 32,768 B | 0 |
+| `gemm_wmma_k32_kernel<*>` | 39-50 | 26-34 | 14,336 B | 0 |
 | `attention_prefill_f32_kernel` | 53 | 40 | 0 | 32,768 B at head_dim 256 |
 | `gdn_chunk_f32_kernel` | 37 | 70 | 8 B | 2,048 B at state 128 |
 | `gdn_chunk_splitreg_f32_kernel<128>` | 93 | 34 | 1,064 B | 0 |

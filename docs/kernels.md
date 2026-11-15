@@ -215,28 +215,49 @@ the measured F16 shape classes, not a fallback for unsupported quantization.
 
 ### 6.2 Custom WMMA GEMM
 
-`gemm_wmma_kernel` computes a 32x64 output tile with eight waves. Each wave owns
-one 16x16 fragment and accumulates in FP32 across the K dimension.
+Two rocWMMA tile variants share the packed-load helper and are selected inside
+`launch_gemm_wmma_f32out` from the measured row and shape class:
 
-1. Load a 32x32 FP32 `X` tile and convert it to FP16 in shared memory.
-2. Stream the corresponding 64x32 weight tile and decode one 32-value
-   quantization sub-block per wave lane directly into the FP16 shared tile.
-3. Run two 16x16x16 WMMA operations per wave per K step.
-4. Stage the FP32 accumulator tile in shared memory and write only the valid
+- `gemm_wmma_k32_kernel`: 32x64 output tile, eight waves, one 16x16 fragment
+  per wave, 32-wide K step. This is the original Phase 3 kernel.
+- `gemm_wmma_kernel<DType, 64, 2>`: 64x64 output tile, eight waves, one A
+  fragment and two B fragments per wave, 64-wide K step with double-buffered
+  shared-memory staging. One decoded weight tile feeds two accumulator
+  fragments and 64 activation rows.
+
+Both variants:
+
+1. Load the FP32 `X` tile and convert it to FP16 in shared memory.
+2. Stream and decode the weight tile directly into the FP16 shared tile, one
+   32-value quantization sub-block at a time.
+3. Accumulate in FP32 with 16x16x16 WMMA operations.
+4. Stage the FP32 accumulator tile in shared memory and write only valid
    output elements, so non-aligned `M` and `N` edges are safe.
 
-The K step is 32 because every K-quant superblock splits into 32-value
-sub-blocks. A segment therefore uses exactly one scale/min pair (or two 16-value
-Q6_K scales) and never crosses a superblock. No dequantized weight matrix is
-materialized. `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, and `F32` share the same
-tile path; only the packed-load helper differs.
+A 64-wide K step consumes two 32-value segments in order. Each segment keeps
+its own Q4_K/Q5_K scale and min pair, or its two 16-value Q6_K scales, so a
+segment never crosses a scale boundary. No dequantized weight matrix is
+materialized. `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, and `F32` share the tile
+path; only the packed-load helper differs.
 
-Static shared memory is 14 KiB per workgroup: 2 KiB A tile, 4 KiB B tile, and
-8 KiB output staging. Compiler-reported usage is 39-47 VGPRs, 26-34 SGPRs, no
-spills, and a 16 waves/SIMD resource maximum. The kernel is not pipelined in
-this release: LDS double-buffering, a wider K step, and a larger M tile for
-weight reuse across workgroups are planned under [roadmap2.md](roadmap2.md);
-they are not implemented and are not claimed in the benchmark results.
+The 64x64 variant is selected for `rows >= 64` when `K <= N`; the 32x64 variant
+remains selected for tall-K projections and smaller batches. This rule comes
+from the 2026-11-15 sweep: the 64x64 tile improved wide 512-row shapes by 3-7%
+and did not win for `K > N`, where the 32x64 tile is 5-20% faster. The
+double-buffered variant reports 64-75 VGPRs, 28-34 SGPRs, 32 KiB static LDS, no
+spills, and 16 waves/SIMD. The 32x64 variant reports 39-50 VGPRs, 26-34 SGPRs,
+14 KiB static LDS, no spills, and 16 waves/SIMD. The isolated improvements did
+not move the 512-row chunk GEMM total outside run-to-run noise (944 ms before,
+895 ms after in the last diagnostic), so the 500 ms workstream gate is not met.
+
+A CTA-order experiment that mapped consecutive blocks to M tiles was measured
+and rejected: it reduced the tall-K time but raised the wide-projection time,
+and the position-0 chunk GEMM total regressed to 947 ms. The kernels keep `N`
+fastest in `blockIdx.x`.
+
+Larger tiles, an int8 tensor-core path, and epilogue fusions remain candidates
+under [roadmap2.md](roadmap2.md); they are not implemented and are not claimed
+in the benchmark results.
 
 ### 6.3 Dispatch
 
