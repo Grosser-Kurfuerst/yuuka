@@ -797,8 +797,8 @@ bool test_attention_prefill(yuuka_device * device, yuuka_stream * stream,
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
-                          yuuka_event * event, std::mt19937 & rng) {
-    const int rows = 128, groups = 16, heads = 32, state = 128, kernel = 4;
+                          yuuka_event * event, std::mt19937 & rng, int state) {
+    const int rows = 128, groups = 16, heads = 32, kernel = 4;
     const int inner = heads * state, conv_dim = 2 * groups * state + inner;
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     std::vector<float> qkv(size_t(rows * conv_dim)), z(size_t(rows * inner));
@@ -990,7 +990,7 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
                 }
             }
         }
-        std::printf("recurrent chunk: %s (max abs %.3g)\n", ok ? "ok" : "FAILED", max_abs);
+        std::printf("recurrent chunk state=%d: %s (max abs %.3g)\n", state, ok ? "ok" : "FAILED", max_abs);
     }
     if (plan != nullptr) yuuka_plan_destroy(plan);
     release(ob);
@@ -1058,7 +1058,8 @@ int main() {
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
-    ok = test_recurrent_chunk(device, stream, event, rng) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 128) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 64) && ok;
 
     yuuka_event_destroy(event);
     yuuka_stream_destroy(stream);

@@ -399,6 +399,42 @@ The test is opt-in because it loads the full model. It is a diagnostic path:
 do not use its numbers as release benchmarks without the metadata and
 repetition requirements in [testing.md](testing.md).
 
+### Gated delta-net register state (2026-11-15)
+
+The `gdn_chunk_splitreg_f32_kernel` path replaced the per-row global state
+traversal described above. Measurement conditions match the attribution run:
+`Qwen3.5-4B-Q4_K_M.gguf`, `gfx1151`, HIP, F32 KV, chunk size 512, one warmup,
+one diagnostic `ExecuteProfiled` execution. The same test command as the
+attribution section was used.
+
+| Operation | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Recurrent chunk, 24 layers | 551 ms | 67.6 ms | 8.1x faster |
+| WMMA GEMM, 248 submissions | 909 ms | 944 ms | unchanged path |
+| Prefill attention, position 0 | 48.7 ms | 50.2 ms | unchanged path |
+| Profiled chunk total, position 0 | 1534 ms | 1086 ms | 1.41x faster |
+| Wall chunk total, position 0 | 1553 ms | 1077 ms | 1.44x faster |
+
+The recurrent-chunk time is constant at positions 0, 2048, and 7680 (67.6,
+67.7, and 67.7 ms), so the register path removed the state traffic that scaled
+only with rows. This meets the A1 acceptance target of at most 150 ms and is
+below the sequencing target of 50-150 ms. The provisional A1-A3 total-chunk
+target of 1050 ms was not met at 1077 ms; the remaining gap is the GEMM path.
+
+`tests/hip/prefill_test.cpp` checks the register path against its float
+reference at state 128 and the fallback fused kernel at state 64, and repeats
+the same execution to require bitwise-identical output and conv scratch. The
+resource report for the new kernels:
+
+| Kernel | VGPR | SGPR | LDS | Scratch | Occupancy | Spills |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gdn_chunk_splitreg_f32_kernel<128>` | 93 | 34 | 1,064 B | 0 | 16 waves/SIMD | 0 |
+| `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 | 0 | 16 waves/SIMD | 0 |
+
+An earlier one-column-per-lane variant kept all 128 state values in one thread
+and compiled to 192 VGPRs with 90 spills, so it was rejected; the four-lane
+column split is the accepted mapping.
+
 ### Short-prompt latency and correctness
 
 The Phase 2 baseline at the top of this document submitted 16 prompt tokens
@@ -448,6 +484,8 @@ zero VGPR spills, and 16 waves/SIMD occupancy.
 | `gemm_wmma_kernel<Q6_K>` | 39 | 34 | 14,336 B | 0 |
 | `attention_prefill_f32_kernel` | 53 | 40 | 0 | 32,768 B at head_dim 256 |
 | `gdn_chunk_f32_kernel` | 37 | 70 | 8 B | 2,048 B at state 128 |
+| `gdn_chunk_splitreg_f32_kernel<128>` | 93 | 34 | 1,064 B | 0 |
+| `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 | 0 |
 | `rmsnorm_batch_f32_kernel` | 9 | 18 | 1,024 B | 0 |
 | `rmsnorm_heads_batch_f32_kernel` | 9 | 20 | 1,024 B | 0 |
 | `rope_batch_f32_kernel` | 19 | 18 | 0 | 0 |

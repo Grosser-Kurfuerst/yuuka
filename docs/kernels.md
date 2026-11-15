@@ -414,15 +414,21 @@ traffic without reducing occupancy:
 - Gated delta-net chunk: convolution state update, q/k L2 normalization, the
   128x128 recurrent update, and gated RMSNorm per head. It replaces five
   launches and one normalized intermediate per token with two launches per
-  layer. Each thread owns one state column for a token row, and a barrier
-  separates the q and k block reductions because both reuse the same shared
-  reduction scratch. Both choices are required for deterministic multi-row
-  execution; the row-major state layout is unchanged and shared with the decode
-  kernel. The column is read from and written back to the state buffer for
-  every row, so the kernel re-traverses the full state four times per row. That
-  traffic and the 32-workgroup grid are the measured bottleneck; register
-  residency, column-block splitting, and shuffle reductions are planned under
-  [roadmap2.md](roadmap2.md) and are not implemented.
+  layer. The register-resident path (`gdn_chunk_splitreg_f32_kernel`) covers
+  state size 128, where four lanes cooperate on one state column and each lane
+  holds 32 of the 128 state rows in registers for the whole chunk. A layer
+  exposes `heads * (state / 32)` workgroups instead of `heads` workgroups; q/k
+  normalization is recomputed per workgroup, and the per-row cost is two block
+  barriers for the q/k and decay/beta handoff. The q and k partial reductions
+  are wave shuffles combined through shared memory, and the per-column `S^T k`
+  and `S^T q` dot products are summed across the four lanes with shuffles.
+  Gated RMSNorm runs as a separate row kernel over each `(row, head)` pair,
+  because splitting columns across workgroups would otherwise break the
+  per-head normalization domain. State sizes other than 128 use the fused
+  one-column-per-thread kernel, which reads and writes the state for every row.
+  Both paths keep the row-major state layout shared with the decode kernel.
+  The register path is the measured fast path; see the attribution in
+  [benchmarks.md](benchmarks.md).
 
 SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
 epilogue, together with fusing the gate/up GEMMs themselves, is a candidate

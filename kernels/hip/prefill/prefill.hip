@@ -353,6 +353,129 @@ __global__ void gdn_chunk_f32_kernel(float * rec, const float * conv,
     }
 }
 
+// gdn_chunk_splitreg_f32_kernel keeps the recurrent state in registers for the
+// whole chunk. One workgroup covers 32 state columns; four lanes cooperate on
+// one column, each holding 32 of its 128 state rows. A layer therefore exposes
+// heads * (State / 32) workgroups instead of heads workgroups, and the only
+// block barriers are the two required by the q/k and decay/beta handoff per
+// token row. q/k normalization is recomputed per workgroup; that work is
+// negligible next to the state update.
+template <int State>
+__global__ void gdn_chunk_splitreg_f32_kernel(float * rec, const float * conv,
+                                              const float * alpha, const float * beta,
+                                              const float * dt, const float * a,
+                                              float * out, int rows, int groups,
+                                              int heads, int conv_dim, int inner,
+                                              float eps, float q_scale) {
+    constexpr int kSplit = 4;
+    constexpr int kChunk = State / kSplit;
+    constexpr int kCols = 32;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int head = blockIdx.x;
+    const int column_in_block = tid / kSplit;
+    const int part = tid % kSplit;
+    const int col = blockIdx.y * kCols + column_in_block;
+    const int r0 = part * kChunk;
+    const int kh = head % groups;
+    const int key_dim = groups * State;
+    float * matrix = rec + static_cast<int64_t>(head) * State * State;
+    __shared__ float qs[State];
+    __shared__ float ks[State];
+    __shared__ float q_part[State / 32];
+    __shared__ float k_part[State / 32];
+    __shared__ float decay_shared;
+    __shared__ float beta_shared;
+    float column[kChunk];
+    #pragma unroll
+    for (int j = 0; j < kChunk; ++j) {
+        column[j] = matrix[(r0 + j) * State + col];
+    }
+    for (int r = 0; r < rows; ++r) {
+        const float * row = conv + static_cast<int64_t>(r) * conv_dim;
+        const float q_raw = row[kh * State + tid];
+        const float k_raw = row[key_dim + kh * State + tid];
+        const float q_sum = warp_reduce_sum(q_raw * q_raw);
+        const float k_sum = warp_reduce_sum(k_raw * k_raw);
+        if (lane == 0) {
+            q_part[wave] = q_sum;
+            k_part[wave] = k_sum;
+        }
+        if (tid == 0) {
+            const float raw = alpha[static_cast<int64_t>(r) * heads + head] + dt[head];
+            const float softplus = raw > 20.0f ? raw : log1pf(expf(raw));
+            decay_shared = expf(softplus * a[head]);
+            beta_shared = 1.0f / (1.0f + expf(-beta[static_cast<int64_t>(r) * heads + head]));
+        }
+        __syncthreads();
+        float q_total = 0.0f;
+        float k_total = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < State / 32; ++w) {
+            q_total += q_part[w];
+            k_total += k_part[w];
+        }
+        qs[tid] = q_raw * q_scale * rsqrtf(q_total + eps);
+        ks[tid] = k_raw * rsqrtf(k_total + eps);
+        __syncthreads();
+        const float decay = decay_shared;
+        const float b = beta_shared;
+        float sk = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < kChunk; ++j) {
+            column[j] *= decay;
+            sk = fmaf(column[j], ks[r0 + j], sk);
+        }
+        sk += __shfl_xor_sync(0xffffffffffffffffull, sk, 1);
+        sk += __shfl_xor_sync(0xffffffffffffffffull, sk, 2);
+        const float value = row[2 * key_dim + head * State + col];
+        const float delta = (value - sk) * b;
+        float result = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < kChunk; ++j) {
+            column[j] = fmaf(ks[r0 + j], delta, column[j]);
+            result = fmaf(column[j], qs[r0 + j], result);
+        }
+        result += __shfl_xor_sync(0xffffffffffffffffull, result, 1);
+        result += __shfl_xor_sync(0xffffffffffffffffull, result, 2);
+        if (part == 0) {
+            out[static_cast<int64_t>(r) * inner + head * State + col] = result;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < kChunk; ++j) {
+        matrix[(r0 + j) * State + col] = column[j];
+    }
+}
+
+// gdn_norm_gate_rows_f32_kernel applies the gated RMSNorm to the raw per-column
+// dot products written by gdn_chunk_splitreg_f32_kernel. One wave owns one
+// (row, head) pair, so the row reduction needs no block barrier and the column
+// split does not change the normalization domain.
+__global__ void gdn_norm_gate_rows_f32_kernel(float * out, const float * z,
+                                              const float * norm, int heads,
+                                              int state, int inner, float eps) {
+    const int lane = threadIdx.x & 31;
+    const int head = blockIdx.x * 4 + (threadIdx.x >> 5);
+    const int row = blockIdx.y;
+    if (head >= heads) {
+        return;
+    }
+    float * h = out + static_cast<int64_t>(row) * inner + head * state;
+    const float * gate = z + static_cast<int64_t>(row) * inner + head * state;
+    float sum = 0.0f;
+    for (int d = lane; d < state; d += 32) {
+        sum += h[d] * h[d];
+    }
+    sum = warp_reduce_sum(sum);
+    const float scale = rsqrtf(sum / static_cast<float>(state) + eps);
+    for (int d = lane; d < state; d += 32) {
+        const float g = gate[d];
+        h[d] *= scale * norm[d] * (g / (1.0f + expf(-g)));
+    }
+}
+
 __global__ void cast_f32_to_f16_kernel(__half * dst, const float * src, int64_t n) {
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -657,6 +780,18 @@ void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
     const int conv_blocks = (conv_dim + kThreads - 1) / kThreads;
     conv1d_chunk_f32_kernel<<<conv_blocks, kThreads, 0, stream>>>(
         conv_state, conv_weights, qkv, conv, conv_dim, conv_kernel, rows);
+    if (state_size == 128) {
+        const dim3 grid(static_cast<unsigned>(heads),
+                        static_cast<unsigned>(state_size / 32));
+        gdn_chunk_splitreg_f32_kernel<128><<<grid, 128, 0, stream>>>(
+            rec_state, conv, alpha, beta, dt, a, out, rows, groups, heads,
+            conv_dim, inner, eps, q_scale);
+        const dim3 norm_grid(static_cast<unsigned>((heads + 3) / 4),
+                             static_cast<unsigned>(rows));
+        gdn_norm_gate_rows_f32_kernel<<<norm_grid, 128, 0, stream>>>(
+            out, z, norm, heads, state_size, inner, eps);
+        return;
+    }
     const size_t shared = size_t(4 * state_size) * sizeof(float);
     gdn_chunk_f32_kernel<<<heads, static_cast<unsigned>(state_size), shared, stream>>>(
         rec_state, conv, z, alpha, beta, dt, a, norm, out, rows, groups, heads,

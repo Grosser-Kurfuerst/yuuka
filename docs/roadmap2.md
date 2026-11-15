@@ -211,6 +211,22 @@ isolated kernel over 512-4096 tokens on CDNA. That result does not transfer
 directly to gfx1151; it is a design reference, not a performance claim. This
 work is a larger rewrite and must keep the decode recurrence unchanged.
 
+### 3.6 Status (2026-11-15)
+
+A1-A3 are implemented and measured; A4 is not needed for the current gate.
+`gdn_chunk_splitreg_f32_kernel` keeps 32 state rows per lane in registers, with
+four lanes per column, and exposes `heads * (state / 32)` workgroups. The
+per-row cost is two block barriers. Gated RMSNorm runs as a separate row kernel
+because the column split would otherwise change the normalization domain.
+State sizes other than 128 keep the fused fallback.
+
+Measured under the diagnostic protocol: 551 ms to 67.6 ms for the 24 recurrent
+layers of a 512-row chunk, no spills, 93 VGPRs, 16 waves/SIMD, and bitwise
+repeatability in `tests/hip/prefill_test.cpp`. The A1 time target (at most
+150 ms) is met. The provisional total-chunk target of 1050 ms was not met
+(1077 ms) because the GEMM path is unchanged. See
+[benchmarks.md](benchmarks.md#gated-delta-net-register-state-2026-11-15).
+
 ## 4. Workstream B: prefill GEMM
 
 ### 4.1 Problem
