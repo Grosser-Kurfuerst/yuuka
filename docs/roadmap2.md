@@ -347,6 +347,24 @@ length. Greedy tokens and chunk-size equivalence are unchanged. Q/K/V
 projection fusion, beta/alpha projection fusion, and RMSNorm epilogue fusion
 remain unstarted.
 
+### 4.9 B4 status: not accepted (2026-11-15)
+
+The int8 tensor-core path is not implemented. The gfx1151 dense WMMA reference
+lists both `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` and
+`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32` at 8192 operations per 32-cycle
+issue, so true int8 does not raise the instruction issue rate on this device.
+The precision-ladder ratios cited in section 4.5 compare int8 against an
+int8-to-FP16 conversion path; they do not apply to the packed-weight kernel,
+which already decodes into an FP16 WMMA operand.
+
+The measured kernel is not operand-bandwidth bound: the 512-row chunk GEMM
+consumed about 38 GB/s of the 221 GB/s read bandwidth before the tile changes,
+and the later tile/fusion work reduced that further. An int8 path would add
+per-32 activation quantization and Q4_K/Q5_K min-term correction to the
+epilogue without a measured issue-rate gain, and would require a token-level
+tolerance change. It stays rejected until a register-blocked GEMM makes the
+kernel compute-bound; the FP16 WMMA path remains the fallback either way.
+
 ## 5. Workstream C: prefill attention
 
 ### 5.1 Problem
