@@ -387,6 +387,31 @@ register/LDS layout and compare against the scalar tile path.
 - The attention reference tolerance `2e-4 * (1 + |expected|)` still passes.
 - Chunked-prefill equivalence across chunk sizes still passes.
 
+### 5.7 Status (2026-11-15)
+
+C1 and C2 are implemented. A workgroup now owns 16 query rows for one head
+(512 threads), stages K and V together in 16-key blocks, and reuses the staged
+V tile across all 16 rows. The per-lane shared stride is padded by one float;
+without that padding the staged-V version still measured 1484 ms at position
+7680, and with it the time is 643 ms. The shared staging reduces global V
+traffic by 16x, not the 32x that grouping the four query heads of one KV head
+would allow; those heads still rely on L2 reuse.
+
+C3 is measured but not adopted as a default: F16 KV measures 657.5 ms against
+643.1 ms for F32 at position 7680, so F32 stays the default and the F16 target
+of at most 600 ms is not met. C4 remains unstarted; no rocWMMA attention path is
+used.
+
+Results: position-7680 attention is 643 ms with F32 KV (target: at most 800 ms,
+met), and 657.5 ms with F16 KV (target: at most 600 ms, not met). End-to-end
+prefill reaches 515.9 tok/s at 512 tokens, 480.2 tok/s at 2048, 382.9 tok/s at
+8192, and 208.9 tok/s at 32768; the 32768 sequencing target of at least
+250 tok/s is not met. `TestGPUChunkedPrefillLongContext` reports bitwise
+identical logits at chunk sizes 128, 512, and 1024 with the same top-1 token,
+and the attention reference test passes at `2.98e-08` maximum absolute
+difference. See
+[benchmarks.md](benchmarks.md#prefill-attention-tiling-2026-11-15).
+
 ## 6. Workstream D: dispatch and planning
 
 These changes are small and must follow, not lead, the kernel work:

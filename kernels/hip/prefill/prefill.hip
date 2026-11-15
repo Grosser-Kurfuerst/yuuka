@@ -157,14 +157,16 @@ __global__ void embedding_batch_f32_kernel(float * out, const uint8_t * weights,
     }
 }
 
-constexpr int kQPerBlock = 8;
-constexpr int kKeysPerBlock = 32;
+constexpr int kQPerBlock = 16;
+constexpr int kKeysPerBlock = 16;
 constexpr int kMaxHeadVec = 8;
+constexpr int kAttnThreads = 512;
 
 // attention_prefill_f32_kernel implements tiled online-softmax attention over
 // a prompt chunk. One wave owns one query row; the workgroup stages a block of
-// K in shared memory and reads V directly. The causal limit is position+row,
-// and each query head uses its GQA KV head.
+// K and V in shared memory, so the same V tile is reused by every query row in
+// the workgroup. The causal limit is position+row, and each query head uses its
+// GQA KV head.
 __global__ void attention_prefill_f32_kernel(float * out, const float * q,
                                              const float * k_cache,
                                              const float * v_cache, int kv_heads,
@@ -198,14 +200,20 @@ __global__ void attention_prefill_f32_kernel(float * out, const float * q,
     }
     float m = -INFINITY;
     float l = 0.0f;
-    extern __shared__ float k_shared[];
+    const int lane_stride = vec + 1;
+    const int key_stride = 32 * lane_stride;
+    extern __shared__ float kv_shared[];
+    float * k_shared = kv_shared;
+    float * v_shared = kv_shared + kKeysPerBlock * key_stride;
     for (int k0 = 0; k0 <= max_pos; k0 += kKeysPerBlock) {
         const int valid = min(kKeysPerBlock, max_pos + 1 - k0);
         for (int idx = tid; idx < valid * head_dim; idx += blockDim.x) {
             const int kk = idx / head_dim;
             const int d = idx % head_dim;
-            k_shared[kk * head_dim + d] =
-                k_cache[static_cast<int64_t>(k0 + kk) * kv_dim + kvh * head_dim + d];
+            const int64_t row = k0 + kk;
+            const int slot = kk * key_stride + (d / vec) * lane_stride + d % vec;
+            k_shared[slot] = k_cache[row * kv_dim + kvh * head_dim + d];
+            v_shared[slot] = v_cache[row * kv_dim + kvh * head_dim + d];
         }
         __syncthreads();
         if (active) {
@@ -216,7 +224,8 @@ __global__ void attention_prefill_f32_kernel(float * out, const float * q,
                 for (int i = 0; i < kMaxHeadVec; ++i) {
                     const int d = lane * vec + i;
                     if (i < vec && d < head_dim) {
-                        dot += qv[i] * k_shared[kk * head_dim + d];
+                        dot += qv[i] *
+                               k_shared[kk * key_stride + lane * lane_stride + i];
                     }
                 }
                 #pragma unroll
@@ -229,13 +238,12 @@ __global__ void attention_prefill_f32_kernel(float * out, const float * q,
                 const float p = expf(s - m_new);
                 l = l * corr + p;
                 m = m_new;
-                const float * v_ptr = v_cache +
-                    static_cast<int64_t>(k0 + kk) * kv_dim + kvh * head_dim + lane * vec;
                 #pragma unroll
                 for (int i = 0; i < kMaxHeadVec; ++i) {
                     const int d = lane * vec + i;
                     if (i < vec && d < head_dim) {
-                        acc[i] = acc[i] * corr + p * v_ptr[i];
+                        acc[i] = acc[i] * corr +
+                                 p * v_shared[kk * key_stride + lane * lane_stride + i];
                     }
                 }
             }
@@ -573,15 +581,22 @@ __global__ void attention_prefill_paged_f32_kernel(
     }
     float m = -INFINITY;
     float l = 0.0f;
-    extern __shared__ float k_shared[];
+    const int lane_stride = vec + 1;
+    const int key_stride = 32 * lane_stride;
+    extern __shared__ float kv_shared[];
+    float * k_shared = kv_shared;
+    float * v_shared = kv_shared + kKeysPerBlock * key_stride;
     for (int k0 = 0; k0 <= max_pos; k0 += kKeysPerBlock) {
         const int valid = min(kKeysPerBlock, max_pos + 1 - k0);
         for (int idx = tid; idx < valid * head_dim; idx += blockDim.x) {
             const int kk = idx / head_dim;
             const int d = idx % head_dim;
             const int64_t row = paged_kv_row(block_table, block_size, k0 + kk);
-            k_shared[kk * head_dim + d] =
+            const int slot = kk * key_stride + (d / vec) * lane_stride + d % vec;
+            k_shared[slot] =
                 kv_load(k_pool, dtype, row, kvh * head_dim + d, kv_dim);
+            v_shared[slot] =
+                kv_load(v_pool, dtype, row, kvh * head_dim + d, kv_dim);
         }
         __syncthreads();
         if (active) {
@@ -592,7 +607,8 @@ __global__ void attention_prefill_paged_f32_kernel(
                 for (int i = 0; i < kMaxHeadVec; ++i) {
                     const int d = lane * vec + i;
                     if (i < vec && d < head_dim) {
-                        dot += qv[i] * k_shared[kk * head_dim + d];
+                        dot += qv[i] *
+                               k_shared[kk * key_stride + lane * lane_stride + i];
                     }
                 }
                 #pragma unroll
@@ -605,14 +621,12 @@ __global__ void attention_prefill_paged_f32_kernel(
                 const float p = expf(s - m_new);
                 l = l * corr + p;
                 m = m_new;
-                const int64_t vrow = paged_kv_row(block_table, block_size, k0 + kk);
                 #pragma unroll
                 for (int i = 0; i < kMaxHeadVec; ++i) {
                     const int d = lane * vec + i;
                     if (i < vec && d < head_dim) {
                         acc[i] = acc[i] * corr +
-                                 p * kv_load(v_pool, dtype, vrow,
-                                             kvh * head_dim + d, kv_dim);
+                                 p * v_shared[kk * key_stride + lane * lane_stride + i];
                     }
                 }
             }
@@ -709,8 +723,10 @@ void launch_attention_prefill_f32(float * out, const float * q,
     }
     const int blocks = (rows + kQPerBlock - 1) / kQPerBlock;
     const dim3 grid(static_cast<unsigned>(heads), static_cast<unsigned>(blocks));
-    const size_t shared = size_t(kKeysPerBlock) * size_t(head_dim) * sizeof(float);
-    attention_prefill_f32_kernel<<<grid, kThreads, shared, stream>>>(
+    const int vec = (head_dim + 31) / 32;
+    const size_t shared =
+        size_t(2 * kKeysPerBlock) * size_t(32 * (vec + 1)) * sizeof(float);
+    attention_prefill_f32_kernel<<<grid, kAttnThreads, shared, stream>>>(
         out, q, k_cache, v_cache, kv_heads, heads, head_dim, kv_dim, rows,
         position, capacity, scale);
 }
@@ -753,13 +769,15 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
     }
     const int blocks = (rows + kQPerBlock - 1) / kQPerBlock;
     const dim3 grid(static_cast<unsigned>(heads), static_cast<unsigned>(blocks));
-    const size_t shared = size_t(kKeysPerBlock) * size_t(head_dim) * sizeof(float);
+    const int vec = (head_dim + 31) / 32;
+    const size_t shared =
+        size_t(2 * kKeysPerBlock) * size_t(32 * (vec + 1)) * sizeof(float);
     if (dense) {
-        attention_prefill_paged_f32_kernel<true><<<grid, kThreads, shared, stream>>>(
+        attention_prefill_paged_f32_kernel<true><<<grid, kAttnThreads, shared, stream>>>(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
             head_dim, kv_dim, rows, position, scale, dtype);
     } else {
-        attention_prefill_paged_f32_kernel<false><<<grid, kThreads, shared, stream>>>(
+        attention_prefill_paged_f32_kernel<false><<<grid, kAttnThreads, shared, stream>>>(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
             head_dim, kv_dim, rows, position, scale, dtype);
     }

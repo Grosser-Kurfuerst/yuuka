@@ -282,34 +282,36 @@ from assumptions about other RDNA parts.
 
 The isolated GEMM is weight-reuse limited: with a 32-row M tile, each
 workgroup reloads the weight tile, so a 512-row chunk reads every weight tile
-16 times. The end-to-end prompt path measured about 313 tok/s at 512 tokens
-after the recurrent-kernel fix, versus llama.cpp HIP at about 2163 tok/s on the
-same GGUF and device. A 2026-11-14 diagnostic attribution of a 512-token chunk
-measured GEMM at 59%, the gated delta-net chunk kernel at 36%, and prefill
-attention at 3% at position 0; attention grows with context and dominates at
-long positions. The ordered optimization plan is [roadmap2.md](roadmap2.md).
-None of its targets are implemented or claimed in the benchmark results.
+16 times. The 64-row tile halves that for wide projections at large row counts.
+The 2026-11-15 measurements put a 512-token prompt at 516 tok/s, versus
+llama.cpp HIP at about 2163 tok/s on the same GGUF and device. In the
+position-0 chunk attribution, GEMM is 895 ms (87%), the gated delta-net chunk
+is 63.7 ms, and prefill attention is 17.8 ms; attention dominates at long
+positions and was reduced from 2030 ms to 643 ms at position 7680. The ordered
+optimization plan and its per-workstream status are in
+[roadmap2.md](roadmap2.md).
 
 ## 7. Attention
 
 ### 7.1 Prefill: Flash Attention
 
-`attention_prefill_f32_kernel` processes a prompt chunk with one wave per query
-row. A workgroup owns eight query rows for one head.
+`attention_prefill_f32_kernel` (and its paged counterpart) processes a prompt
+chunk with one wave per query row. A workgroup owns 16 query rows for one head
+with 512 threads.
 
 - Q is read into registers, with each lane holding `ceil(head_dim/32)` values.
-- K is staged one 32-key block at a time in dynamic shared memory
-  (`32 * head_dim * 4` bytes; 32 KiB for head_dim 256). V is read from global
-  memory with coalesced per-lane vectors. V is not staged in this release, so
-  the load is on the softmax dependency chain and the same V rows are read by
-  each query row in the workgroup and by each query head that shares a KV head.
-  Shared-memory V staging and query tiling are planned under
-  [roadmap2.md](roadmap2.md); they are not implemented.
+- K and V are staged together, 16 keys at a time, in dynamic shared memory as
+  FP32. The shared layout stores each lane's `vec` values with a stride of
+  `vec + 1`, so the lane-parallel dot-product and value reads are bank-conflict
+  free. The workgroup reuses one staged V tile across all 16 query rows, which
+  cuts global V traffic by 16x relative to the previous one-row tile. Query
+  heads that share a KV head still stage their own tile; they are not grouped
+  in one workgroup, and only L2 reuse applies across them.
 - Scores are reduced within the wave; online softmax keeps per-row max, sum,
   and FP32 value accumulators, so the full attention matrix is never
   materialized.
 - Causality uses the chunk position: query row `r` may attend to keys
-  `0..position+r`. Waves in a workgroup share the K-block loop to keep
+  `0..position+r`. Waves in a workgroup share the K/V-block loop to keep
   `__syncthreads` convergent and mask keys beyond their own position.
 - GQA maps query head `h` to KV head `h / (heads/kv_heads)`.
 - The Qwen3.5 attention gate (the second half of each query vector) is applied
@@ -317,6 +319,14 @@ row. A workgroup owns eight query rows for one head.
   this gated layout; `ATTENTION_PREFILL` rejects `u[3] != 0` with an unsupported
   capability error. The dense flag applies to the paged variants in section
   7.4.
+
+Dynamic shared memory is `2 * 16 * 32 * (vec + 1) * 4` bytes, or 36 KiB at
+`head_dim = 256`. The kernels report 49-53 VGPRs, 48-63 SGPRs, no spills, and
+16 waves/SIMD. F16 KV is still loaded and staged as FP32; with the staged-V
+kernel it measured slightly slower than F32 KV at position 7680 (657.5 ms
+versus 643.1 ms), so F32 remains the default and F16 stays a capacity option.
+The measured position-7680 attention time is 643 ms with F32 KV, down from
+2030 ms before this change.
 
 Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
 unsupported capability error above 256. Decode attention remains the

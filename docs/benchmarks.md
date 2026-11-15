@@ -483,6 +483,55 @@ Resource report for the two selected variants:
 | `gemm_wmma_kernel<Q4_K,64,2>` | 72 | 29 | 32,768 B | 0 | 16 waves/SIMD | 0 |
 | `gemm_wmma_k32_kernel<Q4_K>` | 48 | 30 | 14,336 B | 0 | 16 waves/SIMD | 0 |
 
+### Prefill attention tiling (2026-11-15)
+
+The prefill attention kernels now process 16 query rows per workgroup with 512
+threads, stage K and V together in 16-key blocks, and pad the per-lane shared
+stride by one float to remove the 8-way bank conflict in the lane-parallel dot
+product and value accumulation. Measurement conditions match the attribution
+run; the F32 KV diagnostic uses the same `ExecuteProfiled` command.
+
+| Chunk start position | F32 KV before | F32 KV after | F16 KV after |
+| ---: | ---: | ---: | ---: |
+| 0 | 48.7 ms | 17.8 ms | 18.5 ms |
+| 2048 | 421.5 ms | 159.4 ms | 174.3 ms |
+| 7680 | 2030.1 ms | 643.1 ms | 657.5 ms |
+
+The F32 position-7680 acceptance target of at most 800 ms is met; the F16
+target of at most 600 ms is not. F16 KV is slightly slower at every measured
+position after V staging because the staged tile is FP32 and the F16 load path
+adds conversion work without reducing the now-cached shared traffic. F32 KV
+therefore remains the default. The lane-padded shared layout is responsible for
+most of the gain; an intermediate version that staged K and V but kept the
+unpadded layout measured 1484 ms at position 7680.
+
+End-to-end prompt curves, `yuuka` HIP, Q4_K_M, greedy, chunk size 512, one
+measured repetition without warmup:
+
+| Prompt tokens | Before | After | Throughput after |
+| ---: | ---: | ---: | ---: |
+| 512 | 1.635 s | 0.992 s | 515.9 tok/s |
+| 2048 | 6.690 s | 4.265 s | 480.2 tok/s |
+| 8192 | 37.687 s | 21.394 s | 382.9 tok/s |
+| 32768 | 340.357 s | 156.868 s | 208.9 tok/s |
+
+The 32768-token run completes with unchanged greedy processing; the sequencing
+target of at least 250 tok/s at that length is not met, but the prefill time is
+2.17x shorter than the recorded Phase 3 run.
+
+The 512-token prefill rate improved from 313.06 to 515.9 tok/s. The
+position-0 chunk profile dropped from 1086 ms to 1001 ms profiled, and from
+1077 ms to 994 ms wall, with GEMM still at 895 ms of the total.
+
+At position 7680 the chunk profile is 1639 ms, with attention at 643 ms (39%),
+GEMM at 905 ms (55%), and the recurrent chunk at 66 ms. Resource report:
+
+| Kernel | VGPR | SGPR | Static LDS | Dynamic LDS | Spills |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `attention_prefill_f32_kernel` | 49 | 48 | 0 | 36,864 B at head_dim 256 | 0 |
+| `attention_prefill_paged_f32_kernel<dense>` | 51 | 63 | 0 | 36,864 B at head_dim 256 | 0 |
+| `attention_prefill_paged_f32_kernel<gated>` | 53 | 61 | 0 | 36,864 B at head_dim 256 | 0 |
+
 ### Short-prompt latency and correctness
 
 The Phase 2 baseline at the top of this document submitted 16 prompt tokens
@@ -526,7 +575,9 @@ zero VGPR spills, and 16 waves/SIMD occupancy.
 | --- | ---: | ---: | ---: | ---: |
 | `gemm_wmma_kernel<*,64,2>` | 64-75 | 28-34 | 32,768 B | 0 |
 | `gemm_wmma_k32_kernel<*>` | 39-50 | 26-34 | 14,336 B | 0 |
-| `attention_prefill_f32_kernel` | 53 | 40 | 0 | 32,768 B at head_dim 256 |
+| `attention_prefill_f32_kernel` | 49 | 48 | 0 | 36,864 B at head_dim 256 |
+| `attention_prefill_paged_f32_kernel<dense>` | 51 | 63 | 0 | 36,864 B at head_dim 256 |
+| `attention_prefill_paged_f32_kernel<gated>` | 53 | 61 | 0 | 36,864 B at head_dim 256 |
 | `gdn_chunk_f32_kernel` | 37 | 70 | 8 B | 2,048 B at state 128 |
 | `gdn_chunk_splitreg_f32_kernel<128>` | 93 | 34 | 1,064 B | 0 |
 | `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 | 0 |
