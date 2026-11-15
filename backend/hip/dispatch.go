@@ -18,13 +18,29 @@ const (
 	PrefillBLAS
 )
 
+// String returns the diagnostic name of a prefill path.
+func (p PrefillPath) String() string {
+	switch p {
+	case PrefillBatchedGemv:
+		return "batched-gemv"
+	case PrefillWMMA:
+		return "wmma"
+	case PrefillBLAS:
+		return "rocblas"
+	default:
+		return "unknown"
+	}
+}
+
 // SelectPrefillPath returns the measured prefill matmul choice for a dtype,
 // row count, and shape. Measurements are in docs/benchmarks.md. Batched GEMV
 // is selected below four rows and for the tall-K projections at the smallest
 // WMMA batch; at one row the sweep shows per-row submission is faster for F16,
 // Q8_0, and Q6_K, which remains a small-row follow-up. Above those points the
 // custom WMMA GEMM beats per-row submission; the rocBLAS FP16 baseline wins for
-// F16 only in the measured shape classes below.
+// F16 only in the measured shape classes below. The WMMA path selects its
+// 64x64 or 32x64 tile internally from the same measured row and shape class;
+// that choice is not exposed as a separate Go path.
 func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 	if rows <= 0 {
 		return PrefillBatchedGemv

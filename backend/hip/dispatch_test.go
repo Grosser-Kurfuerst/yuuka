@@ -87,7 +87,10 @@ func TestSelectPrefillPath(t *testing.T) {
 		{"f32 wide", tensor.F32, 8, 2560, 9216, PrefillWMMA},
 	}
 	for _, c := range cases {
-		if got := SelectPrefillPath(c.dtype, c.rows, c.nIn, c.nOut); got != c.want {
+		got := SelectPrefillPath(c.dtype, c.rows, c.nIn, c.nOut)
+		t.Logf("%s: dtype=%v rows=%d K=%d N=%d path=%s", c.name, c.dtype,
+			c.rows, c.nIn, c.nOut, got)
+		if got != c.want {
 			t.Errorf("%s: got path %d, want %d", c.name, got, c.want)
 		}
 	}

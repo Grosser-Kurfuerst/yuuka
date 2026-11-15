@@ -425,6 +425,17 @@ These changes are small and must follow, not lead, the kernel work:
   temporary test.
 - Do not add a runtime autotuner. Dispatch remains offline and documented.
 
+### 6.1 Status (2026-11-15)
+
+The chunk size remains 512; the 2026-11-14 chunk sweep did not justify a
+different value. `backend/hip.SelectPrefillPath` is unchanged because the
+measured batched-GEMV/WMMA/rocBLAS crossovers did not move. The WMMA path's
+internal 64x64-versus-32x64 tile selection is documented in
+[kernels.md](kernels.md) and follows the same measured row and shape classes.
+`PrefillPath.String` and the logged cases in `TestSelectPrefillPath` report the
+selected path, while `TestGPUProfilePrefill` reports per-operation time through
+`Plan.ExecuteProfiled`. No runtime autotuner was added.
+
 ## 7. Sequencing and provisional targets
 
 Dependencies are strict: B4 depends on B1-B3, and C4 depends on C1-C2.
