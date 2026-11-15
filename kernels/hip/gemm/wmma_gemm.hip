@@ -8,6 +8,9 @@ namespace {
 
 constexpr int kBlockN = 64;
 constexpr int kBlockK = 64;
+// The fused gate/up kernel stages three tiles, so it uses a 32-wide K step to
+// keep shared memory at 24 KiB and preserve occupancy.
+constexpr int kFusedBlockK = 32;
 constexpr int kThreads = 256;
 
 // segment_value decodes the weight value at an absolute k offset. K-quant
@@ -101,33 +104,33 @@ __device__ __forceinline__ float segment_value(const uint8_t * row, int64_t k,
     return 0.0f;
 }
 
-template <int BlockM>
+template <int BlockM, int BlockK>
 __device__ __forceinline__ void load_a_tile(__half * tile, const float * x,
                                             int64_t m0, int64_t k0, int64_t rows,
                                             int64_t n_in) {
-    for (int idx = threadIdx.x; idx < BlockM * kBlockK; idx += kThreads) {
-        const int r = idx / kBlockK;
-        const int c = idx % kBlockK;
+    for (int idx = threadIdx.x; idx < BlockM * BlockK; idx += kThreads) {
+        const int r = idx / BlockK;
+        const int c = idx % BlockK;
         const int64_t gr = m0 + r;
         const int64_t gk = k0 + c;
         const float value = (gr < rows && gk < n_in) ? x[gr * n_in + gk] : 0.0f;
-        tile[r * kBlockK + c] = __float2half(value);
+        tile[r * BlockK + c] = __float2half(value);
     }
 }
 
-template <uint32_t DType>
+template <uint32_t DType, int BlockK>
 __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
                                             int64_t n0, int64_t k0, int64_t n_in,
                                             int64_t n_out, uint64_t row_bytes) {
-    for (int idx = threadIdx.x; idx < kBlockN * kBlockK; idx += kThreads) {
-        const int s = idx / kBlockK;
-        const int c = idx % kBlockK;
+    for (int idx = threadIdx.x; idx < kBlockN * BlockK; idx += kThreads) {
+        const int s = idx / BlockK;
+        const int c = idx % BlockK;
         const int64_t gn = n0 + s;
         float value = 0.0f;
         if (gn < n_out) {
             value = segment_value<DType>(w + gn * row_bytes, k0 + c, n_in);
         }
-        tile[s * kBlockK + c] = __float2half(value);
+        tile[s * BlockK + c] = __float2half(value);
     }
 }
 
@@ -162,18 +165,18 @@ __global__ void gemm_wmma_kernel(float * out, const float * x, const uint8_t * w
         rocwmma::fill_fragment(c_frag1, 0.0f);
     }
 
-    load_a_tile<BlockM>(a_tile, x, m0, 0, rows, n_in);
-    load_b_tile<DType>(b_tile, w, n0, 0, n_in, n_out, row_bytes);
+    load_a_tile<BlockM, kBlockK>(a_tile, x, m0, 0, rows, n_in);
+    load_b_tile<DType, kBlockK>(b_tile, w, n0, 0, n_in, n_out, row_bytes);
     __syncthreads();
 
     int current = 0;
     for (int64_t k0 = 0; k0 < n_in; k0 += kBlockK) {
         const int next = current ^ 1;
         if (k0 + kBlockK < n_in) {
-            load_a_tile<BlockM>(a_tile + next * BlockM * kBlockK, x, m0,
-                                k0 + kBlockK, rows, n_in);
-            load_b_tile<DType>(b_tile + next * kBlockN * kBlockK, w, n0,
-                               k0 + kBlockK, n_in, n_out, row_bytes);
+            load_a_tile<BlockM, kBlockK>(a_tile + next * BlockM * kBlockK, x, m0,
+                                         k0 + kBlockK, rows, n_in);
+            load_b_tile<DType, kBlockK>(b_tile + next * kBlockN * kBlockK, w, n0,
+                                        k0 + kBlockK, n_in, n_out, row_bytes);
         }
         const __half * a_cur = a_tile + current * BlockM * kBlockK;
         const __half * b_cur = b_tile + current * kBlockN * kBlockK;
@@ -287,6 +290,118 @@ __global__ void gemm_wmma_k32_kernel(float * out, const float * x,
     }
 }
 
+// gemm_wmma_swiglu_kernel computes two GEMMs that share the same activation
+// tile and writes silu(gate) * up in one epilogue. Both weight matrices have
+// the same shape and dtype. The C staging tile aliases the A/B staging memory
+// after the K loop, and no gate or up intermediate is written to global memory.
+template <uint32_t DType, int BlockM, int NFragments>
+__global__ void gemm_wmma_swiglu_kernel(float * out, const float * x,
+                                        const uint8_t * w_gate,
+                                        const uint8_t * w_up, int64_t n_in,
+                                        int64_t n_out, int64_t rows,
+                                        uint64_t row_bytes) {
+    constexpr int kK = kFusedBlockK;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    constexpr int kWaveCols = kBlockN / 16 / NFragments;
+    const int wm = warp / kWaveCols;
+    const int wn = warp % kWaveCols;
+    const int64_t m0 = static_cast<int64_t>(blockIdx.y) * BlockM;
+    const int64_t n0 = static_cast<int64_t>(blockIdx.x) * kBlockN;
+
+    __shared__ __align__(16) unsigned char staging[
+        2 * (BlockM + 2 * kBlockN) * kK * sizeof(__half)];
+    __half * a_tile = reinterpret_cast<__half *>(staging);
+    __half * gate_tile = a_tile + 2 * BlockM * kK;
+    __half * up_tile = gate_tile + 2 * kBlockN * kK;
+    float * c_tile = reinterpret_cast<float *>(staging);
+
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> gate0;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> gate1;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> up0;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> up1;
+    rocwmma::fill_fragment(gate0, 0.0f);
+    rocwmma::fill_fragment(up0, 0.0f);
+    if constexpr (NFragments == 2) {
+        rocwmma::fill_fragment(gate1, 0.0f);
+        rocwmma::fill_fragment(up1, 0.0f);
+    }
+
+    load_a_tile<BlockM, kK>(a_tile, x, m0, 0, rows, n_in);
+    load_b_tile<DType, kK>(gate_tile, w_gate, n0, 0, n_in, n_out, row_bytes);
+    load_b_tile<DType, kK>(up_tile, w_up, n0, 0, n_in, n_out, row_bytes);
+    __syncthreads();
+
+    int current = 0;
+    for (int64_t k0 = 0; k0 < n_in; k0 += kK) {
+        const int next = current ^ 1;
+        if (k0 + kK < n_in) {
+            load_a_tile<BlockM, kK>(a_tile + next * BlockM * kK, x, m0,
+                                    k0 + kK, rows, n_in);
+            load_b_tile<DType, kK>(gate_tile + next * kBlockN * kK, w_gate, n0,
+                                   k0 + kK, n_in, n_out, row_bytes);
+            load_b_tile<DType, kK>(up_tile + next * kBlockN * kK, w_up, n0,
+                                   k0 + kK, n_in, n_out, row_bytes);
+        }
+        const __half * a_cur = a_tile + current * BlockM * kK;
+        const __half * g_cur = gate_tile + current * kBlockN * kK;
+        const __half * u_cur = up_tile + current * kBlockN * kK;
+        rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
+        rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> g_frag0;
+        rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> u_frag0;
+        rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> g_frag1;
+        rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> u_frag1;
+        for (int kk = 0; kk < kK; kk += 16) {
+            rocwmma::load_matrix_sync(a_frag, a_cur + (wm * 16) * kK + kk, kK);
+            rocwmma::load_matrix_sync(
+                g_frag0, g_cur + (wn * NFragments * 16) * kK + kk, kK);
+            rocwmma::load_matrix_sync(
+                u_frag0, u_cur + (wn * NFragments * 16) * kK + kk, kK);
+            rocwmma::mma_sync(gate0, a_frag, g_frag0, gate0);
+            rocwmma::mma_sync(up0, a_frag, u_frag0, up0);
+            if constexpr (NFragments == 2) {
+                rocwmma::load_matrix_sync(
+                    g_frag1, g_cur + (wn * NFragments * 16 + 16) * kK + kk, kK);
+                rocwmma::load_matrix_sync(
+                    u_frag1, u_cur + (wn * NFragments * 16 + 16) * kK + kk, kK);
+                rocwmma::mma_sync(gate1, a_frag, g_frag1, gate1);
+                rocwmma::mma_sync(up1, a_frag, u_frag1, up1);
+            }
+        }
+        __syncthreads();
+        current = next;
+    }
+
+    for (uint32_t i = 0; i < gate0.num_elements; ++i) {
+        const float g = gate0.x[i];
+        gate0.x[i] = (g / (1.0f + expf(-g))) * up0.x[i];
+    }
+    if constexpr (NFragments == 2) {
+        for (uint32_t i = 0; i < gate1.num_elements; ++i) {
+            const float g = gate1.x[i];
+            gate1.x[i] = (g / (1.0f + expf(-g))) * up1.x[i];
+        }
+    }
+
+    rocwmma::store_matrix_sync(c_tile + (wm * 16) * kBlockN + (wn * NFragments * 16),
+                               gate0, kBlockN, rocwmma::mem_row_major);
+    if constexpr (NFragments == 2) {
+        rocwmma::store_matrix_sync(
+            c_tile + (wm * 16) * kBlockN + (wn * NFragments * 16 + 16), gate1,
+            kBlockN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < BlockM * kBlockN; idx += kThreads) {
+        const int r = idx / kBlockN;
+        const int c = idx % kBlockN;
+        const int64_t gr = m0 + r;
+        const int64_t gn = n0 + c;
+        if (gr < rows && gn < n_out) {
+            out[gr * n_out + gn] = c_tile[r * kBlockN + c];
+        }
+    }
+}
+
 uint64_t packed_row_bytes(uint32_t dtype, uint64_t n_in) {
     switch (dtype) {
         case YUUKA_DTYPE_F32:
@@ -339,6 +454,35 @@ void launch_wmma_selected(float * out, const float * x, const uint8_t * w,
         out, x, w, n_in, n_out, rows, row_bytes);
 }
 
+template <uint32_t DType, int BlockM, int NFragments>
+void launch_wmma_swiglu_tile(float * out, const float * x, const uint8_t * w_gate,
+                             const uint8_t * w_up, int64_t n_in, int64_t n_out,
+                             int64_t rows, uint64_t row_bytes,
+                             hipStream_t stream) {
+    const dim3 grid(static_cast<unsigned>((n_out + kBlockN - 1) / kBlockN),
+                    static_cast<unsigned>((rows + BlockM - 1) / BlockM));
+    gemm_wmma_swiglu_kernel<DType, BlockM, NFragments>
+        <<<grid, kThreads, 0, stream>>>(out, x, w_gate, w_up, n_in, n_out, rows,
+                                        row_bytes);
+}
+
+// launch_wmma_swiglu_selected uses the same measured tile classes as the plain
+// GEMM: the 64-row tile for wide projections at 64 or more rows, otherwise the
+// 32-row tile.
+template <uint32_t DType>
+void launch_wmma_swiglu_selected(float * out, const float * x,
+                                 const uint8_t * w_gate, const uint8_t * w_up,
+                                 int64_t n_in, int64_t n_out, int64_t rows,
+                                 uint64_t row_bytes, hipStream_t stream) {
+    if (rows >= 64 && n_in <= n_out) {
+        launch_wmma_swiglu_tile<DType, 64, 2>(out, x, w_gate, w_up, n_in, n_out,
+                                              rows, row_bytes, stream);
+    } else {
+        launch_wmma_swiglu_tile<DType, 32, 1>(out, x, w_gate, w_up, n_in, n_out,
+                                              rows, row_bytes, stream);
+    }
+}
+
 } // namespace
 
 namespace yuuka {
@@ -389,6 +533,60 @@ void launch_gemm_wmma_f32out(float * out, const float * x, const void * w,
         case YUUKA_DTYPE_Q6_K:
             launch_wmma_selected<YUUKA_DTYPE_Q6_K>(out, x, weights, in, on, m,
                                                    row_bytes, stream);
+            break;
+        default:
+            break;
+    }
+}
+
+void launch_gemm_wmma_swiglu_f32out(float * out, const float * x,
+                                    const void * w_gate, const void * w_up,
+                                    uint64_t n_in, uint64_t n_out, uint64_t batch,
+                                    uint32_t dtype, hipStream_t stream) {
+    if (n_in == 0 || n_out == 0 || batch == 0) {
+        return;
+    }
+    const uint64_t row_bytes = packed_row_bytes(dtype, n_in);
+    if (row_bytes == 0) {
+        return;
+    }
+    const auto * gate = static_cast<const uint8_t *>(w_gate);
+    const auto * up = static_cast<const uint8_t *>(w_up);
+    const int64_t m = static_cast<int64_t>(batch);
+    const int64_t in = static_cast<int64_t>(n_in);
+    const int64_t on = static_cast<int64_t>(n_out);
+    switch (dtype) {
+        case YUUKA_DTYPE_F32:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_F32>(out, x, gate, up, in, on,
+                                                         m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_F16:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_F16>(out, x, gate, up, in, on,
+                                                         m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_Q4_0:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_Q4_0>(out, x, gate, up, in, on,
+                                                          m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_Q5_0:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_Q5_0>(out, x, gate, up, in, on,
+                                                          m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_Q8_0:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_Q8_0>(out, x, gate, up, in, on,
+                                                          m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_Q4_K:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_Q4_K>(out, x, gate, up, in, on,
+                                                          m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_Q5_K:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_Q5_K>(out, x, gate, up, in, on,
+                                                          m, row_bytes, stream);
+            break;
+        case YUUKA_DTYPE_Q6_K:
+            launch_wmma_swiglu_selected<YUUKA_DTYPE_Q6_K>(out, x, gate, up, in, on,
+                                                          m, row_bytes, stream);
             break;
         default:
             break;

@@ -506,7 +506,8 @@ most of the gain; an intermediate version that staged K and V but kept the
 unpadded layout measured 1484 ms at position 7680.
 
 End-to-end prompt curves, `yuuka` HIP, Q4_K_M, greedy, chunk size 512, one
-measured repetition without warmup:
+measured repetition without warmup. These are the workstream C numbers before
+the FFN gate/up fusion; the final numbers are in the next section:
 
 | Prompt tokens | Before | After | Throughput after |
 | ---: | ---: | ---: | ---: |
@@ -531,6 +532,53 @@ GEMM at 905 ms (55%), and the recurrent chunk at 66 ms. Resource report:
 | `attention_prefill_f32_kernel` | 49 | 48 | 0 | 36,864 B at head_dim 256 | 0 |
 | `attention_prefill_paged_f32_kernel<dense>` | 51 | 63 | 0 | 36,864 B at head_dim 256 | 0 |
 | `attention_prefill_paged_f32_kernel<gated>` | 53 | 61 | 0 | 36,864 B at head_dim 256 | 0 |
+
+### Fused FFN gate/up (2026-11-15)
+
+The prefill FFN now submits one fused gate/up GEMM when both projections select
+the custom WMMA path. The kernel stages one activation tile and both weight
+tiles, accumulates both matrices, and applies SwiGLU in the epilogue, so no gate
+or up intermediate is written and the separate `SILU_MUL` pass is removed. The
+fused kernel uses a 32-wide K step because staging three tiles at the 64-wide
+step raised shared memory to 48 KiB and measured 528 ms for the 32 fused ops;
+the 32-wide step uses 24 KiB and measures 308 ms.
+
+Position-0 chunk, same diagnostic protocol:
+
+| Operation | Before fusion | After fusion |
+| --- | ---: | ---: |
+| Remaining GEMM submissions | 248 / 895 ms | 184 / 534 ms |
+| Fused gate/up submissions | — | 32 / 308 ms |
+| Separate `SILU_MUL` | 32 / 6.3 ms | removed |
+| Recurrent chunk | 63.7 ms | 64.0 ms |
+| Prefill attention | 17.8 ms | 18.1 ms |
+| Profiled chunk total | 1001 ms | 942 ms |
+| Wall chunk total | 994 ms | 938 ms |
+
+The fused path replaces 64 GEMM submissions and 32 elementwise submissions with
+32 fused submissions. Its combined FFN gate/up time is 308 ms against 379 ms
+for the removed GEMM submissions, a 19% reduction for that pair and 5.6% for
+the whole chunk. Greedy output is unchanged:
+`TestGPUChunkedPrefillLongContext` still reports bitwise identical logits at
+chunk sizes 128, 512, and 1024 with top-1 token 33075, and the native fused test
+passes F32/F16/Q4_K/Q6_K at 33 and 70 rows.
+
+Resource report: `gemm_wmma_swiglu_kernel<Q4_K,64,2>` uses 93 VGPRs, 38 SGPRs,
+24,576 B LDS, no spills, and 16 waves/SIMD; the 32-row variant uses the same
+VGPR count and 20,480 B LDS.
+
+End-to-end prefill with the fused path, one measured repetition without warmup:
+
+| Prompt tokens | Before all workstreams | After fusion |
+| ---: | ---: | ---: |
+| 512 | 1.635 s / 313.06 tok/s | 0.931 s / 549.8 tok/s |
+| 2048 | 6.690 s / 306.14 tok/s | 4.008 s / 511.0 tok/s |
+| 8192 | 37.687 s / 217.37 tok/s | 19.854 s / 412.6 tok/s |
+| 32768 | 340.357 s / 96.28 tok/s | 156.562 s / 209.3 tok/s |
+
+The 32768 result is essentially unchanged from the pre-fusion C measurement
+(208.9 tok/s): at that length attention dominates and the FFN pair is a smaller
+share of the chunk.
 
 ### Short-prompt latency and correctness
 
@@ -575,6 +623,8 @@ zero VGPR spills, and 16 waves/SIMD occupancy.
 | --- | ---: | ---: | ---: | ---: |
 | `gemm_wmma_kernel<*,64,2>` | 64-75 | 28-34 | 32,768 B | 0 |
 | `gemm_wmma_k32_kernel<*>` | 39-50 | 26-34 | 14,336 B | 0 |
+| `gemm_wmma_swiglu_kernel<*,64,2>` | 93 | 38 | 24,576 B | 0 |
+| `gemm_wmma_swiglu_kernel<*,32,1>` | 93 | 38 | 20,480 B | 0 |
 | `attention_prefill_f32_kernel` | 49 | 48 | 0 | 36,864 B at head_dim 256 |
 | `attention_prefill_paged_f32_kernel<dense>` | 51 | 63 | 0 | 36,864 B at head_dim 256 |
 | `attention_prefill_paged_f32_kernel<gated>` | 53 | 61 | 0 | 36,864 B at head_dim 256 |

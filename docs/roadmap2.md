@@ -330,6 +330,23 @@ order were all measured slower and are not in the kernel. B3's acceptance rule
 is therefore applied as written: it was not accepted. B4 and B5 remain future
 work. See [benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
 
+### 4.8 B5 status: fused gate/up (2026-11-15)
+
+The FFN gate/up pair is fused when both projections select the custom WMMA
+path. One kernel stages the activation tile and both weight tiles, accumulates
+both matrices, and applies SwiGLU in the epilogue. The separate gate GEMM, up
+GEMM, and `SILU_MUL` pass are removed from that plan. The fused kernel uses a
+32-wide K step: with a 64-wide step it measured 528 ms for the 32 fused
+submissions, and with 32-wide staging it measures 308 ms against 385 ms for the
+three removed operations.
+
+The position-0 chunk total moves from 994 ms to 938 ms and the 512-token prefill
+rate from 515.9 to 549.8 tok/s; 2048 tokens reaches 511.0 tok/s. The 32768 rate
+is 209.3 tok/s, unchanged within noise because attention dominates at that
+length. Greedy tokens and chunk-size equivalence are unchanged. Q/K/V
+projection fusion, beta/alpha projection fusion, and RMSNorm epilogue fusion
+remain unstarted.
+
 ## 5. Workstream C: prefill attention
 
 ### 5.1 Problem

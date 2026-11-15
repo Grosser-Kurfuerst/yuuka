@@ -255,9 +255,19 @@ and rejected: it reduced the tall-K time but raised the wide-projection time,
 and the position-0 chunk GEMM total regressed to 947 ms. The kernels keep `N`
 fastest in `blockIdx.x`.
 
-Larger tiles, an int8 tensor-core path, and epilogue fusions remain candidates
-under [roadmap2.md](roadmap2.md); they are not implemented and are not claimed
-in the benchmark results.
+`gemm_wmma_swiglu_kernel` fuses the FFN gate and up projections. It stages one
+activation tile and both weight tiles, accumulates with two pairs of fragments,
+and applies `silu(gate) * up` to the accumulator elements before the single
+output store. Both weights must share dtype and shape. The fused kernel uses a
+32-wide K step (24 KiB shared memory for the 64-row tile) because a 64-wide step
+needed 48 KiB and was 72% slower for the fused pair. The plan selects it only
+when both projections resolve to `PrefillWMMA`; otherwise the separate gate,
+up, and `SILU_MUL` operations remain. Q/K/V, beta/alpha, and RMSNorm fusions are
+not implemented.
+
+Larger tiles, an int8 tensor-core path, and the remaining projection fusions
+remain candidates under [roadmap2.md](roadmap2.md); they are not implemented and
+are not claimed in the benchmark results.
 
 ### 6.3 Dispatch
 

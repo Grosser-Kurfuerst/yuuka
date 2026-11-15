@@ -64,6 +64,14 @@ void launch_gemm_f16(float * out, const float * x, const void * w,
 void launch_gemm_wmma_f32out(float * out, const float * x, const void * w,
                              uint64_t n_in, uint64_t n_out, uint64_t batch,
                              uint32_t dtype, hipStream_t stream);
+
+/* Fused gate/up WMMA GEMM. Both weights have the same shape and dtype and the
+ * kernel computes out = silu(W_gate * x) * (W_up * x) without writing the two
+ * GEMM intermediates. */
+void launch_gemm_wmma_swiglu_f32out(float * out, const float * x,
+                                    const void * w_gate, const void * w_up,
+                                    uint64_t n_in, uint64_t n_out, uint64_t batch,
+                                    uint32_t dtype, hipStream_t stream);
 int launch_gemm_blas_f16(float * out, const void * x, const void * w,
                          uint64_t n_in, uint64_t n_out, uint64_t batch,
                          hipStream_t stream);

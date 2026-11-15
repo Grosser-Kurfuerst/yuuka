@@ -122,12 +122,13 @@ Implemented and tested:
   `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, and `Q6_K`; direct embedding tests
   cover `F32`, `Q4_0`, `Q5_0`, and `Q6_K`.
 - rocWMMA FP16 and quantized prefill GEMM with measured 64x64 and 32x64 tile
-  selection, a rocBLAS FP16 baseline, causal GQA Flash Attention that stages K
-  and V for a 16-query-row tile, chunked prefill with per-chunk KV writes, and
-  the measured `SelectPrefillPath` dispatch table.
+  selection, a fused gate/up SwiGLU kernel, a rocBLAS FP16 baseline, causal GQA
+  Flash Attention that stages K and V for a 16-query-row tile, chunked prefill
+  with per-chunk KV writes, and the measured `SelectPrefillPath` dispatch
+  table.
 - A split-register gated delta-net chunk kernel that keeps the recurrent state
   resident for the whole chunk. The 512-token prefill rate improved from 313 to
-  516 tok/s, and position-7680 attention dropped from 2030 ms to 643 ms; the
+  550 tok/s, and position-7680 attention dropped from 2030 ms to 643 ms; the
   measured status is in [roadmap2.md](roadmap2.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.

@@ -577,14 +577,25 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillMatmul(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows); err != nil {
-		return err
-	}
-	if err := m.prefillMatmul(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows); err != nil {
-		return err
-	}
-	if err := plan.AddSiluMul(p.ffnGate, p.ffnUp, p.ffnGate, rows*ffn); err != nil {
-		return err
+	// Fuse the gate/up pair when both matmuls select the custom WMMA path.
+	// The fused kernel shares one activation tile and applies SwiGLU in the
+	// epilogue, so neither intermediate is written.
+	if gate.dtype == up.dtype &&
+		hip.SelectPrefillPath(gate.dtype, rows, hidden, ffn) == hip.PrefillWMMA {
+		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, p.norm, 0,
+			p.ffnGate, 0, hidden, ffn, rows, gate.dtype); err != nil {
+			return err
+		}
+	} else {
+		if err := m.prefillMatmul(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows); err != nil {
+			return err
+		}
+		if err := m.prefillMatmul(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows); err != nil {
+			return err
+		}
+		if err := plan.AddSiluMul(p.ffnGate, p.ffnUp, p.ffnGate, rows*ffn); err != nil {
+			return err
+		}
 	}
 	if err := m.prefillMatmul(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows); err != nil {
 		return err

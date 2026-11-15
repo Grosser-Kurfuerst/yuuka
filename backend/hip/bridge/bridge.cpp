@@ -264,6 +264,59 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// validate_gemm_swiglu_plan_op checks a fused gate/up GEMM. Both weight
+// matrices must use the same dtype and shape, activations are FP32, and the
+// output is one FP32 SwiGLU result per output element.
+yuuka_status validate_gemm_swiglu_plan_op(const yuuka_op & op) {
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu op buffer %d is null", i);
+        }
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t batch = op.n[2];
+    const uint32_t dtype = op.u[0];
+    if (!check_gemv_shapes(n_in, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "unsupported gemm_swiglu dtype %u or input width %llu",
+                    dtype, static_cast<unsigned long long>(n_in));
+    }
+    if (n_in == 0 || n_out == 0 || batch == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "gemm_swiglu dimensions must be positive");
+    }
+    uint64_t weight_row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t input_elements = 0;
+    uint64_t output_elements = 0;
+    if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+        __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+        __builtin_mul_overflow(n_in, batch, &input_elements) ||
+        __builtin_mul_overflow(n_out, batch, &output_elements)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu dimensions overflow");
+    }
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    if (__builtin_mul_overflow(input_elements, uint64_t(sizeof(float)), &input_bytes) ||
+        __builtin_mul_overflow(output_elements, uint64_t(sizeof(float)), &output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu gate buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu up buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[2], op.off[2], input_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu input buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[3], op.off[3], output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm_swiglu output buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 // range_elements checks a [rows, width] region with an explicit row stride.
 bool range_elements(const yuuka_buffer * buf, uint64_t offset, uint64_t rows,
                     uint64_t stride, uint64_t width) {
@@ -1289,6 +1342,16 @@ yuuka_status launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
     return YUUKA_OK;
 }
 
+yuuka_status launch_gemm_swiglu_dispatch(yuuka_op const & op, hipStream_t stream) {
+    auto * out = op_ptr<float>(op, 3);
+    const auto * x = op_ptr<const float>(op, 2);
+    const void * gate = op_ptr<const void>(op, 0);
+    const void * up = op_ptr<const void>(op, 1);
+    yuuka::launch_gemm_wmma_swiglu_f32out(out, x, gate, up, op.n[0], op.n[1],
+                                          op.n[2], op.u[0], stream);
+    return YUUKA_OK;
+}
+
 yuuka_status launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
     const auto * x = op_ptr<const float>(op, 1);
@@ -1338,6 +1401,13 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         }
         case YUUKA_OP_GEMM: {
             yuuka_status status = launch_gemm_dispatch(op, stream);
+            if (status != YUUKA_OK) {
+                return status;
+            }
+            break;
+        }
+        case YUUKA_OP_GEMM_SWIGLU: {
+            yuuka_status status = launch_gemm_swiglu_dispatch(op, stream);
             if (status != YUUKA_OK) {
                 return status;
             }
@@ -2564,7 +2634,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_REDUCE_ADD) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMM_SWIGLU) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -2577,6 +2647,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_GEMM:
                 status = validate_gemm_plan_op(*op);
+                break;
+            case YUUKA_OP_GEMM_SWIGLU:
+                status = validate_gemm_swiglu_plan_op(*op);
                 break;
             case YUUKA_OP_RMSNORM_BATCH:
                 status = validate_batch_norm_plan_op(*op);

@@ -407,6 +407,71 @@ bool test_gemm(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     return ok;
 }
 
+bool test_gemm_swiglu(yuuka_device * device, yuuka_stream * stream,
+                      yuuka_event * event, yuuka_dtype dtype, const char * name,
+                      int64_t n_in, int64_t n_out, int64_t rows,
+                      std::mt19937 & rng) {
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> x(size_t(n_in * rows));
+    for (float & v : x) v = dist(rng);
+    std::vector<uint8_t> gate = pack_weights(dtype, rng, n_in, n_out);
+    std::vector<uint8_t> up = pack_weights(dtype, rng, n_in, n_out);
+    Buffer gb, ub, xb, ob;
+    bool ok = alloc(device, gb, gate.size()) && alloc(device, ub, up.size()) &&
+              alloc(device, xb, x.size() * 4) &&
+              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              upload(gb, gate.data(), gate.size()) &&
+              upload(ub, up.data(), up.size()) && upload_vec(xb, x);
+    yuuka_plan * plan = nullptr;
+    if (ok) ok = check(yuuka_plan_create(device, &plan), "fused plan create");
+    if (ok) {
+        yuuka_op op{};
+        op.code = YUUKA_OP_GEMM_SWIGLU;
+        op.buf[0] = gb.buf;
+        op.buf[1] = ub.buf;
+        op.buf[2] = xb.buf;
+        op.buf[3] = ob.buf;
+        op.n[0] = uint64_t(n_in);
+        op.n[1] = uint64_t(n_out);
+        op.n[2] = uint64_t(rows);
+        op.u[0] = dtype;
+        ok = check(yuuka_plan_add(plan, &op), "add fused swiglu");
+    }
+    if (ok) ok = check(yuuka_plan_execute(plan, stream, 0, 0, 1, event), "execute fused") &&
+                 check(yuuka_event_wait(event), "fused wait");
+    std::vector<float> got(size_t(n_out * rows));
+    ok = ok && download_vec(ob, got);
+    const DotFn dot = dot_for(dtype);
+    if (ok && dot != nullptr) {
+        const uint64_t rb = row_bytes(dtype, n_in);
+        double max_abs = 0.0;
+        for (int64_t row = 0; row < rows && ok; ++row) {
+            for (int64_t col = 0; col < n_out; ++col) {
+                const float g = dot(gate.data() + col * rb, x.data() + row * n_in, n_in);
+                const float u = dot(up.data() + col * rb, x.data() + row * n_in, n_in);
+                const float expected = (g / (1.0f + std::exp(-g))) * u;
+                const float value = got[size_t(row * n_out + col)];
+                const double diff = std::fabs(double(value) - double(expected));
+                max_abs = std::max(max_abs, diff);
+                if (diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
+                    std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
+                                 name, static_cast<long long>(row),
+                                 static_cast<long long>(col), value, expected);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        std::printf("%s: %s (max abs %.3g)\n", name, ok ? "ok" : "FAILED", max_abs);
+    }
+    if (plan != nullptr) yuuka_plan_destroy(plan);
+    release(ob);
+    release(xb);
+    release(ub);
+    release(gb);
+    return ok;
+}
+
 bool test_blas(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
                std::mt19937 & rng) {
     const int64_t n_in = 256, n_out = 96, rows = 17;
@@ -1052,6 +1117,21 @@ int main() {
         for (const auto & s : shapes) {
             ok = test_gemm(device, stream, event, c.dtype, c.name, s.n_in, s.n_out,
                            s.rows, rng) && ok;
+        }
+    }
+    const struct {
+        yuuka_dtype dtype;
+        const char * name;
+    } fused_cases[] = {
+        {YUUKA_DTYPE_F32, "fused swiglu F32"},
+        {YUUKA_DTYPE_F16, "fused swiglu F16"},
+        {YUUKA_DTYPE_Q4_K, "fused swiglu Q4_K"},
+        {YUUKA_DTYPE_Q6_K, "fused swiglu Q6_K"},
+    };
+    for (const auto & c : fused_cases) {
+        for (int64_t rows : {33, 70}) {
+            ok = test_gemm_swiglu(device, stream, event, c.dtype, c.name, 256, 96,
+                                  rows, rng) && ok;
         }
     }
     ok = test_blas(device, stream, event, rng) && ok;

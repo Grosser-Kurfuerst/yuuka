@@ -790,6 +790,36 @@ func (p *Plan) AddGemmPathAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out
 	return p.add(op)
 }
 
+// AddGemmSwigluAt appends one fused gate/up GEMM. Both weight buffers must
+// have the same dtype and [n_out, n_in] shape, x is FP32, and out receives
+// silu(gate*x) * (up*x) in FP32. The kernel does not materialize the two GEMM
+// intermediates.
+func (p *Plan) AddGemmSwigluAt(gate *Buffer, gateOff uint64, up *Buffer, upOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut, batch int64, dtype tensor.DType) error {
+	if nIn <= 0 || nOut <= 0 || batch <= 0 {
+		return errors.New("hip: fused GEMM dimensions must be positive")
+	}
+	if err := checkGemvDType(dtype, nIn); err != nil {
+		return err
+	}
+	if err := p.check(gate, up, x, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMM_SWIGLU}
+	op.buf[0] = gate.ptr
+	op.buf[1] = up.ptr
+	op.buf[2] = x.ptr
+	op.buf[3] = out.ptr
+	op.off[0] = C.uint64_t(gateOff)
+	op.off[1] = C.uint64_t(upOff)
+	op.off[2] = C.uint64_t(xOff)
+	op.off[3] = C.uint64_t(outOff)
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(batch)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
 // AddRMSNormBatchAt appends a row-wise RMSNorm over rows rows of cols values.
 func (p *Plan) AddRMSNormBatchAt(src *Buffer, srcOff uint64, weight *Buffer, dst *Buffer, dstOff uint64, rows, cols, srcStride, dstStride int64, eps float32) error {
 	if rows <= 0 || cols <= 0 || srcStride < cols || dstStride < cols {

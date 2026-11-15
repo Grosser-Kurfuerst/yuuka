@@ -134,7 +134,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_ROUTE = 30,
     YUUKA_OP_MOE_GATE_UP = 31,
     YUUKA_OP_MOE_DOWN = 32,
-    YUUKA_OP_MOE_REDUCE_ADD = 33
+    YUUKA_OP_MOE_REDUCE_ADD = 33,
+    YUUKA_OP_GEMM_SWIGLU = 34
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -226,7 +227,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
 
 /* Plans batch generic device operations into one submission.
  *
- * GEMV, GEMM, GEMV_BATCH, the legacy single-token family (RMSNORM, L2NORM,
+ * GEMV, GEMM, GEMM_SWIGLU, GEMV_BATCH, the legacy single-token family (RMSNORM, L2NORM,
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
  * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
@@ -261,6 +262,10 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   EMBEDDING_BATCH:     buf0 weight table, buf1 out, buf2 int32 tokens;
  *                        n={cols,rows,row_bytes,vocab}; u[0]=dtype
  *   CAST_F16:            buf0 FP32 src, buf1 FP16 dst; n[0]=elements
+ *   GEMM_SWIGLU:         buf0 gate weights, buf1 up weights, buf2 FP32 x,
+ *                        buf3 out; n={n_in,n_out,rows}; u[0]=dtype. Both
+ *                        weights share dtype and shape; out holds
+ *                        silu(W_gate*x) * (W_up*x) in FP32.
  *
  * Paged family. The block table is an int32 buffer with ceil(capacity/block_size)
  * entries mapping logical token positions to pool blocks. The pool holds
