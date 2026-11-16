@@ -833,6 +833,41 @@ func (p *Plan) AddGemmBlasAt(w *Buffer, wOff uint64, x16, out16, out *Buffer, ou
 	return p.add(op)
 }
 
+// AddQuantActI8PairAt appends the two-pass int8 activation quantizer. q1 and q2
+// receive n int8 values each, scales n/32 FP32 {s1, s2} pairs (an FP16 scale
+// would round the block and cost about 5e-4 relative on its own), and sums n/32
+// int32 {sum1, sum2} pairs. The pair reconstructs the activation as
+// s1*q1 + s2*q2 near 1e-5 relative, which is what keeps an int8 matmul inside
+// the prefill logit gate.
+func (p *Plan) AddQuantActI8PairAt(src *Buffer, srcOff uint64, q1, q2, scales, sums *Buffer, n int64) error {
+	if n <= 0 || n%32 != 0 {
+		return fmt.Errorf("hip: int8 activation count %d is not a positive multiple of 32", n)
+	}
+	if err := p.check(src, q1, q2, scales, sums); err != nil {
+		return err
+	}
+	need := []uint64{uint64(n) * 4, uint64(n), uint64(n), uint64(n/32) * 8, uint64(n/32) * 8}
+	for i, buf := range []*Buffer{src, q1, q2, scales, sums} {
+		off := uint64(0)
+		if i == 0 {
+			off = srcOff
+		}
+		if off > buf.bytes || need[i] > buf.bytes-off {
+			return fmt.Errorf("hip: int8 activation buffer %d holds %d bytes, want %d",
+				i, buf.bytes-off, need[i])
+		}
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_QUANT_ACT_I8_PAIR}
+	op.buf[0] = src.ptr
+	op.buf[1] = q1.ptr
+	op.buf[2] = q2.ptr
+	op.buf[3] = scales.ptr
+	op.buf[4] = sums.ptr
+	op.off[0] = C.uint64_t(srcOff)
+	op.n[0] = C.uint64_t(n)
+	return p.add(op)
+}
+
 // AddDequantF16At appends a dequantization of one packed K-quant weight matrix
 // into dst. dst must hold nIn*nOut FP16 elements; the decoded values match the
 // tiles the WMMA path stages, so only the accumulation differs downstream.
@@ -869,6 +904,63 @@ func (p *Plan) AddDequantF16At(src *Buffer, srcOff uint64, dst *Buffer, nIn, nOu
 	op.buf[1] = dst.ptr
 	op.n[0] = C.uint64_t(nIn)
 	op.n[1] = C.uint64_t(nOut)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMMQGemmAt appends the integer matmul: packed K-quant weights times the
+// two-pass int8 activations from AddQuantActI8PairAt, accumulated exactly in
+// int32 per step and scaled in FP32 into out. ascales and asums hold one
+// {s1,s2} / {sum1,sum2} pair per 32 activation values.
+func (p *Plan) AddMMQGemmAt(w *Buffer, wOff uint64, q1, q2, ascales, asums, out *Buffer, outOff uint64, nIn, nOut, rows int64, dtype tensor.DType) error {
+	if nIn <= 0 || nOut <= 0 || rows <= 0 {
+		return errors.New("hip: MMQ dimensions must be positive")
+	}
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+	default:
+		return fmt.Errorf("hip: MMQ supports K-quants only, got %s", dtype)
+	}
+	if nIn%256 != 0 {
+		return fmt.Errorf("hip: MMQ input width %d is not a multiple of 256", nIn)
+	}
+	if err := p.check(w, q1, q2, ascales, asums, out); err != nil {
+		return err
+	}
+	rowBytes, err := dtype.RowBytes(nIn)
+	if err != nil {
+		return fmt.Errorf("hip: MMQ shape: %w", err)
+	}
+	blocks := rows * (nIn / 32)
+	checks := []struct {
+		buf  *Buffer
+		off  uint64
+		want uint64
+	}{
+		{w, wOff, uint64(rowBytes) * uint64(nOut)},
+		{q1, 0, uint64(rows) * uint64(nIn)},
+		{q2, 0, uint64(rows) * uint64(nIn)},
+		{ascales, 0, uint64(blocks) * 8},
+		{asums, 0, uint64(blocks) * 8},
+		{out, outOff, uint64(rows) * uint64(nOut) * 4},
+	}
+	for i, c := range checks {
+		if c.off > c.buf.bytes || c.want > c.buf.bytes-c.off {
+			return fmt.Errorf("hip: MMQ buffer %d holds %d bytes, want %d", i, c.buf.bytes-c.off, c.want)
+		}
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MMQ_GEMM}
+	op.buf[0] = w.ptr
+	op.buf[1] = q1.ptr
+	op.buf[2] = q2.ptr
+	op.buf[3] = ascales.ptr
+	op.buf[4] = asums.ptr
+	op.buf[5] = out.ptr
+	op.off[0] = C.uint64_t(wOff)
+	op.off[5] = C.uint64_t(outOff)
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(rows)
 	op.u[0] = C.uint32_t(dtype)
 	return p.add(op)
 }

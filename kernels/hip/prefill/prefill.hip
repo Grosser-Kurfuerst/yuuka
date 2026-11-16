@@ -491,6 +491,66 @@ __global__ void cast_f32_to_f16_kernel(__half * dst, const float * src, int64_t 
     }
 }
 
+__device__ __forceinline__ int warp_reduce_sum_int(int value) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float value) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffffffffffull, value, offset));
+    }
+    return value;
+}
+
+// quantize_act_i8_pair_kernel writes the two int8 passes an int8 matmul needs:
+// one warp per 32-value block, a per-block scale from the block amax, and a
+// second pass over the residual. The reconstruction is s1*q1 + s2*q2, which
+// measured 4.6e-6 to 1.1e-5 relative error per dot on real weights, against
+// 1.6e-3 to 2.0e-3 for a single int8 pass (docs/benchmarks.md). The per-block
+// sums of the quantized values are written because a quantized weight block
+// carries a per-sub-block minimum term that multiplies the activation sum.
+__global__ void quantize_act_i8_pair_kernel(int8_t * q1, int8_t * q2, float * scales,
+                                            int32_t * sums, const float * src,
+                                            int64_t n) {
+    const int lane = threadIdx.x & 31;
+    const int warps = blockDim.x >> 5;
+    const int64_t blocks = n / 32;
+    for (int64_t b = int64_t(blockIdx.x) * warps + (threadIdx.x >> 5); b < blocks;
+         b += int64_t(gridDim.x) * warps) {
+        const int64_t off = b * 32 + lane;
+        const float v = src[off];
+        const float d1 = warp_reduce_max(fabsf(v)) / 127.0f;
+        const float s1 = d1 == 0.0f ? 1.0f : d1;
+        const float r1 = fminf(127.0f, fmaxf(-127.0f, rintf(v / s1)));
+        const float residual = v - r1 * s1;
+        const float d2 = warp_reduce_max(fabsf(residual)) / 127.0f;
+        const float s2 = d2 == 0.0f ? 1.0f : d2;
+        const float r2 = fminf(127.0f, fmaxf(-127.0f, rintf(residual / s2)));
+        q1[off] = static_cast<int8_t>(r1);
+        q2[off] = static_cast<int8_t>(r2);
+        if (lane == 0) {
+            // FP32 scales: an FP16 scale rounds the whole block and costs about
+            // 5e-4 relative, which is larger than the residual step the second
+            // pass exists to remove.
+            scales[b * 2] = s1;
+            scales[b * 2 + 1] = s2;
+        }
+        // Sums come from the register values, not from the stores above, so the
+        // same warp never reads its own in-flight writes.
+        const int w1 = warp_reduce_sum_int(static_cast<int>(r1));
+        const int w2 = warp_reduce_sum_int(static_cast<int>(r2));
+        if (lane == 0) {
+            sums[b * 2] = w1;
+            sums[b * 2 + 1] = w2;
+        }
+    }
+}
+
 __global__ void cast_f16_to_f32_kernel(float * dst, const __half * src, int64_t n) {
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -831,6 +891,20 @@ void launch_cast_f32_to_f16(void * dst, const float * src, uint64_t n,
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
     cast_f32_to_f16_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<__half *>(dst), src, static_cast<int64_t>(n));
+}
+
+void launch_quantize_act_i8_pair(int8_t * q1, int8_t * q2, float * scales,
+                                 int32_t * sums, const float * src, uint64_t n,
+                                 hipStream_t stream) {
+    if (n == 0 || n % 32 != 0) {
+        return;
+    }
+    const int warps = kThreads / 32;
+    const int64_t blocks = static_cast<int64_t>(n / 32);
+    const int64_t want = (blocks + warps - 1) / warps;
+    quantize_act_i8_pair_kernel<<<static_cast<int>(want < 65535 ? want : 65535),
+                                  kThreads, 0, stream>>>(
+        q1, q2, scales, sums, src, static_cast<int64_t>(n));
 }
 
 void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,

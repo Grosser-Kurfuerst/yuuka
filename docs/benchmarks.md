@@ -813,6 +813,54 @@ Above 16k tokens the matmul is no longer where the time goes: 64 chunks of the
 route save 5.3 s of a 129 s prefill, so attention and the gated delta-net are the
 levers there.
 
+#### Measured and not selected: int8 MMQ
+
+An integer matmul over packed quants was implemented to answer whether keeping
+the weights packed is the way past the traffic term above. Design: the packed
+quants are used directly as int8 weights (Q4_K 0..15, Q5_K 0..31, Q6_K -32..31),
+so no weight rounding happens; activations are quantized to two int8 passes with
+FP32 per-32-value scales and int32 block sums; products accumulate exactly in
+int32 per 32-value step and the scales, the per-sub-block minimum, and the
+activation sums are applied in FP32.
+
+Numeric gates. The first version used one int8 activation pass, which measured
+1.57-2.02e-3 per dot against the FP32 reference and drove the chunk gate to
+**0.344** end to end. Two passes bring the per-dot error to 4.6e-6-1.1e-5; the
+kernel then measures 7e-7 to 3.3e-5 against the FP32 dot of the same
+reconstruction, and the chunk gate measures **0**, i.e. bitwise identical across
+chunk boundaries with the same top-1 token. That is the strongest numeric result
+of any route measured here, better than the adopted rocBLAS route (0.042).
+
+One pitfall is worth recording: storing the per-block activation scales in FP16
+costs about 5e-4 relative on its own and swallowed the second pass's benefit;
+the scales are FP32.
+
+Speed, isolated GEMM at `M = 512` (`./build/yuuka_prefill_sweep`, `mmq` column
+against `blasq` and `wmma`):
+
+| Dtype | Shape | `mmq` | `blasq` | `wmma` |
+| --- | --- | ---: | ---: | ---: |
+| Q4_K | 2560 -> 9216 | 17.05 ms / 1.4 TFLOP/s | 1.77 ms / 13.6 TFLOP/s | 2.73 ms / 8.8 TFLOP/s |
+| Q4_K | 2560 -> 8192 | 15.06 ms / 1.4 TFLOP/s | 1.52 ms / 14.2 TFLOP/s | 2.42 ms / 8.9 TFLOP/s |
+| Q4_K | 9216 -> 2560 | 17.57 ms / 1.4 TFLOP/s | 1.58 ms / 15.3 TFLOP/s | 2.96 ms / 8.2 TFLOP/s |
+
+End to end with the route wired for every wide K-quant matmul: 2.107 s at 512
+tokens, against 0.463 s for the adopted route and 0.583 s for WMMA.
+
+The cause is hardware, not the algorithm. gfx1151 has no int8 dot instruction:
+`__builtin_amdgcn_sdot4` requires the CDNA `dot1-insts` feature, so the kernel
+widens every value to int32 and multiplies one MAC per instruction, which is
+1.4 TFLOP/s against the 8.6-22 TFLOP/s of the selected routes. The rocWMMA int8
+MMA (`v_wmma_i32_16x16x16_iu8`) exists, but a K-quant scale applies per 32-value
+sub-block, so each step would have to store the int32 fragment, rescale it, and
+reload it; that overhead does not clear the 22 TFLOP/s the library already
+delivers.
+
+The integer route is therefore not selected. The kernel, the quantizer, and
+their tests stay in the tree as a measured `mmq` sweep column so the comparison
+stays reproducible and a future K-quant layout with a per-block scale (or a
+device with int8 dot) can reuse them.
+
 #### Rejected: 128-row WMMA tile
 
 The attribution ranks token-tile reuse first: the 64-row tile re-reads every

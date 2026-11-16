@@ -115,14 +115,18 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
 
     const bool kquant = dtype == YUUKA_DTYPE_Q4_K || dtype == YUUKA_DTYPE_Q5_K ||
                         dtype == YUUKA_DTYPE_Q6_K;
-    Buffer wb, xb, ob, x16, o16, w16, rowbuf;
+    const uint64_t act_blocks = uint64_t(rows) * uint64_t(n_in / 32);
+    Buffer wb, xb, ob, x16, o16, w16, q1b, q2b, sb, sumb, rowbuf;
     bool ok = alloc(device, wb, weights.size()) &&
               alloc(device, xb, x.size() * 4) && alloc(device, ob, size_t(n_out * rows) * 4) &&
               alloc(device, x16, x.size() * 2) &&
               alloc(device, o16, size_t(n_out * rows) * 2) &&
               alloc(device, rowbuf, size_t(n_in) * 4);
     if (ok && kquant) {
-        ok = alloc(device, w16, size_t(n_in * n_out) * 2);
+        ok = alloc(device, w16, size_t(n_in * n_out) * 2) &&
+             alloc(device, q1b, uint64_t(rows) * uint64_t(n_in)) &&
+             alloc(device, q2b, uint64_t(rows) * uint64_t(n_in)) &&
+             alloc(device, sb, act_blocks * 8) && alloc(device, sumb, act_blocks * 8);
     }
     if (ok) {
         ok = check(yuuka_memcpy_h2d(wb.buf, weights.data(), weights.size()), "h2d w") &&
@@ -188,6 +192,40 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
                                   rows, event);
         }, wait_event));
     }
+    // The integer route keeps the weights packed and accumulates exactly in
+    // int32. gfx1151 has no int8 dot instruction, so the widening multiplies
+    // make it the slowest column here; it stays as measurement evidence.
+    yuuka_plan * mmq_plan = nullptr;
+    if (ok && kquant) {
+        bool mmq_ok = check(yuuka_plan_create(device, &mmq_plan), "mmq plan");
+        yuuka_op quant{};
+        quant.code = YUUKA_OP_QUANT_ACT_I8_PAIR;
+        quant.buf[0] = xb.buf;
+        quant.buf[1] = q1b.buf;
+        quant.buf[2] = q2b.buf;
+        quant.buf[3] = sb.buf;
+        quant.buf[4] = sumb.buf;
+        quant.n[0] = uint64_t(rows) * uint64_t(n_in);
+        yuuka_op gemm{};
+        gemm.code = YUUKA_OP_MMQ_GEMM;
+        gemm.buf[0] = wb.buf;
+        gemm.buf[1] = q1b.buf;
+        gemm.buf[2] = q2b.buf;
+        gemm.buf[3] = sb.buf;
+        gemm.buf[4] = sumb.buf;
+        gemm.buf[5] = ob.buf;
+        gemm.n[0] = uint64_t(n_in);
+        gemm.n[1] = uint64_t(n_out);
+        gemm.n[2] = uint64_t(rows);
+        gemm.u[0] = dtype;
+        mmq_ok = mmq_ok && check(yuuka_plan_add(mmq_plan, &quant), "add quant_act") &&
+                 check(yuuka_plan_add(mmq_plan, &gemm), "add mmq gemm");
+        if (mmq_ok) {
+            results.push_back(bench_rows(device, stream, event, mmq_plan, "mmq", 5, [&]() {
+                (void)yuuka_plan_execute(mmq_plan, stream, 0, 0, 1, event);
+            }, wait_event));
+        }
+    }
     if (ok) {
         const double weight_gb = double(weights.size()) / 1e9;
         const double flops = 2.0 * double(n_in) * double(n_out) * double(rows);
@@ -205,7 +243,12 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
         }
         std::printf("\n");
     }
+    if (mmq_plan != nullptr) yuuka_plan_destroy(mmq_plan);
     if (plan != nullptr) yuuka_plan_destroy(plan);
+    release(sumb);
+    release(sb);
+    release(q2b);
+    release(q1b);
     release(rowbuf);
     release(w16);
     release(o16);
