@@ -83,24 +83,26 @@ int physical_row(const int32_t * table, int pos) {
     return table[pos / kBlockSize] * kBlockSize + pos % kBlockSize;
 }
 
-void reference_attention(const std::vector<float> & q, const std::vector<float> & k,
-                         const std::vector<float> & v, const int32_t * table,
-                         int start_pos, int rows, std::vector<float> & out) {
-    (void)table; // The pool maps logical positions; contents come from the same row.
-    out.assign(size_t(rows) * kHeads * kHeadDim, 0.0f);
+void reference_attention_dims(const std::vector<float> & q,
+                              const std::vector<float> & k,
+                              const std::vector<float> & v, int start_pos, int rows,
+                              int heads, int kv_heads, int head_dim,
+                              std::vector<float> & out) {
+    const int kv_dim = kv_heads * head_dim;
+    out.assign(size_t(rows) * heads * head_dim, 0.0f);
     for (int row = 0; row < rows; ++row) {
         const int position = start_pos + row;
-        for (int head = 0; head < kHeads; ++head) {
-            const int kvh = head / (kHeads / kKVHeads);
+        for (int head = 0; head < heads; ++head) {
+            const int kvh = head / (heads / kv_heads);
             std::vector<float> scores(size_t(position) + 1);
             float max = -INFINITY;
-            const float * qrow = q.data() + size_t(row) * kHeads * 2 * kHeadDim;
+            const float * qrow = q.data() + size_t(row) * heads * 2 * head_dim;
             for (int p = 0; p <= position; ++p) {
                 float dot = 0.0f;
-                for (int d = 0; d < kHeadDim; ++d) {
-                    dot += qrow[head * 2 * kHeadDim + d] * k[size_t(p) * kKVDim + kvh * kHeadDim + d];
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += qrow[head * 2 * head_dim + d] * k[size_t(p) * kv_dim + kvh * head_dim + d];
                 }
-                scores[size_t(p)] = dot / std::sqrt(float(kHeadDim));
+                scores[size_t(p)] = dot / std::sqrt(float(head_dim));
                 max = std::fmax(max, scores[size_t(p)]);
             }
             float total = 0.0f;
@@ -108,18 +110,25 @@ void reference_attention(const std::vector<float> & q, const std::vector<float> 
                 score = std::exp(score - max);
                 total += score;
             }
-            for (int d = 0; d < kHeadDim; ++d) {
+            for (int d = 0; d < head_dim; ++d) {
                 float value = 0.0f;
                 for (int p = 0; p <= position; ++p) {
                     value += (scores[size_t(p)] / total) *
-                             v[size_t(p) * kKVDim + kvh * kHeadDim + d];
+                             v[size_t(p) * kv_dim + kvh * head_dim + d];
                 }
-                const float gate = qrow[head * 2 * kHeadDim + kHeadDim + d];
-                out[size_t(row) * kHeads * kHeadDim + head * kHeadDim + d] =
+                const float gate = qrow[head * 2 * head_dim + head_dim + d];
+                out[size_t(row) * heads * head_dim + head * head_dim + d] =
                     value / (1.0f + std::exp(-gate));
             }
         }
     }
+}
+
+void reference_attention(const std::vector<float> & q, const std::vector<float> & k,
+                         const std::vector<float> & v, const int32_t * table,
+                         int start_pos, int rows, std::vector<float> & out) {
+    (void)table; // The pool maps logical positions; contents come from the same row.
+    reference_attention_dims(q, k, v, start_pos, rows, kHeads, kKVHeads, kHeadDim, out);
 }
 
 float max_diff(const std::vector<float> & a, const std::vector<float> & b) {
@@ -136,6 +145,106 @@ int expect_graph_rejected(context & ctx, yuuka_plan * plan, yuuka_buffer * dynam
     CHECK(status == YUUKA_ERR_UNSUPPORTED);
     CHECK(graph == nullptr);
     CHECK(std::strstr(yuuka_last_error(), "position-dependent") != nullptr);
+    return 0;
+}
+
+// test_gqa_attention_group4 checks the group-of-four prefill attention kernel,
+// which the launcher selects at a position of 2048 or more when four query
+// heads share one KV head. The pool is filled through the paged write op with
+// an identity block table, so the reference attention sweep over the same host
+// arrays is a direct comparison.
+int test_gqa_attention_group4(context & ctx) {
+    const int heads = 4, kv_heads = 1, head_dim = 4, kv_dim = kv_heads * head_dim;
+    const int block_size = 16, capacity = 2048 + 16, blocks = capacity / block_size;
+    const int rows = 16, position = 2048;
+    std::vector<int32_t> table(static_cast<size_t>(blocks));
+    for (int i = 0; i < blocks; ++i) table[size_t(i)] = i;
+    std::vector<float> host_k(size_t(capacity) * kv_dim);
+    std::vector<float> host_v(size_t(capacity) * kv_dim);
+    for (size_t i = 0; i < host_k.size(); ++i) {
+        host_k[i] = std::sin(0.11f * float(i)) + 0.2f * float(i % 5);
+        host_v[i] = std::cos(0.09f * float(i)) - 0.15f * float(i % 3);
+    }
+    std::vector<float> q(size_t(rows) * heads * 2 * head_dim);
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = std::sin(0.19f * float(i) + 0.2f);
+    }
+    yuuka_buffer * k_src = upload(ctx, host_k.data(), host_k.size() * sizeof(float));
+    yuuka_buffer * v_src = upload(ctx, host_v.data(), host_v.size() * sizeof(float));
+    yuuka_buffer * k_pool = upload(ctx, nullptr, host_k.size() * sizeof(float));
+    yuuka_buffer * v_pool = upload(ctx, nullptr, host_v.size() * sizeof(float));
+    yuuka_buffer * table_buf = upload(ctx, table.data(), table.size() * sizeof(int32_t));
+    yuuka_buffer * q_buf = upload(ctx, q.data(), q.size() * sizeof(float));
+    yuuka_buffer * out = upload(ctx, nullptr, size_t(rows) * heads * head_dim * sizeof(float));
+    CHECK(k_src && v_src && k_pool && v_pool && table_buf && q_buf && out);
+    // The pool is filled at position 0 and the attention runs at position 2048,
+    // so the two ops live in separate plans: the execute position applies to
+    // every position-dependent op in the plan.
+    yuuka_plan * fill = nullptr;
+    CHECK_STATUS(yuuka_plan_create(ctx.device, &fill));
+    {
+        yuuka_op op{};
+        op.code = YUUKA_OP_KV_WRITE_BATCH_PAGED;
+        op.buf[0] = k_src;
+        op.buf[1] = v_src;
+        op.buf[2] = k_pool;
+        op.buf[3] = v_pool;
+        op.buf[4] = table_buf;
+        op.n[0] = kv_dim;
+        op.n[1] = capacity;
+        op.u[0] = block_size;
+        op.u[1] = capacity;
+        CHECK_STATUS(yuuka_plan_add(fill, &op));
+    }
+    CHECK_STATUS(yuuka_plan_execute(fill, ctx.stream, 0, 0, 1, ctx.event));
+    CHECK_STATUS(yuuka_event_wait(ctx.event));
+    yuuka_plan * plan = nullptr;
+    CHECK_STATUS(yuuka_plan_create(ctx.device, &plan));
+    {
+        yuuka_op op{};
+        op.code = YUUKA_OP_ATTENTION_PREFILL_PAGED;
+        op.buf[0] = q_buf;
+        op.buf[1] = k_pool;
+        op.buf[2] = v_pool;
+        op.buf[3] = out;
+        op.buf[4] = table_buf;
+        op.n[0] = kv_heads;
+        op.n[1] = heads;
+        op.n[2] = head_dim;
+        op.n[3] = kv_dim;
+        op.n[4] = rows;
+        op.u[0] = block_size;
+        op.u[1] = capacity;
+        op.f[0] = 1.0f / std::sqrt(float(head_dim));
+        CHECK_STATUS(yuuka_plan_add(plan, &op));
+    }
+    CHECK_STATUS(yuuka_plan_execute(plan, ctx.stream, 0, uint32_t(position), 1, ctx.event));
+    CHECK_STATUS(yuuka_event_wait(ctx.event));
+    std::vector<float> got(size_t(rows) * heads * head_dim);
+    CHECK(download(ctx, out, got.data(), got.size() * sizeof(float)));
+    std::vector<float> want;
+    reference_attention_dims(q, host_k, host_v, position, rows, heads, kv_heads,
+                             head_dim, want);
+    const float diff = max_diff(got, want);
+    if (diff >= 2e-4f) {
+        std::fprintf(stderr, "gqa attention max diff %g\n", diff);
+        for (int i = 0; i < 8; ++i) {
+            std::fprintf(stderr, "  [%d] got %.6f want %.6f\n", i, got[size_t(i)],
+                         want[size_t(i)]);
+        }
+    }
+    CHECK(diff < 2e-4f);
+    yuuka_plan_destroy(fill);
+    yuuka_plan_destroy(plan);
+    yuuka_buffer_free(k_src);
+    yuuka_buffer_free(v_src);
+    yuuka_buffer_free(k_pool);
+    yuuka_buffer_free(v_pool);
+    yuuka_buffer_free(table_buf);
+    yuuka_buffer_free(q_buf);
+    yuuka_buffer_free(out);
+    std::printf("gqa attention group4 position=%d: ok (max diff %.3g)\n", position,
+                diff);
     return 0;
 }
 
@@ -408,6 +517,11 @@ int main() {
             const int r = physical_row(table, p);
             CHECK(k_check[size_t(r) * kKVDim] == host_k[size_t(p) * kKVDim]);
         }
+    }
+
+    if (test_gqa_attention_group4(ctx) != 0) {
+        teardown(ctx);
+        return 1;
     }
 
     yuuka_plan_destroy(prefill);

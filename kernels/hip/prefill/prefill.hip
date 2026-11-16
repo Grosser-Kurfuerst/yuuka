@@ -576,6 +576,142 @@ __global__ void kv_write_paged_dynamic_kv_kernel(void * k_pool, void * v_pool,
     }
 }
 
+constexpr int kGQAHeads = 4;
+constexpr int kGQAQPerBlock = 16;
+constexpr int kGQAThreshold = 2048;
+
+// attention_prefill_paged_gqa_f32_kernel covers the four query heads that share
+// one KV head in a single workgroup, so one staged K/V tile serves all four.
+// Each wave owns one head and four of the block's 16 query rows, strided by the
+// four rows a wave slot covers; the shared tile layout, the staging walk, and
+// the online-softmax update are the ones the one-head kernel uses. Only the
+// long-context chunk uses this kernel: below the threshold the staging cost is
+// small and the extra workgroup count of the one-head kernel wins.
+template <bool Dense>
+__global__ void attention_prefill_paged_gqa_f32_kernel(
+    float * out, const float * q, const void * k_pool, const void * v_pool,
+    const int32_t * block_table, int block_size, int heads, int head_dim,
+    int kv_dim, int rows, int position, float scale, uint32_t dtype) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int kvh = blockIdx.x;
+    const int head = kvh * kGQAHeads + (wave & (kGQAHeads - 1));
+    const int row_slot = wave / kGQAHeads;
+    const int q_base = blockIdx.y * kGQAQPerBlock;
+    const int vec = (head_dim + 31) / 32;
+    const int head_stride = Dense ? head_dim : 2 * head_dim;
+    const int row_stride = heads * head_stride;
+    const int last_row = min(q_base + kGQAQPerBlock, rows) - 1;
+    const int max_pos = position + last_row;
+    float qv[kGQAHeads][kMaxHeadVec];
+    float acc[kGQAHeads][kMaxHeadVec];
+    float m[kGQAHeads];
+    float l[kGQAHeads];
+    bool active[kGQAHeads];
+    #pragma unroll
+    for (int i = 0; i < kGQAHeads; ++i) {
+        const int q_row = q_base + row_slot + i * kGQAHeads;
+        active[i] = q_row < rows;
+        const float * q_ptr =
+            q + static_cast<int64_t>(active[i] ? q_row : last_row) * row_stride +
+            head * head_stride;
+        m[i] = -INFINITY;
+        l[i] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < kMaxHeadVec; ++j) {
+            const int d = lane * vec + j;
+            qv[i][j] = (active[i] && j < vec && d < head_dim) ? q_ptr[d] : 0.0f;
+            acc[i][j] = 0.0f;
+        }
+    }
+    const int lane_stride = vec + 1;
+    const int key_stride = 32 * lane_stride;
+    extern __shared__ float kv_shared[];
+    float * k_shared = kv_shared;
+    float * v_shared = kv_shared + kKeysPerBlock * key_stride;
+    for (int k0 = 0; k0 <= max_pos; k0 += kKeysPerBlock) {
+        const int valid = min(kKeysPerBlock, max_pos + 1 - k0);
+        for (int idx = tid; idx < valid * head_dim; idx += blockDim.x) {
+            const int kk = idx / head_dim;
+            const int d = idx % head_dim;
+            const int64_t row = paged_kv_row(block_table, block_size, k0 + kk);
+            const int slot = kk * key_stride + (d / vec) * lane_stride + d % vec;
+            k_shared[slot] =
+                kv_load(k_pool, dtype, row, kvh * head_dim + d, kv_dim);
+            v_shared[slot] =
+                kv_load(v_pool, dtype, row, kvh * head_dim + d, kv_dim);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < kGQAHeads; ++i) {
+            if (!active[i]) {
+                continue;
+            }
+            const int pos = position + q_base + row_slot + i * kGQAHeads;
+            const int stop = min(valid, pos - k0 + 1);
+            float m_i = m[i];
+            float l_i = l[i];
+            for (int kk = 0; kk < stop; ++kk) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < kMaxHeadVec; ++j) {
+                    const int d = lane * vec + j;
+                    if (j < vec && d < head_dim) {
+                        dot += qv[i][j] *
+                               k_shared[kk * key_stride + lane * lane_stride + j];
+                    }
+                }
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot += __shfl_xor(dot, offset);
+                }
+                const float s = dot * scale;
+                const float m_new = fmaxf(m_i, s);
+                const float corr = expf(m_i - m_new);
+                const float p = expf(s - m_new);
+                l_i = l_i * corr + p;
+                m_i = m_new;
+                #pragma unroll
+                for (int j = 0; j < kMaxHeadVec; ++j) {
+                    const int d = lane * vec + j;
+                    if (j < vec && d < head_dim) {
+                        acc[i][j] = acc[i][j] * corr +
+                                    p * v_shared[kk * key_stride + lane * lane_stride + j];
+                    }
+                }
+            }
+            m[i] = m_i;
+            l[i] = l_i;
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < kGQAHeads; ++i) {
+        if (!active[i]) {
+            continue;
+        }
+        const int q_row = q_base + row_slot + i * kGQAHeads;
+        const float inv = 1.0f / l[i];
+        const int64_t out_row =
+            static_cast<int64_t>(q_row) * heads * head_dim + head * head_dim;
+        const float * q_ptr = q + static_cast<int64_t>(q_row) * row_stride +
+                              head * head_stride;
+        #pragma unroll
+        for (int j = 0; j < kMaxHeadVec; ++j) {
+            const int d = lane * vec + j;
+            if (j < vec && d < head_dim) {
+                if constexpr (Dense) {
+                    out[out_row + d] = acc[i][j] * inv;
+                } else {
+                    const float gate = q_ptr[head_dim + d];
+                    out[out_row + d] = acc[i][j] * inv / (1.0f + expf(-gate));
+                }
+            }
+        }
+    }
+}
+
 template <bool Dense>
 __global__ void attention_prefill_paged_f32_kernel(
     float * out, const float * q, const void * k_pool, const void * v_pool,
@@ -794,11 +930,27 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
         block_size <= 0) {
         return;
     }
-    const int blocks = (rows + kQPerBlock - 1) / kQPerBlock;
-    const dim3 grid(static_cast<unsigned>(heads), static_cast<unsigned>(blocks));
     const int vec = (head_dim + 31) / 32;
     const size_t shared =
         size_t(2 * kKeysPerBlock) * size_t(32 * (vec + 1)) * sizeof(float);
+    if (heads / kv_heads == kGQAHeads && position + rows >= kGQAThreshold) {
+        const dim3 gqa_grid(static_cast<unsigned>(kv_heads),
+                            static_cast<unsigned>((rows + kGQAQPerBlock - 1) / kGQAQPerBlock));
+        if (dense) {
+            attention_prefill_paged_gqa_f32_kernel<true>
+                <<<gqa_grid, kAttnThreads, shared, stream>>>(
+                    out, q, k_pool, v_pool, block_table, block_size, heads,
+                    head_dim, kv_dim, rows, position, scale, dtype);
+        } else {
+            attention_prefill_paged_gqa_f32_kernel<false>
+                <<<gqa_grid, kAttnThreads, shared, stream>>>(
+                    out, q, k_pool, v_pool, block_table, block_size, heads,
+                    head_dim, kv_dim, rows, position, scale, dtype);
+        }
+        return;
+    }
+    const int blocks = (rows + kQPerBlock - 1) / kQPerBlock;
+    const dim3 grid(static_cast<unsigned>(heads), static_cast<unsigned>(blocks));
     if (dense) {
         attention_prefill_paged_f32_kernel<true><<<grid, kAttnThreads, shared, stream>>>(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
