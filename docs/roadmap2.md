@@ -383,18 +383,26 @@ GEMM with fp16 compute and output reaches 20-33 TFLOP/s. Both the library
 datatype and the tile/int8 geometry are open items. See
 [benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
-A 2026-11-16 experiment closed the datatype item and the tile item without
-adopting either. Dequantize-to-F16 plus fp16-compute rocBLAS runs the 512-token
-prefill in 0.330 s (1552 tok/s, 1.76x) and is 1.6-3.3x faster per GEMM from 256
-rows upward, but it moves the chunk-512 logits by 0.305 against the 0.05 gate,
-and restricting it to the shallow-`K` or the deep-`K` matmul family alone still
+A 2026-11-16 experiment rejected the FP16 accumulator and the 128-row tile.
+Dequantize-to-F16 plus fp16-compute rocBLAS runs the 512-token prefill in
+0.330 s (1552 tok/s, 1.76x) and is 1.6-3.3x faster per GEMM from 256 rows
+upward, but it moves the chunk-512 logits by 0.305 against the 0.05 gate, and
+restricting it to the shallow-`K` or the deep-`K` matmul family alone still
 drifts 0.319 and 0.296. FP16 accumulation is therefore rejected for every
 prefill matmul; the FP32 accumulator stays. The 128-row tile gains 6-26% on wide
 shallow-`K` shapes and loses 0.5-12% on tall-`K` and 3-15% at 128 rows, and its
 end-to-end range (0.553-0.572 s) stays inside the 2.4% run-to-run band of the
-baseline (0.559-0.589 s), so it is not selected. The binding limit is
-instructions per MAC, which leaves the int8 MMQ geometry as the next attempt.
-See
+baseline (0.559-0.589 s), so it is not selected.
+
+The remaining matmul bottleneck is instructions per MAC, but the datatype item
+is only half closed. rocBLAS accepts FP16 operands with FP32 compute and an FP16
+destination, which keeps the FP32 accumulator and still measures 22.0 TFLOP/s on
+`2560 -> 9216` at `M = 512`, against 8.6 TFLOP/s for the selected WMMA kernel
+and 35.9 TFLOP/s for the rejected FP16 accumulator. That combination is the
+cheapest next measurement: it removes the error this experiment rejected and
+leaves only the FP16 rounding of the result. The int8 MMQ geometry remains the
+larger rewrite, and its int8 activation quantization adds its own error term, so
+it must be measured against the same gate rather than assumed exact. See
 [benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)

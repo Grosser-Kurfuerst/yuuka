@@ -824,12 +824,32 @@ was reverted.
 bottleneck: halving it with a 128-row tile buys 6-26% on the wide shapes and
 nothing on the tall ones, and the two matmul families that dominate the 476 ms,
 the fused gate/up pair and the tall-`K` down projection, keep the 64-row
-geometry either way. The library route reaches 20-33 TFLOP/s but only with FP16
-accumulation, which the logit gate rejects. What remains is instructions per
-MAC: llama.cpp spends about 22 instructions per 4096-MAC WMMA against yuuka's
-114 because it dequantizes weights to int8 once per 128-token pass and
-accumulates in int32, which is numerically exact. That is the roadmap's Phase 3
-quantized GEMM, not a tile or datatype change.
+geometry either way. What remains is instructions per MAC: llama.cpp spends
+about 22 instructions per 4096-MAC WMMA against yuuka's 114 because it
+dequantizes weights to int8 once per 128-token pass and accumulates in int32.
+That accumulation is exact, but the int8 activation quantization it requires
+adds an error term of the same order as the one rejected here, so that route
+must clear the same logit gate rather than inherit exactness from its
+accumulator. It is the roadmap's Phase 3 quantized GEMM either way.
+
+**The datatype question is not closed by this rejection.** rocBLAS also accepts
+FP16 operands with FP32 compute and an FP16 destination, which rounds each
+output once instead of after every K step. Same shape as the table above
+(`2560 -> 9216`, `M = 512`), one warmup call then three timed repeats:
+
+| rocBLAS types | Time | Rate |
+| --- | ---: | ---: |
+| FP16 compute, FP16 out | 0.672 ms | 35.9 TFLOP/s |
+| FP32 compute, FP16 out | 1.098 ms | 22.0 TFLOP/s |
+| FP32 compute, FP32 out (the 2026-11-15 wrapper) | 5.107 ms | 4.7 TFLOP/s |
+
+FP32 compute with FP16 output is 2.5x faster than the selected WMMA kernel on
+this shape and 1.6x slower than the rejected route. Its only new error term
+against the WMMA path is the FP16 rounding of the result, 5e-4 relative against
+the 4e-3 measured for FP16 accumulation, which puts the expected drift near
+0.04. That is inside the 0.05 gate only barely, so it has to be measured on the
+chunk test rather than assumed; it was identified after this rejection and is
+not implemented.
 
 Reproduction without committed code: the numeric gate is a scratch Go module
 that replaces `github.com/yuuka-ai/yuuka` and uses `gguf.Open` plus

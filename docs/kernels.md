@@ -260,10 +260,13 @@ expanded each packed matrix into an FP16 scratch and ran rocBLAS with FP16
 compute was 1.6-3.3x faster per GEMM from 256 rows upward, but it moved the
 512-token prefill logits by 0.305 against the 0.05 chunk gate even when only one
 matmul family used it, so FP16 accumulation is not adopted anywhere in the
-prefill path. A 128-row tile with four accumulator fragments was also measured:
-it halves the weight-tile reloads but needs a two-half epilogue for the 24 KiB
-staging alias, and it loses on tall-`K` shapes where the extra CTA count matters
-more. Both experiments are recorded in
+prefill path. The accumulator width, not the library, is the constraint: the
+same expansion with FP32 compute and an FP16 destination measures 22.0 TFLOP/s
+on `2560 -> 9216` at `M = 512` against 8.6 for this kernel, and it rounds each
+output once instead of after every K step. A 128-row tile with four accumulator
+fragments was also measured: it halves the weight-tile reloads but needs a
+two-half epilogue for the 24 KiB staging alias, and it loses on tall-`K` shapes
+where the extra CTA count matters more. All three experiments are recorded in
 [benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
 
 The 64x64/K32 variant is selected for `rows >= 64` when `K <= N`; the 32x64
