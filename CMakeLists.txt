@@ -59,6 +59,17 @@ if(YUUKA_ENABLE_HIP)
         add_executable(yuuka_hardware_probe bench/hip/hardware_probe.hip)
         target_link_libraries(yuuka_hardware_probe PRIVATE hip::device roc::rocblas roc::rocwmma)
 
+        add_executable(yuuka_dot_probe bench/hip/dot_probe.hip)
+        target_link_libraries(yuuka_dot_probe PRIVATE hip::device roc::rocwmma)
+        # RDNA 3.5 parts have no dot1-insts, so the int8 dot4 builtin does not
+        # compile for them. The flag is set here because the arch macro is only
+        # defined in the device pass and the host pass must agree.
+        if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx115[0-9]")
+            target_compile_definitions(yuuka_dot_probe PRIVATE YUUKA_PROBE_DOT1=0)
+        else()
+            target_compile_definitions(yuuka_dot_probe PRIVATE YUUKA_PROBE_DOT1=1)
+        endif()
+
         add_executable(yuuka_gemv_sweep bench/hip/gemv_sweep.cpp)
         target_link_libraries(yuuka_gemv_sweep PRIVATE yuuka_hip)
 

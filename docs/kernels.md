@@ -448,11 +448,23 @@ are the ones the one-head kernel uses, applied to the four rows independently
 with their own causal stops. It is selected only when `heads / kv_heads == 4`
 and `position + rows >= 2048`: below that the staging cost is small and the
 larger workgroup count of the one-head kernel wins, so a 512-token prompt at
-position 0 is unchanged. Position 7680 attention in the 512-row profile moved
-from 615 ms to 562 ms and the 8192-token prefill from 700 to 741 tok/s. The
-saving is bounded by the score and value arithmetic, which is unchanged: staging
-is only 70 ms of the 615 ms at that position, so the measured 562 ms is above
-the 450 ms this kernel was expected to reach.
+position 0 is unchanged. The kernel has two staged-tile variants:
+
+- **Packed K.** When `head_dim == 32 * vec` with an even `vec >= 2` (so every
+  lane covers whole FP16 pairs), K is staged as `__half2` and each score
+  accumulates with `v_dot2` in FP32. V stays FP32 because converting a half2 V
+  tile costs more instructions than the shared memory it saves. The packed tile
+  is also what makes a 32-key tile fit: at `head_dim` 256 it needs 55 KiB of the
+  64 KiB dynamic limit, while two FP32 tiles of 32 keys need 73.7 KiB.
+- **FP32 tile.** Everything else stages K and V as FP32.
+
+`gqa_tile()` picks 32 keys when the variant's tile fits the 64 KiB dynamic shared
+limit and 16 keys otherwise, so the barrier count per staged key halves wherever
+the budget allows. Two keys are scored before either softmax update, which
+overlaps the two shuffle chains. `tests/hip/paged_test.cpp` covers both variants
+(`head_dim` 4 FP32, `head_dim` 64 packed) against the same reference attention
+sweep at 2e-4. Measured effect and the rejected row-phase restructure are in
+[benchmarks.md](benchmarks.md#long-context-attention-packed-k-tile-2026-11-16).
 
 ### 7.3 KV cache formats
 

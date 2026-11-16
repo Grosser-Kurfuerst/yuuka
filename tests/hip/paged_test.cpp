@@ -152,11 +152,12 @@ int expect_graph_rejected(context & ctx, yuuka_plan * plan, yuuka_buffer * dynam
 // which the launcher selects at a position of 2048 or more when four query
 // heads share one KV head. The pool is filled through the paged write op with
 // an identity block table, so the reference attention sweep over the same host
-// arrays is a direct comparison.
-int test_gqa_attention_group4(context & ctx) {
-    const int heads = 4, kv_heads = 1, head_dim = 4, kv_dim = kv_heads * head_dim;
-    const int block_size = 16, capacity = 2048 + 16, blocks = capacity / block_size;
-    const int rows = 16, position = 2048;
+// arrays is a direct comparison. head_dim 4 uses one 32-bit value per lane and
+// head_dim 64 uses the packed FP16 K tile with half2 dots.
+int test_gqa_attention_group4(context & ctx, int head_dim, int position, int rows,
+                              int block_size, int capacity) {
+    const int heads = 4, kv_heads = 1, kv_dim = kv_heads * head_dim;
+    const int blocks = capacity / block_size;
     std::vector<int32_t> table(static_cast<size_t>(blocks));
     for (int i = 0; i < blocks; ++i) table[size_t(i)] = i;
     std::vector<float> host_k(size_t(capacity) * kv_dim);
@@ -243,8 +244,8 @@ int test_gqa_attention_group4(context & ctx) {
     yuuka_buffer_free(table_buf);
     yuuka_buffer_free(q_buf);
     yuuka_buffer_free(out);
-    std::printf("gqa attention group4 position=%d: ok (max diff %.3g)\n", position,
-                diff);
+    std::printf("gqa attention group4 head_dim=%d position=%d: ok (max diff %.3g)\n",
+                head_dim, position, diff);
     return 0;
 }
 
@@ -519,7 +520,11 @@ int main() {
         }
     }
 
-    if (test_gqa_attention_group4(ctx) != 0) {
+    if (test_gqa_attention_group4(ctx, 4, 2048, 16, 16, 2048 + 16) != 0) {
+        teardown(ctx);
+        return 1;
+    }
+    if (test_gqa_attention_group4(ctx, 64, 2048, 16, 16, 2048 + 16) != 0) {
         teardown(ctx);
         return 1;
     }

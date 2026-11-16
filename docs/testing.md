@@ -163,6 +163,9 @@ Paged KV and graph replay have dedicated native coverage in
 - KV writes through a permuted block table land in the mapped physical rows;
 - paged decode and prefill attention match an independent float reference
   through the same table;
+- the group-of-four prefill attention kernel runs at `head_dim` 4 (FP32 tile)
+  and `head_dim` 64 (packed FP16 K tile with half2 dots) against the same
+  reference, covering both staged-tile variants at 2e-4;
 - device-to-device block copies used for private prefix blocks;
 - graph capture and replay with device-resident token/position updates across
   several positions;

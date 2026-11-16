@@ -773,6 +773,47 @@ Residual error of the adopted route, from
 which is one FP16 unit roundoff of the result, and 1.1-1.5e-3 on the tall shapes
 the engine does not route. The test bound is 2e-3 per element.
 
+#### Rejected: FP32 destination and tall-`K` routing
+
+Two variants were measured against the adopted route on 2026-11-16 and rejected;
+neither ships, so the ABI, the scratch buffers, and the routing table are
+unchanged.
+
+An FP32 destination (`rocblas_datatype_f32_r` for C and D, FP16 operands, FP32
+compute) removes the FP16 rounding of the result but moves rocBLAS onto a
+different kernel. Isolated, one warmup then ten timed calls, milliseconds:
+
+| Shape | `M` | FP16 destination | FP32 destination | `blasq` (dequant + rocBLAS) before / after |
+| --- | ---: | ---: | ---: | ---: |
+| Q6_K 9216 -> 2560 | 512 | 1.03 | 7.31 | 1.815 / 8.617 |
+| Q4_K 2560 -> 9216 | 512 | 1.13 | 5.65 | 1.688 / 5.243 |
+| F16 2560 -> 9216 | 512 | 1.26 | 5.09 | - |
+
+That is 4.7 TFLOP/s against 19-20 TFLOP/s for the FP16 destination, and it
+would make the adopted wide route 3x slower. The earlier 2026-11-15 wrapper in
+the table above hit the same wall.
+
+The second variant kept the FP16 destination and routed tall-`K` matmuls
+(`9216 -> 2560` and `4096 -> 2560`) through the existing dequant + rocBLAS
+route. It is 1.7-2.2x faster isolated, but each subset was run through
+`TestGPUChunkedPrefillLongContext` (1024-token prompt, chunks 128/512/1024, all
+with top-1 33075). The engine's working bound is 0.045 logits, stricter than
+the test's 0.05:
+
+| Tall route selection | Max logit diff |
+| --- | ---: |
+| none (adopted) | 0.0419 |
+| every tall K-quant matmul | 0.0697 |
+| `K = 4096` only (`ssm_out`, `attn_output`) | 0.0685 |
+| `K = 9216` only (`ffn_down`) | 0.0494 |
+| `K = 9216`, `Q6_K` only | 0.0574 |
+| `K = 9216`, `Q4_K` only | 0.0474 |
+
+The metric is a maximum over 248,320 logits and is reproducible to the last
+digit across runs, so the smallest subset is genuinely above the working bound.
+Tall-`K` keeps WMMA until a route changes the accumulator instead of the output
+type.
+
 Known limitation: a prefill chunk below 128 rows (a prompt shorter than that, or
 an explicitly small `--chunk-size`) selects WMMA while larger chunks select the
 route, so those two produce logits that differ by about the 0.058 measured
@@ -864,6 +905,94 @@ Reproduction: `./build/yuuka_prefill_sweep` prints the isolated columns, and the
 end-to-end numbers are the `bench` commands above. The numeric gate is a scratch
 Go module that replaces `github.com/yuuka-ai/yuuka` and uses `gguf.Open` plus
 `tensor.DequantizeRow`.
+
+### Long-context attention packed K tile (2026-11-16)
+
+The GQA prefill attention kernel gained a packed K tile and a 32-key staging
+block. Same machine, GGUF, and F32 KV as the other sections;
+`TestGPUProfilePrefill` at a 512-row chunk, `ExecuteProfiled` per-op totals:
+
+| Position | Before | Row-phase restructure | Packed K + 32-key tile | + key-pair scores |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 19.7 ms | 18.5 ms | 19.4 ms | 18.6 ms |
+| 2048 | 164.8 ms | 211.1 ms | 155.5 ms | 145.9 ms |
+| 7680 | 578.8 ms | 779.4 ms | 549.2 ms | 522.0 ms |
+
+The row-phase restructure (four rows advanced through the key loop in separate
+phases instead of one row at a time) is 35% slower at position 7680 and was
+reverted: the guarded phases cost more instructions than the independent chains
+save. The packed tile is the measured win, and it is what lets a 32-key block
+fit shared memory at `head_dim` 256 (55 KiB against 73.7 KiB for two FP32
+tiles). Halving the score instructions only moves the kernel 5%, which bounds
+how much of the cell is score arithmetic.
+
+Attribution, skipping the score and value loop entirely while keeping the
+staging walk and both barriers: 92.1 ms at position 7680. Staging is 16% of the
+cell, and the remaining 457 ms is the online softmax and value accumulation,
+which the two-change kernel reduces to 430 ms. Reaching the 400 ms target needs
+the staging walk shared across query-row blocks, which this change does not
+attempt.
+
+End to end, `bench --chunk-size 512`, `--warmup 2 --reps 5` at 512 and
+`--warmup 1 --reps 2` at 8192:
+
+| Prompt tokens | Before | After |
+| ---: | ---: | ---: |
+| 512 | 0.423 s | 0.428 s |
+| 8192 | 11.401 s / 718 tok/s | 10.894 s / 752 tok/s |
+
+The 512-token row is unchanged inside the run-to-run band because position 0
+uses the one-head kernel. The chunk-invariance gate is unchanged at 0.0419
+logits with top-1 33075, and the native packed case (`head_dim` 64, position
+2048) matches the reference sweep within 3.2e-06.
+
+### int8 dot throughput probe (2026-11-16)
+
+`./build/yuuka_dot_probe` runs four register-resident kernels, 4096 workgroups
+of 256 threads, 1024 iterations of eight independent accumulations, 20 repeats,
+and reports `2 * MACs / seconds`:
+
+| Kernel | Time | TFLOP/s-equivalent | MACs per instruction |
+| --- | ---: | ---: | ---: |
+| `fp32-fma` | 0.752 ms | 22.86 | 1 |
+| `fdot2` | 1.346 ms | 25.52 | 2 |
+| `sdot4` | unavailable | - | - |
+| `rocwmma-int8` | 5.004 ms | 54.93 | 4096 per wave call |
+
+`sdot4` does not exist on this target: gfx1151 has no `dot1-insts`, so
+`__builtin_amdgcn_sdot4` is a compile error, not a slow instruction. The int8
+MMQ route that the sdot4 probe was meant to clear is therefore not
+implementable on gfx1151, and no int8 GEMM, repack, or ABI entry was added. The
+rocWMMA int8 tile measures 2.4x the FP32 FMA rate, so an int8 tile route through
+rocWMMA is the remaining candidate; it needs a different kernel and numeric
+scheme than the sdot4 plan and is not measured end to end.
+
+Reproduction: `cmake --build build --target yuuka_dot_probe && ./build/yuuka_dot_probe`.
+CMake sets `YUUKA_PROBE_DOT1=0` for the gfx115x targets.
+
+### Gated delta-net blocked chunk (rejected, 2026-11-16)
+
+A 16-row blocked form of the gated delta-net chunk (forward substitution over
+the block's unit lower-triangular delta system, three dense products against the
+block-start state) was implemented and measured against the register-resident
+kernel. Native correctness passed on the first build: state-128 output 2.09e-07
+against the FP32 reference, state update within tolerance, repeatability
+bitwise. Performance did not:
+
+| Variant | `recurrent_chunk` per 512-row chunk | Note |
+| --- | ---: | --- |
+| Register-resident split (incumbent) | 50.9 ms | state held in registers for the whole chunk |
+| Blocked, one workgroup per head | 133.8 ms | 32 workgroups |
+| Blocked, four workgroups per head | 112.0 ms | 128 workgroups, 4-way column split |
+| Blocked, state reads replaced by one line | 106.5 ms | attribution probe, not a valid kernel |
+
+The attribution probe shows the loss is not state traffic: the blocked kernel
+reads and writes the 64 KiB state once per 16-row block (32 times per chunk)
+and making those reads free changes the time by 5%. The cost is the dependent
+instruction chains in the four sequential phases, which the row-serial kernel
+already hides with a register-resident state. The blocked kernel and its q/k
+normalization kernel were deleted; the incumbent kernel and its contract are
+unchanged.
 
 ### Prefill attention tiling (2026-11-15)
 
@@ -993,10 +1122,18 @@ around every plan operation), before against after:
 | F16 cast (`cast_f16`) | 11.7 ms | 11.5 ms | 11.5 ms | 11.5 ms |
 | Total (profiled) | 480.1 ms | 421.9 ms | 1025.1 ms | 952.2 ms |
 
-The matmul total falls even though the Q6_K kernel itself is faster, because 59
-of the 179 K-quant calls now take the measured-fastest path for their shape: the
-engine re-measures the isolated per-shape timings, and the improved WMMA Q6_K
-kernel wins shapes that the dequant route used to hold.
+The 59-call drop that this table used to attribute to route re-selection inside
+this round does not reproduce. Profiling the round's starting tree (`67d013d`)
+at positions 0, 2048, and 7680 measures `dequant_f16` at 120 calls and 26.2 ms at
+every position, and the tree before the wide-route adoption (`32d22d1`) submits
+no `dequant_f16` op at all (419 plan operations against 723). The Q6_K span
+loader changes only the WMMA kernel's inner loop and cannot move the route, and
+the shape-based rule is position-independent, so the count is 120 wherever the
+wide route is adopted and the 179-call/36.0 ms entry belongs to an intermediate
+route-experiment variant that routed more matrices through the dequant scratch.
+The round's measured starting point is therefore `gemm` 325.8 ms and
+`dequant_f16` 26.2 ms (120) at position 0, against 293.4 ms and 26.1 ms after;
+the table's before column is the earlier route-experiment tree.
 
 Isolated Q6_K cells from `yuuka_prefill_sweep` (`wmma` column, same binary pair):
 
