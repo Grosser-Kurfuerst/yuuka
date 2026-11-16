@@ -55,7 +55,10 @@ func (p PrefillPath) String() string {
 // Tall-`K` projections stay on WMMA at every batch size for a measured numeric
 // reason: rocBLAS splits `K` on those shapes and the FP16 destination forces
 // the split reduction through FP16, which measured 1.0-1.5e-3 relative error
-// against 4.0-4.9e-4 on the wide shapes. The WMMA path selects its 64x64 or
+// against 4.0-4.9e-4 on the wide shapes. The 1024-token chunk gate rejects the
+// route at the same 128-row floor: Q4_K measured 0.047 logits for the FFN down
+// projections alone and 0.061 for the whole tall class, Q5_K measured 0.079,
+// and the route accepts at 0.045. The WMMA path selects its 64x64 or
 // 32x64 tile internally from the same measured row and shape class; that choice
 // is not exposed as a separate Go path.
 func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {

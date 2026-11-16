@@ -162,6 +162,60 @@ __device__ __forceinline__ void decode_span(const uint8_t * row, int64_t k,
     }
 }
 
+// q6k_span4 decodes four consecutive Q6_K values starting at a multiple of 4
+// inside one 256-value block. The group shares one ql word, one qh word, and one
+// scale byte, so the four values cost two words instead of eight scalar byte
+// loads plus four block-header and scale loads. Q6_K block starts are only
+// 2-byte aligned (a block is 210 bytes), so the words are assembled from 16-bit
+// halves.
+__device__ __forceinline__ void q6k_span4(const uint8_t * blk, int j,
+                                          __half * out) {
+    const int8_t * sc = reinterpret_cast<const int8_t *>(blk + 192);
+    const int n = j / 128;
+    const int l = j & 127;
+    const uint8_t * ql = blk + n * 64;
+    const uint8_t * qh = blk + 128 + n * 32;
+    const uint8_t * ql_src = ql;
+    const uint8_t * qh_src = qh;
+    int ql_shift = 0;
+    int qh_shift = 0;
+    int sidx = 0;
+    if (l < 32) {
+        ql_src = ql + l;
+        qh_src = qh + l;
+        sidx = l / 16;
+    } else if (l < 64) {
+        ql_src = ql + l;
+        qh_src = qh + (l - 32);
+        qh_shift = 2;
+        sidx = (l - 32) / 16 + 2;
+    } else if (l < 96) {
+        ql_src = ql + (l - 64);
+        ql_shift = 4;
+        qh_src = qh + (l - 64);
+        qh_shift = 4;
+        sidx = (l - 64) / 16 + 4;
+    } else {
+        ql_src = ql + (l - 64);
+        ql_shift = 4;
+        qh_src = qh + (l - 96);
+        qh_shift = 6;
+        sidx = (l - 96) / 16 + 6;
+    }
+    const uint32_t ql_word = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(ql_src)) |
+                             (static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(ql_src + 2)) << 16);
+    const uint32_t qh_word = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(qh_src)) |
+                             (static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(qh_src + 2)) << 16);
+    const float d = load_f16_device(blk + 208) *
+                    static_cast<float>(sc[n * 8 + sidx]);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int q = static_cast<int>((ql_word >> (8 * i + ql_shift)) & 0xF) |
+                      (static_cast<int>((qh_word >> (8 * i + qh_shift)) & 3) << 4);
+        out[i] = __float2half(d * static_cast<float>(q - 32));
+    }
+}
+
 template <int BlockM, int BlockK>
 __device__ __forceinline__ void load_a_tile(__half * tile, const float * x,
                                             int64_t m0, int64_t k0, int64_t rows,
@@ -179,10 +233,10 @@ __device__ __forceinline__ void load_a_tile(__half * tile, const float * x,
 // load_b_tile stages a kBlockN x BlockK weight tile. Block-quantized layouts
 // decode one contiguous span per thread: the block header is amortized, Q4_K and
 // Q5_K use vector global loads, and no decoded span is staged in registers or
-// scratch. F32, F16, and Q6_K keep the element mapping where consecutive lanes
-// read consecutive row bytes: they have no header worth hoisting above the
-// per-value cost, and the span walk measured slower for them because a thread's
-// bytes are strided across rows instead of coalesced across lanes.
+// scratch. Q6_K decodes four values per thread from one ql word and one qh word;
+// the dense layouts keep the element mapping where consecutive lanes read
+// consecutive row bytes, because they have no header worth hoisting above the
+// per-value cost.
 template <uint32_t DType, int BlockK>
 __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
                                             int64_t n0, int64_t k0, int64_t n_in,
@@ -192,8 +246,7 @@ __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
     constexpr int kRowsPerPass = kThreads / kThreadsPerRow;
     static_assert(BlockK % kThreadsPerRow == 0, "span must divide the K step");
     static_assert(kSpan == 8 || kSpan == 16, "span decoder supports 8 or 16 values");
-    if (DType == YUUKA_DTYPE_F32 || DType == YUUKA_DTYPE_F16 ||
-        DType == YUUKA_DTYPE_Q6_K) {
+    if (DType == YUUKA_DTYPE_F32 || DType == YUUKA_DTYPE_F16) {
         for (int idx = threadIdx.x; idx < kBlockN * BlockK; idx += kThreads) {
             const int s = idx / BlockK;
             const int c = idx % BlockK;
@@ -204,14 +257,41 @@ __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
                 const uint8_t * row = w + gn * row_bytes;
                 if (DType == YUUKA_DTYPE_F32) {
                     value = reinterpret_cast<const float *>(row)[gk];
-                } else if (DType == YUUKA_DTYPE_F16) {
-                    value = load_f16_device(row + gk * 2);
                 } else {
-                    value = q6k_value(row + (gk / 256) * 210,
-                                      static_cast<int>(gk % 256));
+                    value = load_f16_device(row + gk * 2);
                 }
             }
             tile[s * BlockK + c] = __float2half(value);
+        }
+        return;
+    }
+    if (DType == YUUKA_DTYPE_Q6_K) {
+        static_assert(BlockK == 32, "the Q6_K span covers 32 K values per row");
+        // Eight lanes cover one row and four values per lane, so a pass stages
+        // 32 rows.
+        const int row_in_group = threadIdx.x / 8;
+        const int col0 = (threadIdx.x % 8) * 4;
+        for (int r = row_in_group; r < kBlockN; r += kThreads / 8) {
+            __half * dst = tile + r * BlockK + col0;
+            const int64_t gn = n0 + r;
+            const int64_t gk = k0 + col0;
+            const bool in_range = gn < n_out && gk < n_in;
+            const int64_t remaining = in_range ? n_in - gk : 0;
+            const int valid =
+                in_range ? static_cast<int>(remaining < 4 ? remaining : 4) : 0;
+            const uint8_t * row = w + gn * row_bytes;
+            if (valid == 4) {
+                q6k_span4(row + (gk / 256) * 210, static_cast<int>(gk % 256), dst);
+                continue;
+            }
+            for (int j = 0; j < valid; ++j) {
+                const int64_t col = gk + j;
+                dst[j] = __float2half(
+                    q6k_value(row + (col / 256) * 210, static_cast<int>(col % 256)));
+            }
+            for (int j = valid; j < 4; ++j) {
+                dst[j] = __float2half(0.0f);
+            }
         }
         return;
     }
