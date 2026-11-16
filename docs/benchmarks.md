@@ -778,6 +778,41 @@ an explicitly small `--chunk-size`) selects WMMA while larger chunks select the
 route, so those two produce logits that differ by about the 0.058 measured
 above. The gate compares 128 and 512, which both use the route.
 
+#### Prompt-length scaling
+
+The route's saving is a fixed amount of matmul work per 512-row chunk, so its
+relative value falls as the prompt grows and attention takes over. Same machine,
+`--chunk-size 512`, sequential runs, `--warmup 1 --reps 2` up to 8192 and
+`--warmup 1 --reps 1` above it:
+
+| Prompt tokens | WMMA | Route | Delta | Saving per chunk |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 0.575 s / 890 tok/s | 0.475 s / 1077 tok/s | +21% | 0.100 s |
+| 2048 | 2.513 s / 815 tok/s | 2.096 s / 977 tok/s | +20% | 0.104 s |
+| 8192 | 13.795 s / 594 tok/s | 12.818 s / 639 tok/s | +7.6% | 0.061 s |
+| 16384 | 40.105 s / 409 tok/s | 37.302 s / 439 tok/s | +7.5% | 0.088 s |
+| 32768 | 129.245 s / 254 tok/s | 123.898 s / 264 tok/s | +4.3% | 0.084 s |
+
+The absolute saving is 0.08-0.10 s per 512-token chunk at every length, so the
+gain is `saving / total` and the total is dominated by attention from about 8k
+tokens on. The 8192 row measures a lower per-chunk saving than its neighbours;
+two repetitions cannot separate that from run-to-run noise, and the surrounding
+rows bracket it.
+
+The saving is bounded by the traffic the expansion costs. The routed class is
+120 tensors, 1.431 GB packed and 2432.7 M elements, so per chunk the route reads
+1.431 GB of packed weights, writes 4.865 GB of FP16 scratch, and the GEMM reads
+that scratch back: 9.73 GB more DRAM traffic than the WMMA path, which reads the
+1.431 GB once. At the 190 GB/s the hardware probe measures for a streaming
+kernel, that is 51 ms per chunk against a 0.13-0.15 s compute saving, which is
+why the route is 1.2x on the matmul and not the 2.5x the isolated GEMM shows. A kernel that keeps the weights packed
+(the int8 MMQ geometry) removes that term entirely, which is the strongest
+argument for it beyond the instruction count.
+
+Above 16k tokens the matmul is no longer where the time goes: 64 chunks of the
+route save 5.3 s of a 129 s prefill, so attention and the gated delta-net are the
+levers there.
+
 #### Rejected: 128-row WMMA tile
 
 The attribution ranks token-tile reuse first: the 64-row tile re-reads every
