@@ -333,13 +333,6 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 | F16, `M >= 128`, `K <= N` | rocBLAS + cast |
 | F16, other `M >= 8` | Custom rocWMMA |
 
-An integer matmul over packed quants (`mmq` in the sweep) has no dispatch row:
-it is the most accurate route measured, bitwise identical across chunk
-boundaries, but gfx1151 has no int8 dot instruction, so it runs at 1.4 TFLOP/s
-against 8.6-22 for the selected routes. It is measured in
-[benchmarks.md](benchmarks.md#measured-and-not-selected-int8-mmq) and kept as a
-sweep column.
-
 The custom kernel is selected only where the sweep showed it faster than the
 compared baseline, and a library route only where it is both faster and inside
 the numeric gates. The K-quant rocBLAS row is bounded twice: from below by the

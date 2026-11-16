@@ -399,16 +399,10 @@ applies on the WMMA path. The chunk-invariance gate measures 0.042 against its
 0.05 bound, which is now the binding constraint on this route rather than the
 2e-2 per-GEMM tolerance. The 128-row WMMA tile gains 6-26% on wide shallow-`K`
 shapes and loses 0.5-12% on tall-`K` and 3-15% at 128 rows, and its end-to-end
-range stayed inside the run-to-run band, so it is not selected. The int8 MMQ geometry was then implemented and measured: packed quants used
-straight as int8 weights, two-pass int8 activations, exact int32 accumulation,
-FP32 per-step scaling. It is the most accurate route measured, bitwise identical
-across chunk boundaries against 0.042 for the adopted route, but gfx1151 has no
-int8 dot instruction (`sdot4` needs the CDNA `dot1-insts` feature) and the
-rocWMMA int8 MMA cannot apply a per-32-value scale without rescaling the
-accumulator every step, so it runs at 1.4 TFLOP/s and 2.107 s for a 512-token
-prefill. It is not selected; the kernel and its tests stay as a measured sweep
-column. Remaining matmul headroom would need int8 dot hardware or a K-quant
-layout with a per-row scale. See
+range stayed inside the run-to-run band, so it is not selected. Remaining matmul
+headroom is instructions per MAC: the int8 MMQ geometry is the next attempt, and
+its int8 activation quantization must clear the same gate rather than inherit
+exactness from its integer accumulator. See
 [benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)

@@ -137,14 +137,6 @@ bool kv_pool_bytes(uint32_t dtype, uint64_t blocks, uint64_t block_size,
     return true;
 }
 
-uint64_t dense_row_bytes(uint64_t n_in, uint32_t dtype) {
-    uint64_t row_bytes = 0;
-    if (!checked_row_bytes(n_in, dtype, &row_bytes)) {
-        return 0;
-    }
-    return row_bytes;
-}
-
 bool checked_float_bytes(uint64_t elements, uint64_t * out) {
     return !__builtin_mul_overflow(elements, uint64_t(sizeof(float)), out);
 }
@@ -636,102 +628,6 @@ yuuka_status validate_cast_plan_op(const yuuka_op & op) {
     if (!buffer_range_ok(op.buf[0], op.off[0], src_bytes) ||
         !buffer_range_ok(op.buf[1], op.off[1], dst_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "cast buffer is too small");
-    }
-    return YUUKA_OK;
-}
-
-// validate_quant_act_plan_op checks the two-pass int8 activation quantizer.
-// The destination buffers follow the documented layout: n int8 values per pass,
-// n/32 FP16 scale pairs, and n/32 int32 sum pairs.
-yuuka_status validate_quant_act_plan_op(const yuuka_op & op) {
-    for (int i = 0; i < 5; ++i) {
-        if (op.buf[i] == nullptr) {
-            return fail(YUUKA_ERR_INVALID_ARGUMENT, "quant_act op buffer %d is null", i);
-        }
-    }
-    const uint64_t n = op.n[0];
-    if (n == 0 || n % 32 != 0) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT,
-                    "quant_act element count %llu is not a positive multiple of 32",
-                    static_cast<unsigned long long>(n));
-    }
-    uint64_t src_bytes = 0;
-    uint64_t blocks = 0;
-    uint64_t scale_bytes = 0;
-    uint64_t sum_bytes = 0;
-    if (__builtin_mul_overflow(n, uint64_t(4), &src_bytes) ||
-        __builtin_mul_overflow(n / 32, uint64_t(8), &scale_bytes) ||
-        __builtin_mul_overflow(n / 32, uint64_t(8), &sum_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "quant_act dimensions overflow");
-    }
-    blocks = n;
-    if (!buffer_range_ok(op.buf[0], op.off[0], src_bytes) ||
-        !buffer_range_ok(op.buf[1], op.off[1], blocks) ||
-        !buffer_range_ok(op.buf[2], op.off[2], blocks) ||
-        !buffer_range_ok(op.buf[3], op.off[3], scale_bytes) ||
-        !buffer_range_ok(op.buf[4], op.off[4], sum_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "quant_act buffer is too small");
-    }
-    return YUUKA_OK;
-}
-
-// validate_mmq_plan_op checks an integer matmul over packed K-quant weights.
-// All six buffers are required because the kernel reads the packed weights, the
-// two activation passes, and their per-block scales and sums, and writes FP32.
-yuuka_status validate_mmq_plan_op(const yuuka_op & op) {
-    for (int i = 0; i < 6; ++i) {
-        if (op.buf[i] == nullptr) {
-            return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq op buffer %d is null", i);
-        }
-    }
-    const uint64_t n_in = op.n[0];
-    const uint64_t n_out = op.n[1];
-    const uint64_t rows = op.n[2];
-    const uint32_t dtype = op.u[0];
-    if (dtype != YUUKA_DTYPE_Q4_K && dtype != YUUKA_DTYPE_Q5_K &&
-        dtype != YUUKA_DTYPE_Q6_K) {
-        return fail(YUUKA_ERR_UNSUPPORTED, "mmq supports K-quants only, got %u", dtype);
-    }
-    if (n_in == 0 || n_out == 0 || rows == 0) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq dimensions must be positive");
-    }
-    if (!check_gemv_shapes(n_in, dtype)) {
-        return fail(YUUKA_ERR_UNSUPPORTED,
-                    "mmq input width %llu is not a multiple of 256",
-                    static_cast<unsigned long long>(n_in));
-    }
-    if (n_in > 0x7fffffffULL || n_out > 0x7fffffffULL || rows > 0x7fffffffULL) {
-        return fail(YUUKA_ERR_UNSUPPORTED, "mmq dimensions exceed int32");
-    }
-    uint64_t row_bytes = 0;
-    uint64_t weight_bytes = 0;
-    uint64_t elements = 0;
-    uint64_t blocks = 0;
-    uint64_t scale_bytes = 0;
-    uint64_t out_bytes = 0;
-    if (!checked_row_bytes(n_in, dtype, &row_bytes) ||
-        __builtin_mul_overflow(row_bytes, n_out, &weight_bytes) ||
-        __builtin_mul_overflow(n_in, rows, &elements) ||
-        __builtin_mul_overflow(n_in / 32, rows, &blocks) ||
-        __builtin_mul_overflow(blocks, uint64_t(8), &scale_bytes) ||
-        __builtin_mul_overflow(n_out, rows, &elements) ||
-        __builtin_mul_overflow(elements, uint64_t(4), &out_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq dimensions overflow");
-    }
-    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq weight buffer is too small");
-    }
-    const uint64_t act_bytes = uint64_t(n_in) * rows;
-    if (!buffer_range_ok(op.buf[1], op.off[1], act_bytes) ||
-        !buffer_range_ok(op.buf[2], op.off[2], act_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq activation buffer is too small");
-    }
-    if (!buffer_range_ok(op.buf[3], op.off[3], scale_bytes) ||
-        !buffer_range_ok(op.buf[4], op.off[4], scale_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq activation scale buffer is too small");
-    }
-    if (!buffer_range_ok(op.buf[5], op.off[5], out_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq output buffer is too small");
     }
     return YUUKA_OK;
 }
@@ -1654,22 +1550,6 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         case YUUKA_OP_CAST_F16: {
             yuuka::launch_cast_f32_to_f16(
                 op_ptr<void>(op, 1), op_ptr<const float>(op, 0), op.n[0], stream);
-            break;
-        }
-        case YUUKA_OP_MMQ_GEMM: {
-            yuuka::launch_mmq_gemm_f32out(
-                op_ptr<float>(op, 5), op_ptr<const int8_t>(op, 1),
-                op_ptr<const int8_t>(op, 2), op_ptr<const float>(op, 3),
-                op_ptr<const int32_t>(op, 4), op_ptr<const uint8_t>(op, 0),
-                static_cast<int64_t>(op.n[0]), static_cast<int64_t>(op.n[1]),
-                static_cast<int64_t>(op.n[2]), dense_row_bytes(op.n[0], op.u[0]),
-                op.u[0], stream);
-            break;
-        }
-        case YUUKA_OP_QUANT_ACT_I8_PAIR: {
-            yuuka::launch_quantize_act_i8_pair(
-                op_ptr<int8_t>(op, 1), op_ptr<int8_t>(op, 2), op_ptr<float>(op, 3),
-                op_ptr<int32_t>(op, 4), op_ptr<const float>(op, 0), op.n[0], stream);
             break;
         }
         case YUUKA_OP_DEQUANT_F16: {
@@ -2851,7 +2731,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MMQ_GEMM) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_DEQUANT_F16) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -2897,12 +2777,6 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_DEQUANT_F16:
                 status = validate_dequant_plan_op(*op);
-                break;
-            case YUUKA_OP_QUANT_ACT_I8_PAIR:
-                status = validate_quant_act_plan_op(*op);
-                break;
-            case YUUKA_OP_MMQ_GEMM:
-                status = validate_mmq_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

@@ -136,9 +136,7 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_DOWN = 32,
     YUUKA_OP_MOE_REDUCE_ADD = 33,
     YUUKA_OP_GEMM_SWIGLU = 34,
-    YUUKA_OP_DEQUANT_F16 = 35,
-    YUUKA_OP_QUANT_ACT_I8_PAIR = 36,
-    YUUKA_OP_MMQ_GEMM = 37
+    YUUKA_OP_DEQUANT_F16 = 35
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -258,8 +256,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
  * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
- * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
- * DEQUANT_F16, QUANT_ACT_I8_PAIR, and MMQ_GEMM. Unsupported
+ * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16, and
+ * DEQUANT_F16. Unsupported
  * dtypes and widths that violate the quantization block layout fail with
  * YUUKA_ERR_UNSUPPORTED; invalid dimensions, batch sizes, and undersized
  * buffers fail with YUUKA_ERR_INVALID_ARGUMENT. A rejected operation is not
@@ -292,14 +290,6 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   CAST_F16:            buf0 FP32 src, buf1 FP16 dst; n[0]=elements
  *   DEQUANT_F16:         buf0 packed weights, buf1 FP16 dst;
  *                        n[0]=n_in, n[1]=n_out, u[0]=dtype
- *   QUANT_ACT_I8_PAIR:   buf0 FP32 src, buf1 int8 q1, buf2 int8 q2,
- *                        buf3 FP32 {s1,s2} per 32 values, buf4 int32 {sum1,sum2}
- *                        per 32 values; n[0]=elements
- *   MMQ_GEMM:            buf0 packed weights, buf1 int8 q1, buf2 int8 q2,
- *                        buf3 FP32 activation scales, buf4 int32 activation
- *                        sums, buf5 FP32 out; n={n_in,n_out,rows}; u[0]=dtype.
- *                        The scale and sum buffers hold one {s1,s2} /
- *                        {sum1,sum2} pair per 32 activation values.
  *   GEMM_SWIGLU:         buf0 gate weights, buf1 up weights, buf2 FP32 x,
  *                        buf3 out; n={n_in,n_out,rows}; u[0]=dtype. Both
  *                        weights share dtype and shape; out holds

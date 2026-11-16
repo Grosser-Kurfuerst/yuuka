@@ -81,17 +81,6 @@ void launch_cast_f32_to_f16(void * dst, const float * src, uint64_t n,
                             hipStream_t stream);
 void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,
                             hipStream_t stream);
-/* Quantizes n FP32 activations into two int8 passes with a per-32-value scale.
- *
- * q1 and q2 hold n int8 values, scales holds n/32 pairs of FP32 scales
- * (`{s1, s2}`), and sums holds n/32 pairs of int32 block sums of the quantized
- * values. The pair reconstructs the input as `s1*q1 + s2*q2`, which keeps the
- * relative error near 1e-5 so an int8 matmul stays inside the prefill logit
- * gate; a single pass measures 1.6e-3 to 2.0e-3 and does not. The sums are what
- * a quantized weight block's per-sub-block minimum term multiplies. */
-void launch_quantize_act_i8_pair(int8_t * q1, int8_t * q2, float * scales,
-                                 int32_t * sums, const float * src, uint64_t n,
-                                 hipStream_t stream);
 
 /* Dequantizes a packed K-quant weight matrix into FP16.
  *
@@ -102,22 +91,6 @@ void launch_quantize_act_i8_pair(int8_t * q1, int8_t * q2, float * scales,
  * nothing. */
 void launch_dequant_f16(void * dst, const void * w, uint64_t n_in, uint64_t n_out,
                         uint32_t dtype, hipStream_t stream);
-
-/* Integer matmul over packed K-quant weights and two-pass int8 activations.
- *
- * out[rows, n_out] = W[n_out, n_in] * (s1*q1 + s2*q2)[rows, n_in]
- *
- * The packed weight quants are used directly as int8, so no weight rounding
- * happens; products accumulate exactly in int32 per step and every scale, the
- * per-sub-block minimum, and the activation sums are applied in FP32. q1 and q2
- * hold rows*n_in int8 values, ascales and asums hold rows*(n_in/32) {s1,s2} FP32
- * and {sum1,sum2} int32 pairs (from launch_quantize_act_i8_pair). Q4_K, Q5_K,
- * and Q6_K are supported; other dtypes write nothing. */
-void launch_mmq_gemm_f32out(float * out, const int8_t * q1, const int8_t * q2,
-                            const float * ascales, const int32_t * asums,
-                            const uint8_t * w, int64_t n_in, int64_t n_out,
-                            int64_t rows, uint64_t row_bytes, uint32_t dtype,
-                            hipStream_t stream);
 
 void launch_rmsnorm_f32(float * dst, const float * src, const float * weight,
                         int64_t n, float eps, hipStream_t stream);
