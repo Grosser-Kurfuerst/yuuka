@@ -40,7 +40,7 @@ in the same change.
 | A4 | Not needed | A1-A3 met the 150 ms gate |
 | B1-B2 | Partially implemented | 64x64/K32 tile for wide rows with the shared span loader; isolated `M=512` GEMM 48-54% faster |
 | B3 | Rejected | M-first CTA order regressed the chunk total |
-| B4 | Rejected | FP16 and INT8 WMMA issue at the same rate; kernel is not operand bound |
+| B4 | Rejected (revisit) | MMA issue-rate test only; 2026-11-16 counters show the kernel is decode/operand bound, not MMA bound |
 | B5 gate/up | Implemented | Chunk 994 → 938 ms; 512-token 515.9 → 549.8 tok/s |
 | B5 other fusions | Not started | Lower priority; no measured case after B4 |
 | C1-C2 | Implemented | Position-7680 attention 2030 → 643 ms |
@@ -345,14 +345,16 @@ measured, and rejected.
 
 Measured result: wide 512-row Q4_K shapes improved 3-7%, the chunk GEMM total
 moved from 944 ms to 895 ms, and the wall chunk total from 1077 ms to 1025 ms.
-The 500 ms GEMM gate is not met. The isolated wide shapes sit at the same
-4.6-4.7 TFLOP/s ceiling as the rocBLAS FP16 baseline on this device, so further
-ordinary tile widening is not expected to close the gap. A 64x128 tile, a
-128x64 tile with 2x2 fragment waves, a padded LDS stride, and the M-first CTA
-order were all measured slower and are not in the kernel. B3's acceptance rule
-is therefore applied as written: it was not accepted. The gate/up part of B5 is
-implemented in section 4.8; B4 is rejected in section 4.9, and the remaining
-B5 fusions are unstarted. See
+The 500 ms GEMM gate is not met. The isolated wide shapes sat at the same
+4.6-4.7 TFLOP/s figure as the sweep's rocBLAS column, which was read as a
+device ceiling; the 2026-11-16 attribution shows that figure comes from the fp32
+compute path used by both `launch_gemm_blas_f16` and the earlier tile, and that
+hipBLAS with fp16 compute reaches 20-33 TFLOP/s on the same shapes. A 64x128
+tile, a 128x64 tile with 2x2 fragment waves, a padded LDS stride, and the
+M-first CTA order were all measured slower and are not in the kernel. B3's
+acceptance rule is therefore applied as written: it was not accepted. The
+gate/up part of B5 is implemented in section 4.8; B4 is rejected in section
+4.9, and the remaining B5 fusions are unstarted. See
 [benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
 
 A 2026-11-16 follow-up replaced the loader: it decodes one contiguous span per
@@ -368,6 +370,18 @@ condition stays; a 64-wide K step for the 64x64 tile measured 15-30% slower than
 32-wide and is not instantiated. The gate/up fused kernel is unchanged. The
 500 ms GEMM gate is still not met. See
 [benchmarks.md](benchmarks.md#prefill-gemm-span-decode-2026-11-16).
+
+A same-machine attribution against llama.cpp (`pp512` 2216 tok/s) splits the
+remaining 2.5x gap into matmul 476 vs 186 ms, the gated delta-net chunk 67 vs
+13 ms, and attention at parity. The matmul kernel is decode and latency bound:
+114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS, at 2922
+wave cycles per WMMA and 39% issue occupancy, against about 22 instructions per
+WMMA in llama.cpp's int8 MMQ kernel (128-row x 128-token tile, Q8_1 shared
+staging, 256-wide K step). `launch_gemm_blas_f16` also requests fp32 compute
+with fp32 output, which selects Tensile kernels at 3.3-4.7 TFLOP/s; the same
+GEMM with fp16 compute and output reaches 20-33 TFLOP/s. Both the library
+datatype and the tile/int8 geometry are open items. See
+[benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)
 
@@ -403,6 +417,18 @@ per-32 activation quantization and Q4_K/Q5_K min-term correction to the
 epilogue without a measured issue-rate gain, and would require a token-level
 tolerance change. It stays rejected until a register-blocked GEMM makes the
 kernel compute-bound; the FP16 WMMA path remains the fallback either way.
+
+Correction (2026-11-16): the rejection rested on the MMA issue rate and on DRAM
+bandwidth, and both observations stand, but the kernel turned out to be neither
+MMA bound nor DRAM bound. Instruction counters for the 64x64/K32 Q4_K kernel on
+`2560 -> 9216, M=512` measure 114 instructions per 4096-MAC WMMA (54 VALU, 10
+LDS) at 2922 wave cycles per WMMA and about 39% issue occupancy, so the limiter
+is weight decode plus shared-memory staging and the latency around them. An int8
+staging path halves the stored bytes and the per-value conversion work even
+though it does not raise the MMA issue rate, so the operand-density argument
+does apply. llama.cpp's int8 MMQ kernel reaches 24.9 TFLOP/s against yuuka's 8.5
+TFLOP/s on the same device. See
+[benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
 ## 5. Workstream C: prefill attention
 

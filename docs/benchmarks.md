@@ -469,12 +469,16 @@ Chunk effect, same diagnostic protocol as the gated delta-net table:
 | Wall chunk total, position 0 | 1077 ms | 1025 ms |
 
 The GEMM change is a 5% improvement on the chunk, not the 2-3x that workstream B
-targeted: the 500 ms gate is not met. The isolated wide shapes follow the same
-ceiling as the rocBLAS FP16 baseline, which measured 4.6-4.7 TFLOP/s at
-`M=512` in the same sweep, so ordinary tile widening is not the lever that
-closes the gap. The CTA-order experiment that mapped consecutive blocks to M
-tiles was rejected: it improved the tall-K isolated shape but raised the wide
-shape, and the chunk GEMM total regressed to 947 ms.
+targeted: the 500 ms gate is not met. The isolated wide shapes followed the same
+4.6-4.7 TFLOP/s figure as the sweep's rocBLAS column, which suggested a
+hardware ceiling. The 2026-11-16 attribution shows that figure is the fp32
+compute path of both `launch_gemm_blas_f16` and the earlier WMMA tile, not the
+device: hipBLAS with fp16 compute and fp16 output reaches 20-33 TFLOP/s on the
+same shapes. See
+[prefill gap attribution](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
+The CTA-order experiment that mapped consecutive blocks to M tiles was rejected:
+it improved the tall-K isolated shape but raised the wide shape, and the chunk
+GEMM total regressed to 947 ms.
 
 Resource report for the two selected variants:
 
@@ -551,6 +555,103 @@ The sweep was not re-tuned for this change. Because its five-submission window
 cannot separate a 2% kernel change from clock-state noise at small shapes,
 dispatch decisions that depend on a few percent should use a longer protocol
 like the focused A/B above.
+
+### Prefill gap attribution vs llama.cpp (2026-11-16)
+
+Same machine, same GGUF, both backends on the GPU: llama.cpp `b1b770d90` (build
+12359) run as `llama-bench -p 512 -n 1 -r 3 -ngl 99` reports `pp512 = 2216.25
+± 39.88 t/s`; `yuuka bench --prompt-tokens 512 --decode-tokens 1 --warmup 1
+--reps 3 --chunk-size 512` reports 881 t/s (0.581 s against 0.233 s). This
+section attributes the 2.5x gap.
+
+Per-operation split. yuuka: `TestGPUProfilePrefill` HIP events around every plan
+operation, 512 rows, F32 KV, position 0. llama.cpp: `rocprofv3
+--kernel-trace` over one `pp512` run, aggregated by kernel name. Both in
+milliseconds per 512-token prefill:
+
+| Component | yuuka | llama.cpp | Ratio |
+| --- | ---: | ---: | ---: |
+| Matmul (incl. LM head, activation quantize, Q6_K dequant, F16 cast) | 476.0 | 177.9 | 2.7x |
+| Gated delta-net chunk | 67.4 | 13.0 | 5.2x |
+| Prefill attention (incl. llama.cpp KV concat) | 18.8 | 17.6 | 1.07x |
+| Norm, RoPE, elementwise, copy, KV write | 6.7 | 24.5 | 0.3x |
+| Total | 568.9 | 233.0 | 2.44x |
+
+The matmul gap is 298 ms of the 336 ms difference and the delta-net gap is 54
+ms, partly offset by yuuka's 18 ms advantage on the elementwise kernels:
+llama.cpp pays a `concat_non_cont` KV copy (12.1 ms), a per-matmul activation
+quantize (`quantize_mmq_q8_1`, 6.5 ms), and a gate kernel for the SiLU product
+(9.7 ms).
+
+**llama.cpp mixes two matmul paths at 512 tokens.** `ggml_cuda_should_use_mmq`
+keeps Q4_K/Q5_K on the int8 `mul_mat_q` (MMQ) kernel but sends Q6_K to
+dequantize + hipBLAS when the batch exceeds 256 rows. In the trace that is
+`mul_mat_q<(ggml_type)12>` 205.1 ms and `<(ggml_type)13>` 71.7 ms over two runs,
+plus `dequantize_block_q6_K` 3.9 ms and the `Cijk_Alik_Bljk_HB_MT128x128x32`
+hipBLAS kernel 19.6 ms per run. The MMQ kernel is configured with I=128 weight
+rows, J=128 token columns, 256 threads, occupancy 2, 240 VGPR, K step 256, and
+Q8_1 shared staging: weights are dequantized to int8 once per 128-token pass and
+the activation is quantized once per matmul, so per 4096-MAC WMMA-equivalent the
+kernel issues about 22 instructions against yuuka's 114.
+
+**yuuka's kernel is decode and latency bound, not MMA bound.** Counters for the
+64x64/K32 Q4_K kernel on `2560 -> 9216, M=512` (`rocprofv3 --pmc`,
+2,949,120 WMMA instructions per launch):
+
+| Counter | Per WMMA |
+| --- | ---: |
+| `SQ_INSTS_ALL` | 114.0 |
+| `SQ_INSTS_VALU` | 54.0 |
+| `SQ_INSTS_LDS` | 9.9 |
+| `SQ_WAVE_CYCLES` | 2,922.6 |
+
+That launch moves 336.1 M instructions, 0.028 per MAC, for 8.5 TFLOP/s; issue
+occupancy is about 39% of the 160 SIMD issue slots. The same math in llama.cpp
+costs 0.0054 instructions per MAC. Three structural causes, in order of
+measured weight:
+
+1. Token-tile reuse: yuuka decodes each weight for 64 accumulation rows and
+   re-reads every weight tile 8 times for 512 tokens; llama.cpp's J=128 halves
+   both.
+2. Decode cost per weight: yuuka converts to FP16 and stores two bytes per value
+   into shared memory (9.9 LDS instructions per WMMA); llama.cpp stores one byte
+   as int8 and applies the block scale in the dot product.
+3. Synchronization granularity: yuuka synchronizes twice per 32 K values,
+   llama.cpp twice per 256.
+
+**The 4.6-4.7 TFLOP/s "ceiling" reported in the 2026-11-15 sections is a
+rocBLAS wrapper artifact, not hardware.** `launch_gemm_blas_f16` passes
+`rocblas_datatype_f32_r` as the compute type and `f32` output, which makes
+rocBLAS select fp32-compute Tensile kernels. The same GEMM with fp16 compute
+and fp16 output, which is what `ggml-cuda` requests, on the two prefill shape
+classes:
+
+| Shape (F16 in) | f32 compute, f32 out (yuuka) | f16 compute, f16 out (llama.cpp) |
+| --- | ---: | ---: |
+| 2560 -> 9216, M=512 | 5.14 ms, 4.70 TFLOP/s | 0.72 ms, 33.6 TFLOP/s |
+| 9216 -> 2560, M=512 | 7.29 ms, 3.31 TFLOP/s | 1.16 ms, 20.6 TFLOP/s |
+
+So gfx1151 reaches 20-33 TFLOP/s through the library on F16, while yuuka's own
+kernels reach 8.5 TFLOP/s on the wide Q4_K shape and 4.0 TFLOP/s on the Q6_K
+tall-K shape the model actually uses (`9216 -> 2560`, 6.05 ms against 1.16 ms
+for hipBLAS f16). Two implementation paths follow and are not yet implemented:
+
+- Fix `launch_gemm_blas_f16` to request fp16 compute and fp16 output with an
+  explicit cast, and route Q6_K through dequantize + hipBLAS as llama.cpp does.
+  Q6_K is about 100 ms of the 476 ms matmul total, so this is an estimated
+  70-80 ms of the chunk, roughly +12-15% prefill throughput.
+- Rebuild the custom kernel to the MMQ geometry for Q4_K/Q5_K: 128-token tile,
+  int8 shared staging, 256-wide K step. A dequantize-to-F16 route is not
+  obviously better for these types because the expanded weights are 2x larger
+  and are re-read once per 128-token pass, which makes that route memory limited
+  at 512 tokens (about 120 ms of traffic against about 110 ms of compute).
+
+The delta-net gap (67 against 13 ms) is independent of both.
+
+Measurement notes: the per-op split adds HIP event overhead and does not
+control clocks, so it is diagnostic under [testing.md](testing.md), not a
+release benchmark. The counter run uses the same shape in isolation with two
+warmups and three measured launches.
 
 ### Prefill attention tiling (2026-11-15)
 

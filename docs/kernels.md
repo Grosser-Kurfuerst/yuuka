@@ -274,8 +274,11 @@ waves/SIMD. Measured on 2026-11-16 with the same binary pair, `M = 512` shapes
 improve 48-50% for Q4_K, 49-54% for Q5_K, 32-49% for Q8_0, 3-23% for Q6_K, and
 14-27% for F16, and the 512-token prefill moves from 544 to 881 tok/s. See
 [benchmarks.md](benchmarks.md#prefill-gemm-span-decode-2026-11-16). The 500 ms
-chunk GEMM gate is still not met, but the wide Q4_K shape now runs at 8.5
-TFLOP/s instead of the 4.6-4.7 TFLOP/s the earlier tile reported.
+chunk GEMM gate is still not met. The wide Q4_K shape now runs at 8.5 TFLOP/s,
+which is 2.4x below what hipBLAS reaches on the same shape with fp16 compute
+(33.6 TFLOP/s) and 2.9x below llama.cpp's 24.9 TFLOP/s prefill matmul rate; the
+gap attribution is in
+[benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
 A CTA-order experiment that mapped consecutive blocks to M tiles was measured
 and rejected: it reduced the tall-K time but raised the wide-projection time,
@@ -322,10 +325,11 @@ workgroup reloads the weight tile, so a 512-row chunk reads every weight tile
 16 times. The 64-row tile halves that for wide projections at large row counts.
 The 2026-11-15 measurements put a 512-token prompt at 516 tok/s; the
 2026-11-16 span-decoding build measures 881 tok/s on the same GGUF and device,
-against llama.cpp HIP at about 2163 tok/s. The per-operation split was not
-re-profiled for the 2026-11-16 change, so the 2026-11-15 attribution still
-describes it: GEMM 895 ms (87%), the gated delta-net chunk 63.7 ms, and prefill
-attention 17.8 ms. Attention dominates at long positions and was reduced from
+against llama.cpp HIP at 2163 tok/s for the 2026-11-14 baseline and 2216 tok/s
+for the current build. The per-operation split was not re-profiled for the
+2026-11-16 loader change, and the 2026-11-16 gap attribution supersedes the
+2026-11-15 numbers: matmul 476 ms, the gated delta-net chunk 67 ms, and prefill
+attention 19 ms. Attention dominates at long positions and was reduced from
 2030 ms to 643 ms at position 7680. The ordered optimization plan and its
 per-workstream status are in [roadmap2.md](roadmap2.md).
 
