@@ -22,18 +22,30 @@ func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint
 		return plan.AddGemmBlasAt(w.buf, 0, m.prefill.xF16, m.prefill.yF16, out,
 			outOff, nIn, nOut, rows)
 	case hip.PrefillDequantBLAS:
-		if err := plan.AddDequantF16At(w.buf, 0, m.prefill.wF16, nIn, nOut, w.dtype); err != nil {
-			return err
-		}
 		if err := plan.AddCastF16At(x, xOff, m.prefill.xF16, 0, rows*nIn); err != nil {
 			return err
 		}
-		return plan.AddGemmBlasAt(m.prefill.wF16, 0, m.prefill.xF16, m.prefill.yF16,
-			out, outOff, nIn, nOut, rows)
+		return m.prefillDequantBLASPrepared(plan, w, out, outOff, nIn, nOut, rows)
 	default:
 		return plan.AddGemmPathAt(w.buf, 0, x, xOff, out, outOff,
 			nIn, nOut, rows, w.dtype, hip.GemmWMMA)
 	}
+}
+
+// prefillDequantBLASPrepared uses the shared FP16 activation. The packed
+// weights are decoded into the chunk scratch only when no persistent FFN cache
+// has been configured. Both paths feed the same rocBLAS accumulation.
+func (m *Model) prefillDequantBLASPrepared(plan *hip.Plan, w weight,
+	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64) error {
+	w16 := w.prefill16
+	if w16 == nil {
+		w16 = m.prefill.wF16
+		if err := plan.AddDequantF16At(w.buf, 0, w16, nIn, nOut, w.dtype); err != nil {
+			return err
+		}
+	}
+	return plan.AddGemmBlasAt(w16, 0, m.prefill.xF16, m.prefill.yF16, out,
+		outOff, nIn, nOut, rows)
 }
 
 // buildDecodePlan constructs the single-token graph over one session's block
@@ -589,10 +601,24 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 	// Fuse the gate/up pair when both matmuls select the custom WMMA path.
 	// The fused kernel shares one activation tile and applies SwiGLU in the
 	// epilogue, so neither intermediate is written.
-	if gate.dtype == up.dtype &&
-		hip.SelectPrefillPath(gate.dtype, rows, hidden, ffn) == hip.PrefillWMMA {
+	gatePath := hip.SelectPrefillPath(gate.dtype, rows, hidden, ffn)
+	upPath := hip.SelectPrefillPath(up.dtype, rows, hidden, ffn)
+	fused := gate.dtype == up.dtype && gatePath == hip.PrefillWMMA
+	if fused {
 		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, p.norm, 0,
 			p.ffnGate, 0, hidden, ffn, rows, gate.dtype); err != nil {
+			return err
+		}
+	} else if gatePath == hip.PrefillDequantBLAS && upPath == hip.PrefillDequantBLAS {
+		// The two projections read exactly the same normalized activation.
+		// Cast once instead of submitting a redundant FP32->FP16 cast.
+		if err := plan.AddCastF16At(p.norm, 0, p.xF16, 0, rows*hidden); err != nil {
+			return err
+		}
+		if err := m.prefillDequantBLASPrepared(plan, gate, p.ffnGate, 0, hidden, ffn, rows); err != nil {
+			return err
+		}
+		if err := m.prefillDequantBLASPrepared(plan, up, p.ffnUp, 0, hidden, ffn, rows); err != nil {
 			return err
 		}
 	} else {
@@ -602,6 +628,8 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 		if err := m.prefillMatmul(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows); err != nil {
 			return err
 		}
+	}
+	if !fused {
 		if err := plan.AddSiluMul(p.ffnGate, p.ffnUp, p.ffnGate, rows*ffn); err != nil {
 			return err
 		}
