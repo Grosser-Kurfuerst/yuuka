@@ -265,25 +265,45 @@ __global__ void attention_prefill_f32_kernel(float * out, const float * q,
     }
 }
 
-__global__ void conv1d_chunk_f32_kernel(float * state, const float * weights,
-                                        const float * qkv, float * out,
+// conv1d_chunk_f32_kernel applies the depthwise causal convolution and its
+// sigmoid gate to one prompt chunk. The carry state holds only the previous
+// kernel-1 raw inputs, so output row r is a plain kernel-1 tap FIR over the raw
+// chunk and every (row, channel) pair is independent: one thread per output
+// element replaces a serial walk over the chunk. Summation order matches the
+// state-shifting form, so the outputs are unchanged.
+__global__ void conv1d_chunk_f32_kernel(const float * weights, const float * qkv,
+                                        const float * state, float * out,
                                         int channels, int kernel, int rows) {
-    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < channels;
-         c += gridDim.x * blockDim.x) {
+    const int64_t total = static_cast<int64_t>(rows) * channels;
+    for (int64_t idx = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int r = static_cast<int>(idx / channels);
+        const int c = static_cast<int>(idx % channels);
         const float * w = weights + c * kernel;
-        float * s = state + c * (kernel - 1);
-        for (int r = 0; r < rows; ++r) {
-            const float * in = qkv + static_cast<int64_t>(r) * channels + c;
-            float sum = 0.0f;
-            for (int t = 0; t < kernel - 1; ++t) {
-                sum += w[t] * s[t];
-            }
-            sum += w[kernel - 1] * (*in);
-            out[static_cast<int64_t>(r) * channels + c] = sum / (1.0f + expf(-sum));
-            for (int t = 0; t < kernel - 2; ++t) {
-                s[t] = s[t + 1];
-            }
-            s[kernel - 2] = *in;
+        float sum = 0.0f;
+        for (int t = 0; t < kernel - 1; ++t) {
+            const int src = r - (kernel - 1) + t;
+            sum += w[t] * (src >= 0
+                               ? qkv[static_cast<int64_t>(src) * channels + c]
+                               : state[c * (kernel - 1) + src + kernel - 1]);
+        }
+        sum += w[kernel - 1] * qkv[idx];
+        out[idx] = sum / (1.0f + expf(-sum));
+    }
+}
+
+// conv1d_state_f32_kernel writes the trailing raw inputs the next chunk needs.
+// Each element is owned by one thread, so an element that still comes from the
+// previous chunk is left in place.
+__global__ void conv1d_state_f32_kernel(float * state, const float * qkv,
+                                        int channels, int kernel, int rows) {
+    const int total = channels * (kernel - 1);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += gridDim.x * blockDim.x) {
+        const int c = idx / (kernel - 1);
+        const int src = rows - (kernel - 1) + idx % (kernel - 1);
+        if (src >= 0) {
+            state[idx] = qkv[static_cast<int64_t>(src) * channels + c];
         }
     }
 }
@@ -802,9 +822,14 @@ void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
     if (rows <= 0 || groups <= 0 || heads <= 0 || state_size <= 0) {
         return;
     }
-    const int conv_blocks = (conv_dim + kThreads - 1) / kThreads;
+    const int64_t conv_total = static_cast<int64_t>(rows) * conv_dim;
+    const int conv_blocks = static_cast<int>((conv_total + kThreads - 1) / kThreads);
     conv1d_chunk_f32_kernel<<<conv_blocks, kThreads, 0, stream>>>(
-        conv_state, conv_weights, qkv, conv, conv_dim, conv_kernel, rows);
+        conv_weights, qkv, conv_state, conv, conv_dim, conv_kernel, rows);
+    const int state_total = conv_dim * (conv_kernel - 1);
+    const int state_blocks = (state_total + kThreads - 1) / kThreads;
+    conv1d_state_f32_kernel<<<state_blocks, kThreads, 0, stream>>>(
+        conv_state, qkv, conv_dim, conv_kernel, rows);
     if (state_size == 128) {
         const dim3 grid(static_cast<unsigned>(heads),
                         static_cast<unsigned>(state_size / 32));
