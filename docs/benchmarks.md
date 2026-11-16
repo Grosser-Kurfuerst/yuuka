@@ -653,6 +653,191 @@ control clocks, so it is diagnostic under [testing.md](testing.md), not a
 release benchmark. The counter run uses the same shape in isolation with two
 warmups and three measured launches.
 
+### Prefill matmul route experiments (2026-11-16)
+
+The attribution above leaves 476 ms of a 569 ms 512-token prefill in quantized
+matmul, and llama.cpp runs the same math in 178 ms. Two candidate routes were
+implemented, measured end to end, and rejected. Neither is in the tree: the
+numbers and the reproduction recipe are kept here because they close the two
+questions the attribution left open, the library datatype and tile growth, and
+they point the next attempt at the int8 MMQ geometry instead.
+
+Conditions: same machine, GGUF, and CLI as [the
+attribution](#prefill-gap-attribution-vs-llamacpp-2026-11-16); gfx1151,
+Q4_K_M, F32 KV.
+
+#### Numeric gate before implementation
+
+A throwaway Go program decoded the first eight rows of three real weight
+matrices with `tensor.DequantizeRow`, built one deterministic activation row
+(`x[i] = sin(0.37 i) cos(0.11 i)`), and compared three dot products against a
+float64 reference: an FP32 accumulator, a simulated FP16 accumulator that
+rounds the running sum after every product, and one that rounds every 16
+products, which is the MMA shape. The entry is the max over the eight rows of
+`|acc - ref| / (1 + |ref|)`.
+
+| Tensor | Dtype | `K` | `N` | FP16, per product | FP16, per 16 | FP32 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `blk.0.ffn_up.weight` | Q4_K | 2560 | 9216 | 1.94e-3 | 4.20e-4 | 1.5e-7 |
+| `blk.0.ffn_down.weight` | Q6_K | 9216 | 2560 | 4.98e-3 | 4.07e-3 | 8.8e-7 |
+| `blk.0.attn_qkv.weight` | Q5_K | 2560 | 8192 | 2.13e-3 | 7.20e-4 | 4.4e-7 |
+
+Every entry is inside the 5e-3 per-matmul gate that was set for this decision,
+which is why the library route below was implemented and measured end to end.
+
+#### Rejected: FP16 dequant + rocBLAS
+
+rocBLAS on this build rejects FP16 compute with an FP32 destination
+(`rocblas_status` 2), so the route dequantized each packed matrix into a
+caller-owned FP16 scratch (one thread per eight-value span, the same span
+arithmetic and 8-byte vector loads as the WMMA tile loader), ran
+`rocblas_gemm_ex` with FP16 operands, FP16 compute, and an FP16 result, then
+cast that result back to FP32. The expanded tile matched an independent format
+decoder within one FP16 unit (max relative error 2.4e-4 over every element of a
+2560x256 Q4_K, Q5_K, and Q6_K matrix), so the only numeric difference against
+the WMMA route is the accumulator width.
+
+Isolated GEMM, milliseconds, 5 repeats, median. `dequant+rocBLAS` includes the
+weight expansion on every call:
+
+| Dtype | Shape | `M` | WMMA 64x64 | dequant + rocBLAS | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Q4_K | 2560 -> 9216 | 64 | 0.359 | 0.663 | 0.54x |
+| Q4_K | 2560 -> 9216 | 128 | 0.687 | 0.779 | 0.88x |
+| Q4_K | 2560 -> 9216 | 256 | 1.361 | 0.868 | 1.57x |
+| Q4_K | 2560 -> 9216 | 512 | 2.755 | 1.187 | 2.32x |
+| Q4_K | 2560 -> 8192 | 128 | 0.670 | 0.731 | 0.92x |
+| Q4_K | 2560 -> 8192 | 256 | 1.277 | 0.834 | 1.53x |
+| Q4_K | 2560 -> 8192 | 512 | 2.499 | 1.134 | 2.20x |
+| Q4_K | 9216 -> 2560 | 128 | 0.614 | 0.965 | 0.64x |
+| Q4_K | 9216 -> 2560 | 256 | 1.263 | 1.017 | 1.24x |
+| Q4_K | 9216 -> 2560 | 512 | 2.791 | 1.787 | 1.56x |
+| Q5_K | 2560 -> 9216 | 128 | 0.749 | 0.800 | 0.94x |
+| Q5_K | 2560 -> 9216 | 256 | 1.485 | 0.951 | 1.56x |
+| Q5_K | 2560 -> 9216 | 512 | 3.033 | 1.172 | 2.59x |
+| Q5_K | 2560 -> 8192 | 128 | 0.677 | 0.732 | 0.92x |
+| Q5_K | 2560 -> 8192 | 256 | 1.341 | 0.872 | 1.54x |
+| Q5_K | 2560 -> 8192 | 512 | 2.685 | 1.119 | 2.40x |
+| Q5_K | 9216 -> 2560 | 128 | 0.681 | 1.093 | 0.62x |
+| Q5_K | 9216 -> 2560 | 256 | 1.555 | 1.020 | 1.52x |
+| Q5_K | 9216 -> 2560 | 512 | 3.266 | 1.908 | 1.71x |
+| Q6_K | 2560 -> 9216 | 128 | 1.188 | 1.079 | 1.10x |
+| Q6_K | 2560 -> 9216 | 256 | 2.290 | 1.099 | 2.08x |
+| Q6_K | 2560 -> 9216 | 512 | 4.658 | 1.394 | 3.34x |
+| Q6_K | 2560 -> 8192 | 128 | 1.072 | 0.952 | 1.13x |
+| Q6_K | 2560 -> 8192 | 256 | 2.091 | 1.079 | 1.94x |
+| Q6_K | 2560 -> 8192 | 512 | 4.182 | 1.296 | 3.23x |
+| Q6_K | 9216 -> 2560 | 128 | 1.315 | 1.414 | 0.93x |
+| Q6_K | 9216 -> 2560 | 256 | 2.874 | 1.278 | 2.25x |
+| Q6_K | 9216 -> 2560 | 512 | 6.119 | 2.127 | 2.88x |
+
+At 64 rows the route loses in every cell (0.41x to 0.70x) because the
+expansion is paid per call. The crossover is 256 rows for every tested dtype
+and shape class.
+
+End to end with the route selected for every K-quant matmul at `M >= 256`,
+`bench --prompt-tokens 512 --chunk-size 512`: **0.330 s / 1552 tok/s** against
+0.581 s / 881 tok/s, a 1.76x prefill speedup, above the 1.5x target that was
+set for this work.
+
+**Rejected on the numeric gate.** `TestGPUChunkedPrefillLongContext` requires
+the chunk-512 prefill logits to stay within 0.05 of the chunk-128 logits and to
+keep the same greedy token:
+
+| Route selection | Max logit diff | Gate |
+| --- | ---: | ---: |
+| WMMA everywhere (baseline) | 0 | 0.05 |
+| Every K-quant matmul at `M >= 256` | 0.305 | 0.05 |
+| Only `K <= 2560` matmuls | 0.319 | 0.05 |
+| Only `K > 2560` matmuls | 0.296 | 0.05 |
+
+The route keeps the top-1 token, but 0.305 is six times the gate against a
+baseline that is bitwise identical across chunk boundaries. Restricting the
+route to one matmul family does not rescue it: the shallow-`K` group alone
+drifts 0.319 and the deep-`K` group alone 0.296, so one family per layer is
+already over budget.
+
+The per-matmul gate is not a bound on network drift. A 4e-3 relative error in a
+9216-wide dot compounds across 40 layers and lands at about 2% of the logit
+magnitude. The logit gate needs roughly 1e-3 per matmul, which FP16
+accumulation cannot reach at these widths; splitting `K` into enough FP32
+accumulation steps to get there costs more launches than the route saves. The
+code was reverted, including the dequant kernel, the FP16 scratch in the ABI,
+and the planner route.
+
+#### Rejected: 128-row WMMA tile
+
+The attribution ranks token-tile reuse first: the 64-row tile re-reads every
+weight tile eight times for 512 tokens, so a 128-row tile (`BlockM = 128`,
+four accumulator fragments per wave, 32-wide K step) halves that. The new tile
+stages 24 KiB of A/B double buffer (`2 * (128 + 64) * 32 * 2`), which leaves two
+CTAs per LDS CU instead of four, and its 128x64 FP32 result does not fit the
+staging alias, so the epilogue writes two 128x32 column halves with a barrier
+between them.
+
+Isolated GEMM, milliseconds, median of three sweep runs, against the committed
+64-row tile:
+
+| Dtype | Shape | `M` | WMMA 64x64 | WMMA 128x64 | Delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Q4_K | 2560 -> 9216 | 128 | 0.687 | 0.779 | -13.4% |
+| Q4_K | 2560 -> 9216 | 256 | 1.361 | 1.186 | +12.9% |
+| Q4_K | 2560 -> 9216 | 512 | 2.755 | 2.519 | +8.6% |
+| Q4_K | 2560 -> 8192 | 128 | 0.670 | 0.769 | -14.8% |
+| Q4_K | 2560 -> 8192 | 256 | 1.277 | 1.201 | +6.0% |
+| Q4_K | 2560 -> 8192 | 512 | 2.499 | 2.153 | +13.8% |
+| Q4_K | 9216 -> 2560 | 128 | 0.614 | 0.646 | -5.2% |
+| Q4_K | 9216 -> 2560 | 256 | 1.263 | 1.419 | -12.4% |
+| Q4_K | 9216 -> 2560 | 512 | 2.791 | 3.030 | -8.6% |
+| Q5_K | 2560 -> 9216 | 128 | 0.749 | 0.773 | -3.2% |
+| Q5_K | 2560 -> 9216 | 256 | 1.485 | 1.215 | +18.2% |
+| Q5_K | 2560 -> 9216 | 512 | 3.033 | 2.621 | +13.6% |
+| Q5_K | 2560 -> 8192 | 128 | 0.677 | 0.757 | -11.8% |
+| Q5_K | 2560 -> 8192 | 256 | 1.341 | 1.165 | +13.1% |
+| Q5_K | 2560 -> 8192 | 512 | 2.685 | 2.211 | +17.7% |
+| Q5_K | 9216 -> 2560 | 128 | 0.681 | 0.675 | +0.9% |
+| Q5_K | 9216 -> 2560 | 256 | 1.555 | 1.503 | +3.3% |
+| Q5_K | 9216 -> 2560 | 512 | 3.266 | 3.281 | -0.5% |
+| Q6_K | 2560 -> 9216 | 128 | 1.188 | 1.047 | +11.9% |
+| Q6_K | 2560 -> 9216 | 256 | 2.290 | 1.700 | +25.8% |
+| Q6_K | 2560 -> 9216 | 512 | 4.658 | 3.727 | +20.0% |
+| Q6_K | 2560 -> 8192 | 128 | 1.072 | 1.028 | +4.1% |
+| Q6_K | 2560 -> 8192 | 256 | 2.091 | 1.655 | +20.9% |
+| Q6_K | 2560 -> 8192 | 512 | 4.182 | 3.320 | +20.6% |
+| Q6_K | 9216 -> 2560 | 128 | 1.315 | 1.297 | +1.4% |
+| Q6_K | 9216 -> 2560 | 256 | 2.874 | 2.906 | -1.1% |
+| Q6_K | 9216 -> 2560 | 512 | 6.119 | 6.000 | +1.9% |
+
+The tile wins on wide, shallow-`K` shapes (+6% to +26%) and loses on tall-`K`
+shapes (-0.5% to -12%) and at 128 rows (-3% to -15%), where halving the CTA
+count costs more than the weight reuse saves.
+
+End to end with the tile selected for every `K <= N` shape at `M >= 128`:
+0.553 s / 926 tok/s. Restricted to `M >= 256`, `K <= 2560`, and `N >= 8192`:
+0.572 s / 895 tok/s. Baseline over three consecutive runs: 0.559 s, 0.563 s,
+0.589 s (916, 909, 869 tok/s). Both variants sit inside that 2.5% run-to-run
+band while the sweep shows regressions outside it, so the acceptance rule is not
+met and the tile is not selected. The code, including the two-half epilogue,
+was reverted.
+
+**What the two experiments rule out.** Weight traffic is not the prefill matmul
+bottleneck: halving it with a 128-row tile buys 6-26% on the wide shapes and
+nothing on the tall ones, and the two matmul families that dominate the 476 ms,
+the fused gate/up pair and the tall-`K` down projection, keep the 64-row
+geometry either way. The library route reaches 20-33 TFLOP/s but only with FP16
+accumulation, which the logit gate rejects. What remains is instructions per
+MAC: llama.cpp spends about 22 instructions per 4096-MAC WMMA against yuuka's
+114 because it dequantizes weights to int8 once per 128-token pass and
+accumulates in int32, which is numerically exact. That is the roadmap's Phase 3
+quantized GEMM, not a tile or datatype change.
+
+Reproduction without committed code: the numeric gate is a scratch Go module
+that replaces `github.com/yuuka-ai/yuuka` and uses `gguf.Open` plus
+`tensor.DequantizeRow`; the dequant sweep column submits `yuuka_dequant_f16`,
+`yuuka_cast_f32_to_f16`, and `yuuka_gemm_blas` next to the existing `wmma`
+column; the end-to-end number is the `bench` command above with
+`SelectPrefillPath` returning the route for the selected K-quant shapes.
+
 ### Prefill attention tiling (2026-11-15)
 
 The prefill attention kernels now process 16 query rows per workgroup with 512

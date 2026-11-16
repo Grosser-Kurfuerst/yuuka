@@ -146,6 +146,14 @@ Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
 Each compares against an independent float implementation and records its
 tolerance in the test.
 
+Per-operator tolerances do not bound network-level drift. A prefill matmul that
+meets the 2e-2 per-GEMM bound while accumulating in FP16 moved the 512-token
+logits by 0.305 against a bitwise-identical baseline, six times the 0.05 chunk
+gate, because a 2-5e-3 error in one 9216-wide dot compounds across 40 layers.
+A route change must therefore clear the chunk gate in
+`TestGPUChunkedPrefillLongContext`, not only the per-operator bound. See
+[benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
+
 Paged KV and graph replay have dedicated native coverage in
 `tests/hip/paged_test.cpp`:
 

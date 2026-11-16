@@ -255,6 +255,17 @@ are then strided across rows instead of coalesced across lanes. Q6_K row stride
 materialized; every supported dtype shares the tile path and differs only in
 the packed-load helper.
 
+The FP32 accumulator is a measured requirement, not a default. A route that
+expanded each packed matrix into an FP16 scratch and ran rocBLAS with FP16
+compute was 1.6-3.3x faster per GEMM from 256 rows upward, but it moved the
+512-token prefill logits by 0.305 against the 0.05 chunk gate even when only one
+matmul family used it, so FP16 accumulation is not adopted anywhere in the
+prefill path. A 128-row tile with four accumulator fragments was also measured:
+it halves the weight-tile reloads but needs a two-half epilogue for the 24 KiB
+staging alias, and it loses on tall-`K` shapes where the extra CTA count matters
+more. Both experiments are recorded in
+[benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
+
 The 64x64/K32 variant is selected for `rows >= 64` when `K <= N`; the 32x64
 variant remains selected for tall-K projections and smaller batches. Tall-K was
 re-measured with the span loader instead of assumed: at `M = 64` and `M = 128`
@@ -320,9 +331,11 @@ compared baseline. F16 baselines include the cast cost. A dispatch table entry
 is valid only for the recorded gfx1151 environment; the kernel is not selected
 from assumptions about other RDNA parts.
 
-The isolated GEMM is weight-reuse limited: with a 32-row M tile, each
-workgroup reloads the weight tile, so a 512-row chunk reads every weight tile
-16 times. The 64-row tile halves that for wide projections at large row counts.
+Weight reuse is a secondary effect, not the binding limit. A 32-row M tile
+makes a 512-row chunk read every weight tile 16 times, and the 64-row tile
+halves that, but halving it again with the measured 128-row tile only bought
+6-26% on wide shapes and lost 0.5-15% elsewhere. The kernel is instruction-issue
+bound: 114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS.
 The 2026-11-15 measurements put a 512-token prompt at 516 tok/s; the
 2026-11-16 span-decoding build measures 881 tok/s on the same GGUF and device,
 against llama.cpp HIP at 2163 tok/s for the 2026-11-14 baseline and 2216 tok/s
