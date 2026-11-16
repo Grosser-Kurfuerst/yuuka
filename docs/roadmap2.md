@@ -383,26 +383,26 @@ GEMM with fp16 compute and output reaches 20-33 TFLOP/s. Both the library
 datatype and the tile/int8 geometry are open items. See
 [benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
-A 2026-11-16 experiment rejected the FP16 accumulator and the 128-row tile.
-Dequantize-to-F16 plus fp16-compute rocBLAS runs the 512-token prefill in
-0.330 s (1552 tok/s, 1.76x) and is 1.6-3.3x faster per GEMM from 256 rows
-upward, but it moves the chunk-512 logits by 0.305 against the 0.05 gate, and
-restricting it to the shallow-`K` or the deep-`K` matmul family alone still
-drifts 0.319 and 0.296. FP16 accumulation is therefore rejected for every
-prefill matmul; the FP32 accumulator stays. The 128-row tile gains 6-26% on wide
-shallow-`K` shapes and loses 0.5-12% on tall-`K` and 3-15% at 128 rows, and its
-end-to-end range (0.553-0.572 s) stays inside the 2.4% run-to-run band of the
-baseline (0.559-0.589 s), so it is not selected.
-
-The remaining matmul bottleneck is instructions per MAC, but the datatype item
-is only half closed. rocBLAS accepts FP16 operands with FP32 compute and an FP16
-destination, which keeps the FP32 accumulator and still measures 22.0 TFLOP/s on
-`2560 -> 9216` at `M = 512`, against 8.6 TFLOP/s for the selected WMMA kernel
-and 35.9 TFLOP/s for the rejected FP16 accumulator. That combination is the
-cheapest next measurement: it removes the error this experiment rejected and
-leaves only the FP16 rounding of the result. The int8 MMQ geometry remains the
-larger rewrite, and its int8 activation quantization adds its own error term, so
-it must be measured against the same gate rather than assumed exact. See
+A 2026-11-16 experiment adopted a library route for the wide K-quant class and
+rejected the 128-row tile. Dequantize-to-F16 plus fp16-compute rocBLAS runs the
+512-token prefill in 0.330 s (1552 tok/s, 1.76x) and is 1.6-3.3x faster per GEMM
+from 256 rows upward, but it moves the chunk-512 logits by 0.305 against the
+0.05 gate, so FP16 accumulation is rejected for every prefill matmul. The same
+expansion with FP32 compute and an FP16 destination keeps the FP32 accumulator,
+measures 22.0 TFLOP/s on `2560 -> 9216` at `M = 512` against 8.6 for the custom
+kernel, and is 2.3x faster end to end at 512 tokens: 0.463 s (1107 tok/s)
+against 0.583 s (878 tok/s). It is selected for `K <= N`, `M >= 128`, and keeps
+`K > N` on WMMA because rocBLAS splits `K` there and the FP16 destination forces
+the split reduction through FP16. Short prompts are unchanged (32 and 100
+tokens) and a 128-token prompt pays 5% because the fused gate/up kernel only
+applies on the WMMA path. The chunk-invariance gate measures 0.042 against its
+0.05 bound, which is now the binding constraint on this route rather than the
+2e-2 per-GEMM tolerance. The 128-row WMMA tile gains 6-26% on wide shallow-`K`
+shapes and loses 0.5-12% on tall-`K` and 3-15% at 128 rows, and its end-to-end
+range stayed inside the run-to-run band, so it is not selected. Remaining matmul
+headroom is instructions per MAC: the int8 MMQ geometry is the next attempt, and
+its int8 activation quantization must clear the same gate rather than inherit
+exactness from its integer accumulator. See
 [benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)

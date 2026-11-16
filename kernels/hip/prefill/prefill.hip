@@ -491,6 +491,13 @@ __global__ void cast_f32_to_f16_kernel(__half * dst, const float * src, int64_t 
     }
 }
 
+__global__ void cast_f16_to_f32_kernel(float * dst, const __half * src, int64_t n) {
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        dst[i] = __half2float(src[i]);
+    }
+}
+
 
 __device__ __forceinline__ int64_t paged_kv_row(const int32_t * block_table,
                                                 int block_size, int pos) {
@@ -824,6 +831,17 @@ void launch_cast_f32_to_f16(void * dst, const float * src, uint64_t n,
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
     cast_f32_to_f16_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<__half *>(dst), src, static_cast<int64_t>(n));
+}
+
+void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,
+                            hipStream_t stream) {
+    if (n == 0) {
+        return;
+    }
+    const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+    cast_f16_to_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        static_cast<float *>(dst), static_cast<const __half *>(src),
+        static_cast<int64_t>(n));
 }
 
 } // namespace yuuka

@@ -1,6 +1,7 @@
 // prefill_sweep compares prefill matrix implementations on gfx1151:
-// per-row GEMV, batched GEMV, custom rocWMMA GEMM, and the rocBLAS FP16
-// baseline. It is an offline dispatch-table input, not a hot-path tool.
+// per-row GEMV, batched GEMV, custom rocWMMA GEMM, the rocBLAS route, and the
+// dequant-plus-rocBLAS route for K-quant weights. It is an offline
+// dispatch-table input, not a hot-path tool.
 
 #include "yuuka_hip.h"
 
@@ -112,10 +113,17 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     std::vector<float> x(size_t(n_in * rows));
     for (float & v : x) v = 0.25f;
 
-    Buffer wb, xb, ob, x16, rowbuf;
+    const bool kquant = dtype == YUUKA_DTYPE_Q4_K || dtype == YUUKA_DTYPE_Q5_K ||
+                        dtype == YUUKA_DTYPE_Q6_K;
+    Buffer wb, xb, ob, x16, o16, w16, rowbuf;
     bool ok = alloc(device, wb, weights.size()) &&
               alloc(device, xb, x.size() * 4) && alloc(device, ob, size_t(n_out * rows) * 4) &&
-              alloc(device, x16, x.size() * 2) && alloc(device, rowbuf, size_t(n_in) * 4);
+              alloc(device, x16, x.size() * 2) &&
+              alloc(device, o16, size_t(n_out * rows) * 2) &&
+              alloc(device, rowbuf, size_t(n_in) * 4);
+    if (ok && kquant) {
+        ok = alloc(device, w16, size_t(n_in * n_out) * 2);
+    }
     if (ok) {
         ok = check(yuuka_memcpy_h2d(wb.buf, weights.data(), weights.size()), "h2d w") &&
              check(yuuka_memcpy_h2d(xb.buf, x.data(), x.size() * 4), "h2d x");
@@ -166,8 +174,18 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     if (ok && dtype == YUUKA_DTYPE_F16) {
         results.push_back(bench_rows(device, stream, event, plan, "rocblas", 5, [&]() {
             (void)yuuka_cast_f32_to_f16(stream, x16.buf, xb.buf, n_in * rows, event);
-            (void)yuuka_gemm_blas(stream, ob.buf, x16.buf, wb.buf, n_in, n_out, rows,
-                                  event);
+            (void)yuuka_gemm_blas(stream, ob.buf, o16.buf, x16.buf, wb.buf, n_in, n_out,
+                                  rows, event);
+        }, wait_event));
+    }
+    // The K-quant route expands the packed matrix into FP16 on every call, so
+    // the dequantization cost is part of the measured time.
+    if (ok && kquant) {
+        results.push_back(bench_rows(device, stream, event, plan, "blasq", 5, [&]() {
+            (void)yuuka_dequant_f16(stream, w16.buf, wb.buf, n_in, n_out, dtype, event);
+            (void)yuuka_cast_f32_to_f16(stream, x16.buf, xb.buf, n_in * rows, event);
+            (void)yuuka_gemm_blas(stream, ob.buf, o16.buf, x16.buf, w16.buf, n_in, n_out,
+                                  rows, event);
         }, wait_event));
     }
     if (ok) {
@@ -189,6 +207,8 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     }
     if (plan != nullptr) yuuka_plan_destroy(plan);
     release(rowbuf);
+    release(w16);
+    release(o16);
     release(x16);
     release(ob);
     release(xb);

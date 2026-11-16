@@ -18,8 +18,13 @@ func (m *MoEModel) moePrefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOf
 		if err := plan.AddCastF16At(x, xOff, m.act.xF16, 0, rows*nIn); err != nil {
 			return err
 		}
-		return plan.AddGemmPathAt(w.buf, 0, m.act.xF16, 0, out, outOff,
-			nIn, nOut, rows, w.dtype, hip.GemmBLAS)
+		return plan.AddGemmBlasAt(w.buf, 0, m.act.xF16, m.act.yF16, out, outOff,
+			nIn, nOut, rows)
+	case hip.PrefillDequantBLAS:
+		// MoE prefill keeps the WMMA path; the per-expert dequant route is not
+		// measured.
+		return plan.AddGemmPathAt(w.buf, 0, x, xOff, out, outOff,
+			nIn, nOut, rows, w.dtype, hip.GemmWMMA)
 	default:
 		return plan.AddGemmPathAt(w.buf, 0, x, xOff, out, outOff,
 			nIn, nOut, rows, w.dtype, hip.GemmWMMA)

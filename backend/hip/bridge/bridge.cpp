@@ -225,10 +225,14 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     if (path == YUUKA_GEMM_PATH_BLAS) {
         if (dtype != YUUKA_DTYPE_F16) {
             return fail(YUUKA_ERR_UNSUPPORTED,
-                        "rocBLAS baseline requires F16 weights, got %u", dtype);
+                        "rocBLAS route requires F16 weights, got %u", dtype);
         }
         if (n_in > 0x7fffffffULL || n_out > 0x7fffffffULL || batch > 0x7fffffffULL) {
             return fail(YUUKA_ERR_UNSUPPORTED, "rocBLAS dimensions exceed int32");
+        }
+        if (op.buf[3] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "rocBLAS route requires an FP16 scratch buffer");
         }
     }
     if (n_in == 0 || n_out == 0 || batch == 0) {
@@ -260,6 +264,14 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     }
     if (!buffer_range_ok(op.buf[2], op.off[2], output_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm output buffer is too small");
+    }
+    if (path == YUUKA_GEMM_PATH_BLAS) {
+        uint64_t scratch_bytes = 0;
+        if (__builtin_mul_overflow(output_elements, uint64_t(2), &scratch_bytes) ||
+            !buffer_range_ok(op.buf[3], op.off[3], scratch_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "rocBLAS FP16 scratch buffer is too small");
+        }
     }
     return YUUKA_OK;
 }
@@ -616,6 +628,48 @@ yuuka_status validate_cast_plan_op(const yuuka_op & op) {
     if (!buffer_range_ok(op.buf[0], op.off[0], src_bytes) ||
         !buffer_range_ok(op.buf[1], op.off[1], dst_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "cast buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_dequant_plan_op checks an FP16 weight dequantization. Only the
+// K-quant dtypes with a dequant kernel are accepted; the destination is an FP16
+// scratch sized from the unpacked shape.
+yuuka_status validate_dequant_plan_op(const yuuka_op & op) {
+    if (op.buf[0] == nullptr || op.buf[1] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant op buffers are null");
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint32_t dtype = op.u[0];
+    if (dtype != YUUKA_DTYPE_Q4_K && dtype != YUUKA_DTYPE_Q5_K &&
+        dtype != YUUKA_DTYPE_Q6_K) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "dequant supports K-quants only, got %u",
+                    dtype);
+    }
+    if (n_in == 0 || n_out == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant dimensions must be positive");
+    }
+    if (!check_gemv_shapes(n_in, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "dequant input width %llu is not a multiple of 256",
+                    static_cast<unsigned long long>(n_in));
+    }
+    uint64_t row_bytes = 0;
+    uint64_t src_bytes = 0;
+    uint64_t elements = 0;
+    uint64_t dst_bytes = 0;
+    if (!checked_row_bytes(n_in, dtype, &row_bytes) ||
+        __builtin_mul_overflow(row_bytes, n_out, &src_bytes) ||
+        __builtin_mul_overflow(n_in, n_out, &elements) ||
+        __builtin_mul_overflow(elements, uint64_t(2), &dst_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], src_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant source buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], dst_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant destination is too small");
     }
     return YUUKA_OK;
 }
@@ -1321,8 +1375,9 @@ yuuka_status launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
     const uint32_t path = op.u[1];
     if (path == YUUKA_GEMM_PATH_BLAS) {
         const void * x16 = op_ptr<const void>(op, 1);
-        const int status = yuuka::launch_gemm_blas_f16(out, x16, w, n_in, n_out,
-                                                       batch, stream);
+        void * out16 = op_ptr<void>(op, 3);
+        const int status = yuuka::launch_gemm_blas_f16(out, out16, x16, w, n_in,
+                                                       n_out, batch, stream);
         if (status != 0) {
             return fail(YUUKA_ERR_DEVICE, "rocBLAS gemm failed with status %d", status);
         }
@@ -1495,6 +1550,11 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         case YUUKA_OP_CAST_F16: {
             yuuka::launch_cast_f32_to_f16(
                 op_ptr<void>(op, 1), op_ptr<const float>(op, 0), op.n[0], stream);
+            break;
+        }
+        case YUUKA_OP_DEQUANT_F16: {
+            yuuka::launch_dequant_f16(op_ptr<void>(op, 1), op_ptr<const void>(op, 0),
+                                      op.n[0], op.n[1], op.u[0], stream);
             break;
         }
         case YUUKA_OP_RMSNORM: {
@@ -2432,18 +2492,20 @@ YUUKA_API yuuka_status yuuka_gemm_wmma(yuuka_stream * stream, yuuka_buffer * out
 }
 
 YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out,
-                        const yuuka_buffer * x, const yuuka_buffer * w,
-                        uint64_t n_in, uint64_t n_out, uint64_t batch,
-                        yuuka_event * completion) {
+                        yuuka_buffer * out16, const yuuka_buffer * x16,
+                        const yuuka_buffer * w, uint64_t n_in, uint64_t n_out,
+                        uint64_t batch, yuuka_event * completion) {
     return guard([&]() -> yuuka_status {
-        if (stream == nullptr || out == nullptr || x == nullptr || w == nullptr) {
+        if (stream == nullptr || out == nullptr || out16 == nullptr ||
+            x16 == nullptr || w == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
         }
         yuuka_op op{};
         op.code = YUUKA_OP_GEMM;
         op.buf[0] = const_cast<yuuka_buffer *>(w);
-        op.buf[1] = const_cast<yuuka_buffer *>(x);
+        op.buf[1] = const_cast<yuuka_buffer *>(x16);
         op.buf[2] = out;
+        op.buf[3] = out16;
         op.n[0] = n_in;
         op.n[1] = n_out;
         op.n[2] = batch;
@@ -2454,8 +2516,9 @@ YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out
             return status;
         }
         const int blas = yuuka::launch_gemm_blas_f16(static_cast<float *>(out->ptr),
-                                                     x->ptr, w->ptr, n_in, n_out,
-                                                     batch, stream->stream);
+                                                     out16->ptr, x16->ptr, w->ptr,
+                                                     n_in, n_out, batch,
+                                                     stream->stream);
         if (blas != 0) {
             return fail(YUUKA_ERR_DEVICE, "rocBLAS gemm failed with status %d", blas);
         }
@@ -2493,6 +2556,40 @@ YUUKA_API yuuka_status yuuka_cast_f32_to_f16(yuuka_stream * stream, yuuka_buffer
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
             return fail(YUUKA_ERR_DEVICE, "cast launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_dequant_f16(yuuka_stream * stream, yuuka_buffer * dst,
+                        const yuuka_buffer * src, uint64_t n_in, uint64_t n_out,
+                        uint32_t dtype, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || dst == nullptr || src == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        yuuka_op op{};
+        op.code = YUUKA_OP_DEQUANT_F16;
+        op.buf[0] = const_cast<yuuka_buffer *>(src);
+        op.buf[1] = dst;
+        op.n[0] = n_in;
+        op.n[1] = n_out;
+        op.u[0] = dtype;
+        yuuka_status status = validate_dequant_plan_op(op);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        yuuka::launch_dequant_f16(dst->ptr, src->ptr, n_in, n_out, dtype,
+                                  stream->stream);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "dequant launch: %s", hip_error(err));
         }
         if (completion != nullptr) {
             err = hipEventRecord(completion->event, stream->stream);
@@ -2634,7 +2731,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMM_SWIGLU) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_DEQUANT_F16) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -2677,6 +2774,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_CAST_F16:
                 status = validate_cast_plan_op(*op);
+                break;
+            case YUUKA_OP_DEQUANT_F16:
+                status = validate_dequant_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

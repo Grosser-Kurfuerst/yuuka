@@ -14,8 +14,11 @@ import (
 )
 
 type weight struct {
-	buf   *hip.Buffer
-	dtype tensor.DType
+	buf *hip.Buffer
+	// elements is the unpacked element count from the GGUF directory. Prefill
+	// scratch sizing uses it to cover the largest quantized matrix.
+	elements uint64
+	dtype    tensor.DType
 }
 
 type activations struct {
@@ -56,6 +59,8 @@ type prefillActivations struct {
 	ffnGate *hip.Buffer
 	ffnUp   *hip.Buffer
 	xF16    *hip.Buffer
+	yF16    *hip.Buffer
+	wF16    *hip.Buffer
 	tokens  *hip.Buffer
 }
 
@@ -195,7 +200,7 @@ func (m *Model) setup(reader *gguf.Reader, model *qwen35.Model) error {
 		if err := m.device.Upload(buf, data); err != nil {
 			return fmt.Errorf("upload %s: %w", info.Name, err)
 		}
-		m.weights[info.Name] = weight{buf: buf, dtype: info.DType}
+		m.weights[info.Name] = weight{buf: buf, elements: info.Elements(), dtype: info.DType}
 	}
 	if err := m.allocActivations(); err != nil {
 		return err
@@ -339,6 +344,30 @@ func (m *Model) configurePrefill(rows int) error {
 			maxWidth = width
 		}
 	}
+	// The rocBLAS route writes n_out*batch FP16 results per matmul, and its
+	// widest n_out is either a projection width or the gated-delta-net QKV
+	// width. The weight scratch covers the largest quantized matrix the prefill
+	// matmuls read; token_embd and output are excluded because the first is only
+	// gathered by the embedding op and the second only feeds the single-row LM
+	// head, and their FP16 form would add gigabytes.
+	maxOutWidth := maxWidth
+	if convDim := 2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize; convDim > maxOutWidth {
+		maxOutWidth = convDim
+	}
+	var maxWeightElems uint64
+	for name, w := range m.weights {
+		switch w.dtype {
+		case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+		default:
+			continue
+		}
+		if name == "token_embd.weight" || name == "output.weight" {
+			continue
+		}
+		if w.elements > maxWeightElems {
+			maxWeightElems = w.elements
+		}
+	}
 	rowElems := func(width int) uint64 { return uint64(rows) * uint64(width) * 4 }
 	entries := []struct {
 		dst   **hip.Buffer
@@ -360,7 +389,14 @@ func (m *Model) configurePrefill(rows int) error {
 		{&p.ffnGate, rowElems(cfg.FFNSize)},
 		{&p.ffnUp, rowElems(cfg.FFNSize)},
 		{&p.xF16, uint64(rows) * uint64(maxWidth) * 2},
+		{&p.yF16, uint64(rows) * uint64(maxOutWidth) * 2},
 		{&p.tokens, uint64(rows) * 4},
+	}
+	if maxWeightElems > 0 {
+		entries = append(entries, struct {
+			dst   **hip.Buffer
+			bytes uint64
+		}{&p.wF16, maxWeightElems * 2})
 	}
 	for _, entry := range entries {
 		buf, err := m.allocTransient(entry.bytes)

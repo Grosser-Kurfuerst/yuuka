@@ -135,15 +135,17 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_GATE_UP = 31,
     YUUKA_OP_MOE_DOWN = 32,
     YUUKA_OP_MOE_REDUCE_ADD = 33,
-    YUUKA_OP_GEMM_SWIGLU = 34
+    YUUKA_OP_GEMM_SWIGLU = 34,
+    YUUKA_OP_DEQUANT_F16 = 35
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
 
 /* GEMM implementation selection carried in yuuka_op.u[1]. AUTO uses the
- * compiled default for the dtype. BLAS is the rocBLAS FP16 baseline and
- * requires x to be an FP16 buffer. WMMA is the custom rocWMMA kernel, which
- * accepts FP32 x and every supported weight dtype. */
+ * compiled default for the dtype. BLAS is the rocBLAS route and requires FP16
+ * weights, an FP16 x, and an FP16 scratch buffer that receives the FP32-accumulated
+ * product before it is cast to the FP32 result. WMMA is the custom rocWMMA
+ * kernel, which accepts FP32 x and every supported weight dtype. */
 #define YUUKA_GEMM_PATH_AUTO 0u
 #define YUUKA_GEMM_PATH_BLAS 1u
 #define YUUKA_GEMM_PATH_WMMA 2u
@@ -194,19 +196,42 @@ YUUKA_API yuuka_status yuuka_gemm(yuuka_stream * stream, yuuka_buffer * out,
  * out[batch, n_out] = W[n_out, n_in] * x[batch, n_in]
  *
  * x is FP32 row-major; the kernel converts each tile to FP16 in shared memory.
- * w may be any supported dtype, including Q4_K, Q5_K, Q6_K, and Q8_0. This is
- * the prefill path; it never materializes a dequantized weight matrix.
+ * w may be any supported dtype, including Q4_K, Q5_K, Q6_K, and Q8_0. This path
+ * stages one weight tile at a time and never materializes a dequantized weight
+ * matrix; the BLAS route below does materialize one FP16 weight tile per call
+ * in a caller-owned scratch.
  */
 YUUKA_API yuuka_status yuuka_gemm_wmma(yuuka_stream * stream, yuuka_buffer * out,
                         const yuuka_buffer * x, const yuuka_buffer * w,
                         uint64_t n_in, uint64_t n_out, uint64_t batch,
                         uint32_t dtype, yuuka_event * completion);
 
-/* rocBLAS FP16 prefill baseline. x must hold batch*n_in FP16 elements. */
+/* rocBLAS prefill route:
+ *
+ * out[batch, n_out] = W[n_out, n_in] * x[batch, n_in]
+ *
+ * x16 must hold batch*n_in FP16 elements and w must hold FP16 weights. out16 is
+ * a caller-owned FP16 scratch of n_out*batch elements: rocBLAS accumulates in
+ * FP32 and rounds each output once into that scratch, and this call casts it
+ * into out, which stays FP32.
+ */
 YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out,
-                        const yuuka_buffer * x, const yuuka_buffer * w,
-                        uint64_t n_in, uint64_t n_out, uint64_t batch,
-                        yuuka_event * completion);
+                        yuuka_buffer * out16, const yuuka_buffer * x16,
+                        const yuuka_buffer * w, uint64_t n_in, uint64_t n_out,
+                        uint64_t batch, yuuka_event * completion);
+
+/* Dequantizes a packed K-quant weight matrix into an FP16 scratch:
+ *
+ * dst[n_out, n_in] = dequant(src[n_out, n_in])
+ *
+ * src is a packed Q4_K, Q5_K, or Q6_K matrix with dtype row strides; dst must
+ * hold n_in*n_out*2 bytes. The decoded values are the FP16 values the rocWMMA
+ * prefill path stages, so feeding dst to yuuka_gemm_blas isolates the
+ * accumulation from the dequantization.
+ */
+YUUKA_API yuuka_status yuuka_dequant_f16(yuuka_stream * stream, yuuka_buffer * dst,
+                        const yuuka_buffer * src, uint64_t n_in, uint64_t n_out,
+                        uint32_t dtype, yuuka_event * completion);
 
 /* Converts n contiguous FP32 elements to FP16. The destination must hold
  * n*2 bytes. Used to prepare rocBLAS baseline inputs. */
@@ -231,7 +256,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
  * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
- * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, and CAST_F16. Unsupported
+ * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16, and
+ * DEQUANT_F16. Unsupported
  * dtypes and widths that violate the quantization block layout fail with
  * YUUKA_ERR_UNSUPPORTED; invalid dimensions, batch sizes, and undersized
  * buffers fail with YUUKA_ERR_INVALID_ARGUMENT. A rejected operation is not
@@ -262,6 +288,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   EMBEDDING_BATCH:     buf0 weight table, buf1 out, buf2 int32 tokens;
  *                        n={cols,rows,row_bytes,vocab}; u[0]=dtype
  *   CAST_F16:            buf0 FP32 src, buf1 FP16 dst; n[0]=elements
+ *   DEQUANT_F16:         buf0 packed weights, buf1 FP16 dst;
+ *                        n[0]=n_in, n[1]=n_out, u[0]=dtype
  *   GEMM_SWIGLU:         buf0 gate weights, buf1 up weights, buf2 FP32 x,
  *                        buf3 out; n={n_in,n_out,rows}; u[0]=dtype. Both
  *                        weights share dtype and shape; out holds

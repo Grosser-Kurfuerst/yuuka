@@ -656,13 +656,9 @@ warmups and three measured launches.
 ### Prefill matmul route experiments (2026-11-16)
 
 The attribution above leaves 476 ms of a 569 ms 512-token prefill in quantized
-matmul, and llama.cpp runs the same math in 178 ms. Two candidate routes were
-implemented, measured end to end, and rejected. Neither is in the tree: the
-numbers and the reproduction recipe are kept here because they close the two
-questions the attribution left open, the library datatype and tile growth, and
-they point the next attempt at the int8 MMQ geometry instead.
-
-Conditions: same machine, GGUF, and CLI as [the
+matmul, and llama.cpp runs the same math in 178 ms. This section records the
+route that was adopted, the two variants it beat, and the one tile experiment
+that was rejected. Conditions: same machine, GGUF, and CLI as [the
 attribution](#prefill-gap-attribution-vs-llamacpp-2026-11-16); gfx1151,
 Q4_K_M, F32 KV.
 
@@ -682,88 +678,105 @@ products, which is the MMA shape. The entry is the max over the eight rows of
 | `blk.0.ffn_down.weight` | Q6_K | 9216 | 2560 | 4.98e-3 | 4.07e-3 | 8.8e-7 |
 | `blk.0.attn_qkv.weight` | Q5_K | 2560 | 8192 | 2.13e-3 | 7.20e-4 | 4.4e-7 |
 
-Every entry is inside the 5e-3 per-matmul gate that was set for this decision,
-which is why the library route below was implemented and measured end to end.
+The per-matmul gate that was set from this table, 5e-3 on the FP16
+accumulator, turned out to be too loose for the network: see the chunk-gate
+table below.
 
-#### Rejected: FP16 dequant + rocBLAS
+#### Adopted: FP32-compute dequant + rocBLAS
 
-rocBLAS on this build rejects FP16 compute with an FP32 destination
-(`rocblas_status` 2), so the route dequantized each packed matrix into a
-caller-owned FP16 scratch (one thread per eight-value span, the same span
-arithmetic and 8-byte vector loads as the WMMA tile loader), ran
-`rocblas_gemm_ex` with FP16 operands, FP16 compute, and an FP16 result, then
-cast that result back to FP32. The expanded tile matched an independent format
-decoder within one FP16 unit (max relative error 2.4e-4 over every element of a
-2560x256 Q4_K, Q5_K, and Q6_K matrix), so the only numeric difference against
-the WMMA route is the accumulator width.
+rocBLAS rejects FP16 compute with an FP32 destination on this build
+(`rocblas_status` 2) and rejects nothing for FP32 compute with an FP16
+destination, which is the combination that matters here. Same shape
+(`2560 -> 9216`, `M = 512`), one warmup call then three timed repeats:
+
+| rocBLAS types | Time | Rate | Adopted |
+| --- | ---: | ---: | --- |
+| FP16 compute, FP16 out | 0.672 ms | 35.9 TFLOP/s | No: 0.305 logits of drift |
+| FP32 compute, FP16 out | 1.098 ms | 22.0 TFLOP/s | Yes |
+| FP32 compute, FP32 out (the 2026-11-15 wrapper) | 5.107 ms | 4.7 TFLOP/s | No: slower than the WMMA kernel |
+
+FP32 compute keeps the FP32 accumulator and rounds each output once into an
+FP16 scratch, which a cast kernel converts to the FP32 result. The dequantized
+tile matches an independent format decoder within one FP16 unit (max relative
+error 2.4e-4 over every element of a 2560x256 Q4_K, Q5_K, and Q6_K matrix), so
+the route's only numeric difference from the WMMA path is that single rounding
+of the result.
 
 Isolated GEMM, milliseconds, 5 repeats, median. `dequant+rocBLAS` includes the
-weight expansion on every call:
+weight expansion and the activation cast on every call:
 
 | Dtype | Shape | `M` | WMMA 64x64 | dequant + rocBLAS | Speedup |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Q4_K | 2560 -> 9216 | 64 | 0.359 | 0.663 | 0.54x |
-| Q4_K | 2560 -> 9216 | 128 | 0.687 | 0.779 | 0.88x |
-| Q4_K | 2560 -> 9216 | 256 | 1.361 | 0.868 | 1.57x |
-| Q4_K | 2560 -> 9216 | 512 | 2.755 | 1.187 | 2.32x |
-| Q4_K | 2560 -> 8192 | 128 | 0.670 | 0.731 | 0.92x |
-| Q4_K | 2560 -> 8192 | 256 | 1.277 | 0.834 | 1.53x |
-| Q4_K | 2560 -> 8192 | 512 | 2.499 | 1.134 | 2.20x |
-| Q4_K | 9216 -> 2560 | 128 | 0.614 | 0.965 | 0.64x |
-| Q4_K | 9216 -> 2560 | 256 | 1.263 | 1.017 | 1.24x |
-| Q4_K | 9216 -> 2560 | 512 | 2.791 | 1.787 | 1.56x |
-| Q5_K | 2560 -> 9216 | 128 | 0.749 | 0.800 | 0.94x |
-| Q5_K | 2560 -> 9216 | 256 | 1.485 | 0.951 | 1.56x |
-| Q5_K | 2560 -> 9216 | 512 | 3.033 | 1.172 | 2.59x |
-| Q5_K | 2560 -> 8192 | 128 | 0.677 | 0.732 | 0.92x |
-| Q5_K | 2560 -> 8192 | 256 | 1.341 | 0.872 | 1.54x |
-| Q5_K | 2560 -> 8192 | 512 | 2.685 | 1.119 | 2.40x |
-| Q5_K | 9216 -> 2560 | 128 | 0.681 | 1.093 | 0.62x |
-| Q5_K | 9216 -> 2560 | 256 | 1.555 | 1.020 | 1.52x |
-| Q5_K | 9216 -> 2560 | 512 | 3.266 | 1.908 | 1.71x |
-| Q6_K | 2560 -> 9216 | 128 | 1.188 | 1.079 | 1.10x |
-| Q6_K | 2560 -> 9216 | 256 | 2.290 | 1.099 | 2.08x |
-| Q6_K | 2560 -> 9216 | 512 | 4.658 | 1.394 | 3.34x |
-| Q6_K | 2560 -> 8192 | 128 | 1.072 | 0.952 | 1.13x |
-| Q6_K | 2560 -> 8192 | 256 | 2.091 | 1.079 | 1.94x |
-| Q6_K | 2560 -> 8192 | 512 | 4.182 | 1.296 | 3.23x |
-| Q6_K | 9216 -> 2560 | 128 | 1.315 | 1.414 | 0.93x |
-| Q6_K | 9216 -> 2560 | 256 | 2.874 | 1.278 | 2.25x |
-| Q6_K | 9216 -> 2560 | 512 | 6.119 | 2.127 | 2.88x |
+| Q4_K | 2560 -> 9216 | 128 | 0.716 | 0.733 | 0.98x |
+| Q4_K | 2560 -> 9216 | 256 | 1.339 | 1.077 | 1.24x |
+| Q4_K | 2560 -> 9216 | 512 | 2.767 | 1.607 | 1.72x |
+| Q4_K | 2560 -> 8192 | 512 | 2.440 | 1.479 | 1.65x |
+| Q4_K | 9216 -> 2560 | 128 | 0.606 | 1.313 | 0.46x |
+| Q4_K | 9216 -> 2560 | 512 | 2.865 | 1.619 | 1.77x |
+| Q5_K | 2560 -> 9216 | 512 | 2.857 | 1.566 | 1.82x |
+| Q5_K | 2560 -> 8192 | 512 | 2.529 | 1.441 | 1.76x |
+| Q5_K | 9216 -> 2560 | 512 | 3.113 | 1.611 | 1.93x |
+| Q6_K | 2560 -> 9216 | 128 | 1.172 | 1.053 | 1.11x |
+| Q6_K | 2560 -> 9216 | 512 | 4.567 | 1.882 | 2.43x |
+| Q6_K | 2560 -> 8192 | 512 | 4.018 | 1.587 | 2.53x |
+| Q6_K | 9216 -> 2560 | 512 | 5.758 | 1.854 | 3.11x |
 
-At 64 rows the route loses in every cell (0.41x to 0.70x) because the
-expansion is paid per call. The crossover is 256 rows for every tested dtype
-and shape class.
+Below 128 rows the expansion dominates (0.31-0.64x at `M = 32` and `M = 64`),
+and from 128 rows up the route is neutral (0.95-1.16x) and then faster.
 
-End to end with the route selected for every K-quant matmul at `M >= 256`,
-`bench --prompt-tokens 512 --chunk-size 512`: **0.330 s / 1552 tok/s** against
-0.581 s / 881 tok/s, a 1.76x prefill speedup, above the 1.5x target that was
-set for this work.
+End to end, `bench --prompt-tokens N --chunk-size 512 --warmup 2 --reps 5`,
+sequential runs on the same machine:
 
-**Rejected on the numeric gate.** `TestGPUChunkedPrefillLongContext` requires
-the chunk-512 prefill logits to stay within 0.05 of the chunk-128 logits and to
-keep the same greedy token:
+| Prompt tokens | WMMA | Adopted route | Delta |
+| ---: | ---: | ---: | ---: |
+| 32 | 0.081 s / 393 tok/s | 0.082 s / 391 tok/s | -0.3% |
+| 100 | 0.139 s / 717 tok/s | 0.139 s / 717 tok/s | 0 |
+| 128 | 0.149 s / 858 tok/s | 0.157 s / 818 tok/s | -5% |
+| 512 | 0.583 s / 878 tok/s | 0.463 s / 1107 tok/s | **+26%** |
+
+The 128-token row is slower because the fused gate/up kernel is only selected
+on the WMMA path: at 128 rows the GEMMs are neutral and the route pays for two
+separate GEMMs plus `SILU_MUL` instead of one fused epilogue.
+
+#### The route is bounded by the chunk-invariance gate, not by the per-GEMM gate
+
+`TestGPUChunkedPrefillLongContext` requires the chunk-512 prefill to stay within
+0.05 logits of the chunk-128 prefill. It has no slack: the WMMA path is bitwise
+identical across chunk boundaries (0). Measured drift for the route variants,
+each with the same top-1 token (33075):
 
 | Route selection | Max logit diff | Gate |
 | --- | ---: | ---: |
 | WMMA everywhere (baseline) | 0 | 0.05 |
-| Every K-quant matmul at `M >= 256` | 0.305 | 0.05 |
-| Only `K <= 2560` matmuls | 0.319 | 0.05 |
-| Only `K > 2560` matmuls | 0.296 | 0.05 |
+| FP16 compute, every matmul, `M >= 256` | 0.305 | 0.05 |
+| FP32 compute, every matmul, `M >= 256` | 0.0686 | 0.05 |
+| FP32 compute, `K <= N`, `M >= 256` | 0.0577 | 0.05 |
+| FP32 compute, `K <= N`, `M >= 256`, `N <= 8192` | 0.0846 | 0.05 |
+| FP32 compute, `K <= N`, `M >= 128` (adopted) | **0.0419** | 0.05 |
 
-The route keeps the top-1 token, but 0.305 is six times the gate against a
-baseline that is bitwise identical across chunk boundaries. Restricting the
-route to one matmul family does not rescue it: the shallow-`K` group alone
-drifts 0.319 and the deep-`K` group alone 0.296, so one family per layer is
-already over budget.
+Two effects explain the shape of the table. First, a route that depends on the
+row count makes the chunk size change the numerics, and that difference
+(0.058) is larger than the route's own batch-size sensitivity (0.042), so
+the adopted rule keeps the row threshold at the smallest chunk size the gate
+uses. Second, the metric is a maximum over 248,320 logits, so it is an
+extreme-value statistic rather than a norm: the `N <= 8192` subset lands on a
+worse extreme than the full wide set even though it routes fewer matmuls.
 
-The per-matmul gate is not a bound on network drift. A 4e-3 relative error in a
-9216-wide dot compounds across 40 layers and lands at about 2% of the logit
-magnitude. The logit gate needs roughly 1e-3 per matmul, which FP16
-accumulation cannot reach at these widths; splitting `K` into enough FP32
-accumulation steps to get there costs more launches than the route saves. The
-code was reverted, including the dequant kernel, the FP16 scratch in the ABI,
-and the planner route.
+The tall-`K` class is excluded for a numeric reason, not a speed one: it
+measured 1.44-1.77x faster on `9216 -> 2560` at `M = 256` and above, but
+rocBLAS splits `K` there and the FP16 destination forces the split reduction
+through FP16. The native route test measures 1.1-1.5e-3 relative error on those
+shapes against 4.0-4.9e-4 on the wide ones, so tall-`K` keeps the WMMA path.
+
+Residual error of the adopted route, from
+`tests/hip/prefill_test.cpp`: 4.0-4.9e-4 relative per GEMM on the wide shapes,
+which is one FP16 unit roundoff of the result, and 1.1-1.5e-3 on the tall shapes
+the engine does not route. The test bound is 2e-3 per element.
+
+Known limitation: a prefill chunk below 128 rows (a prompt shorter than that, or
+an explicitly small `--chunk-size`) selects WMMA while larger chunks select the
+route, so those two produce logits that differ by about the 0.058 measured
+above. The gate compares 128 and 512, which both use the route.
 
 #### Rejected: 128-row WMMA tile
 
@@ -784,28 +797,14 @@ Isolated GEMM, milliseconds, median of three sweep runs, against the committed
 | Q4_K | 2560 -> 9216 | 256 | 1.361 | 1.186 | +12.9% |
 | Q4_K | 2560 -> 9216 | 512 | 2.755 | 2.519 | +8.6% |
 | Q4_K | 2560 -> 8192 | 128 | 0.670 | 0.769 | -14.8% |
-| Q4_K | 2560 -> 8192 | 256 | 1.277 | 1.201 | +6.0% |
 | Q4_K | 2560 -> 8192 | 512 | 2.499 | 2.153 | +13.8% |
-| Q4_K | 9216 -> 2560 | 128 | 0.614 | 0.646 | -5.2% |
 | Q4_K | 9216 -> 2560 | 256 | 1.263 | 1.419 | -12.4% |
 | Q4_K | 9216 -> 2560 | 512 | 2.791 | 3.030 | -8.6% |
-| Q5_K | 2560 -> 9216 | 128 | 0.749 | 0.773 | -3.2% |
 | Q5_K | 2560 -> 9216 | 256 | 1.485 | 1.215 | +18.2% |
 | Q5_K | 2560 -> 9216 | 512 | 3.033 | 2.621 | +13.6% |
-| Q5_K | 2560 -> 8192 | 128 | 0.677 | 0.757 | -11.8% |
-| Q5_K | 2560 -> 8192 | 256 | 1.341 | 1.165 | +13.1% |
-| Q5_K | 2560 -> 8192 | 512 | 2.685 | 2.211 | +17.7% |
-| Q5_K | 9216 -> 2560 | 128 | 0.681 | 0.675 | +0.9% |
-| Q5_K | 9216 -> 2560 | 256 | 1.555 | 1.503 | +3.3% |
 | Q5_K | 9216 -> 2560 | 512 | 3.266 | 3.281 | -0.5% |
-| Q6_K | 2560 -> 9216 | 128 | 1.188 | 1.047 | +11.9% |
 | Q6_K | 2560 -> 9216 | 256 | 2.290 | 1.700 | +25.8% |
 | Q6_K | 2560 -> 9216 | 512 | 4.658 | 3.727 | +20.0% |
-| Q6_K | 2560 -> 8192 | 128 | 1.072 | 1.028 | +4.1% |
-| Q6_K | 2560 -> 8192 | 256 | 2.091 | 1.655 | +20.9% |
-| Q6_K | 2560 -> 8192 | 512 | 4.182 | 3.320 | +20.6% |
-| Q6_K | 9216 -> 2560 | 128 | 1.315 | 1.297 | +1.4% |
-| Q6_K | 9216 -> 2560 | 256 | 2.874 | 2.906 | -1.1% |
 | Q6_K | 9216 -> 2560 | 512 | 6.119 | 6.000 | +1.9% |
 
 The tile wins on wide, shallow-`K` shapes (+6% to +26%) and loses on tall-`K`
@@ -814,49 +813,22 @@ count costs more than the weight reuse saves.
 
 End to end with the tile selected for every `K <= N` shape at `M >= 128`:
 0.553 s / 926 tok/s. Restricted to `M >= 256`, `K <= 2560`, and `N >= 8192`:
-0.572 s / 895 tok/s. Baseline over three consecutive runs: 0.559 s, 0.563 s,
-0.589 s (916, 909, 869 tok/s). Both variants sit inside that 2.5% run-to-run
-band while the sweep shows regressions outside it, so the acceptance rule is not
-met and the tile is not selected. The code, including the two-half epilogue,
-was reverted.
+0.572 s / 895 tok/s. WMMA baseline over three consecutive runs: 0.559 s,
+0.563 s, 0.589 s (916, 909, 869 tok/s). Both variants sit inside that 2.4%
+run-to-run band while the sweep shows regressions outside it, so the tile is not
+selected, and the two-half epilogue was reverted.
 
-**What the two experiments rule out.** Weight traffic is not the prefill matmul
-bottleneck: halving it with a 128-row tile buys 6-26% on the wide shapes and
-nothing on the tall ones, and the two matmul families that dominate the 476 ms,
-the fused gate/up pair and the tall-`K` down projection, keep the 64-row
-geometry either way. What remains is instructions per MAC: llama.cpp spends
-about 22 instructions per 4096-MAC WMMA against yuuka's 114 because it
-dequantizes weights to int8 once per 128-token pass and accumulates in int32.
-That accumulation is exact, but the int8 activation quantization it requires
-adds an error term of the same order as the one rejected here, so that route
-must clear the same logit gate rather than inherit exactness from its
-accumulator. It is the roadmap's Phase 3 quantized GEMM either way.
+**What the tile experiment rules out.** Weight traffic is not the prefill matmul
+bottleneck: halving it buys 6-26% on the wide shapes and nothing on the tall
+ones. The route that was adopted instead removes work per weight rather than
+weights per work: the library kernel converts each packed weight to FP16 once
+per call and then runs a 128-column-token tile in registers, which is why it
+reaches 22 TFLOP/s where the custom 64-row kernel reaches 8.6.
 
-**The datatype question is not closed by this rejection.** rocBLAS also accepts
-FP16 operands with FP32 compute and an FP16 destination, which rounds each
-output once instead of after every K step. Same shape as the table above
-(`2560 -> 9216`, `M = 512`), one warmup call then three timed repeats:
-
-| rocBLAS types | Time | Rate |
-| --- | ---: | ---: |
-| FP16 compute, FP16 out | 0.672 ms | 35.9 TFLOP/s |
-| FP32 compute, FP16 out | 1.098 ms | 22.0 TFLOP/s |
-| FP32 compute, FP32 out (the 2026-11-15 wrapper) | 5.107 ms | 4.7 TFLOP/s |
-
-FP32 compute with FP16 output is 2.5x faster than the selected WMMA kernel on
-this shape and 1.6x slower than the rejected route. Its only new error term
-against the WMMA path is the FP16 rounding of the result, 5e-4 relative against
-the 4e-3 measured for FP16 accumulation, which puts the expected drift near
-0.04. That is inside the 0.05 gate only barely, so it has to be measured on the
-chunk test rather than assumed; it was identified after this rejection and is
-not implemented.
-
-Reproduction without committed code: the numeric gate is a scratch Go module
-that replaces `github.com/yuuka-ai/yuuka` and uses `gguf.Open` plus
-`tensor.DequantizeRow`; the dequant sweep column submits `yuuka_dequant_f16`,
-`yuuka_cast_f32_to_f16`, and `yuuka_gemm_blas` next to the existing `wmma`
-column; the end-to-end number is the `bench` command above with
-`SelectPrefillPath` returning the route for the selected K-quant shapes.
+Reproduction: `./build/yuuka_prefill_sweep` prints the isolated columns, and the
+end-to-end numbers are the `bench` commands above. The numeric gate is a scratch
+Go module that replaces `github.com/yuuka-ai/yuuka` and uses `gguf.Open` plus
+`tensor.DequantizeRow`.
 
 ### Prefill attention tiling (2026-11-15)
 

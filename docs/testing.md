@@ -147,11 +147,14 @@ Each compares against an independent float implementation and records its
 tolerance in the test.
 
 Per-operator tolerances do not bound network-level drift. A prefill matmul that
-meets the 2e-2 per-GEMM bound while accumulating in FP16 moved the 512-token
+met the 2e-2 per-GEMM bound while accumulating in FP16 moved the 512-token
 logits by 0.305 against a bitwise-identical baseline, six times the 0.05 chunk
-gate, because a 2-5e-3 error in one 9216-wide dot compounds across 40 layers.
+gate, because a 2-5e-3 error in one 9216-wide dot compounds across 32 layers.
 A route change must therefore clear the chunk gate in
-`TestGPUChunkedPrefillLongContext`, not only the per-operator bound. See
+`TestGPUChunkedPrefillLongContext`, not only the per-operator bound. That gate is
+tight enough to be the binding constraint: the adopted rocBLAS route rounds each
+result once to FP16, measures one unit roundoff (4.0-4.9e-4) per GEMM, and still
+lands at 0.042 against the 0.05 bound. See
 [benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
 
 Paged KV and graph replay have dedicated native coverage in

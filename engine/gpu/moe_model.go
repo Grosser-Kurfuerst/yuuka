@@ -40,6 +40,7 @@ type moeActivations struct {
 	expertOut *hip.Buffer
 
 	xF16   *hip.Buffer
+	yF16   *hip.Buffer
 	tokens *hip.Buffer
 }
 
@@ -148,7 +149,7 @@ func (m *MoEModel) setup(reader *gguf.Reader, rows int) error {
 		if err := m.device.Upload(buf, data); err != nil {
 			return fmt.Errorf("upload %s: %w", info.Name, err)
 		}
-		m.weights[info.Name] = weight{buf: buf, dtype: info.DType}
+		m.weights[info.Name] = weight{buf: buf, elements: info.Elements(), dtype: info.DType}
 	}
 	if err := m.allocActivations(rows); err != nil {
 		return err
@@ -215,6 +216,7 @@ func (m *MoEModel) allocActivations(rows int) error {
 		{&a.actOut, uint64(rows) * uint64(cfg.ExpertUsedCount) * uint64(cfg.ExpertFFNSize) * 4},
 		{&a.expertOut, uint64(rows) * uint64(cfg.ExpertUsedCount) * uint64(cfg.HiddenSize) * 4},
 		{&a.xF16, uint64(rows) * uint64(maxWidth) * 2},
+		{&a.yF16, uint64(rows) * uint64(maxWidth) * 2},
 		{&a.tokens, uint64(rows) * 4},
 	}
 	for _, entry := range entries {

@@ -251,22 +251,25 @@ consecutive row bytes. They have no block header worth hoisting above the
 per-value cost, and the span walk measured slower for them: Q6_K lost up to 54%
 on small batches and F16 lost 12-16% on tall-K shapes, because a thread's bytes
 are then strided across rows instead of coalesced across lanes. Q6_K row stride
-210 also rules out aligned vector loads. No dequantized weight matrix is
-materialized; every supported dtype shares the tile path and differs only in
-the packed-load helper.
+210 also rules out aligned vector loads. This kernel never materializes a
+dequantized weight matrix: every supported dtype shares the tile path and
+differs only in the packed-load helper. The separate rocBLAS route does
+materialize one FP16 weight tile per call, in a caller-owned scratch sized from
+the largest quantized matrix, and it is used only for the wide K-quant class
+described below.
 
-The FP32 accumulator is a measured requirement, not a default. A route that
-expanded each packed matrix into an FP16 scratch and ran rocBLAS with FP16
-compute was 1.6-3.3x faster per GEMM from 256 rows upward, but it moved the
-512-token prefill logits by 0.305 against the 0.05 chunk gate even when only one
-matmul family used it, so FP16 accumulation is not adopted anywhere in the
-prefill path. The accumulator width, not the library, is the constraint: the
-same expansion with FP32 compute and an FP16 destination measures 22.0 TFLOP/s
-on `2560 -> 9216` at `M = 512` against 8.6 for this kernel, and it rounds each
-output once instead of after every K step. A 128-row tile with four accumulator
-fragments was also measured: it halves the weight-tile reloads but needs a
-two-half epilogue for the 24 KiB staging alias, and it loses on tall-`K` shapes
-where the extra CTA count matters more. All three experiments are recorded in
+The FP32 accumulator is a measured requirement, not a default. FP16 compute
+(after dequantizing into an FP16 scratch) is 1.6x faster in the library but
+moved the 512-token prefill logits by 0.305 against the 0.05 chunk gate, so the
+wide K-quant class instead runs rocBLAS with FP32 compute and an FP16
+destination: 22.0 TFLOP/s on `2560 -> 9216` at `M = 512` against 8.6 for this
+kernel, with one rounding of each output instead of one per K step. Tall-`K`
+shapes keep this kernel because rocBLAS splits `K` there and the FP16
+destination forces that reduction through FP16 (1.1-1.5e-3 measured against
+4.0-4.9e-4 on the wide shapes). A 128-row tile with four accumulator fragments
+was also measured: it halves the weight-tile reloads but needs a two-half
+epilogue for the 24 KiB staging alias, and it loses on tall-`K` shapes where the
+extra CTA count matters more. All of these are recorded in
 [benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
 
 The 64x64/K32 variant is selected for `rows >= 64` when `K <= N`; the 32x64
@@ -323,6 +326,7 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 | --- | --- |
 | `M < 4` | Batched GEMV |
 | Quantized, `M < 8`, and `K > N` | Batched GEMV |
+| K-quant, `K <= N`, `M >= 128` | Dequantize to FP16 + rocBLAS (FP32 compute) |
 | Quantized, other `M >= 4` | Custom rocWMMA |
 | F16, `4 <= M <= 64`, `K > N` | rocBLAS + cast |
 | F16, `M < 8`, `K <= N` | Batched GEMV |
@@ -330,7 +334,12 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 | F16, other `M >= 8` | Custom rocWMMA |
 
 The custom kernel is selected only where the sweep showed it faster than the
-compared baseline. F16 baselines include the cast cost. A dispatch table entry
+compared baseline, and a library route only where it is both faster and inside
+the numeric gates. The K-quant rocBLAS row is bounded twice: from below by the
+dequantization cost (0.31-0.64x below 128 rows) and on tall-`K` shapes by the
+FP16 split reduction (see 6.2), so `K > N` keeps the custom kernel even though
+the library measures up to 1.8x faster there. F16 baselines include the cast
+cost. A dispatch table entry
 is valid only for the recorded gfx1151 environment; the kernel is not selected
 from assumptions about other RDNA parts.
 

@@ -222,6 +222,64 @@ float dot_q5_0(const uint8_t * row, const float * x, int64_t n) {
     return sum;
 }
 
+// dequant_ref_value decodes one element of a packed K-quant row. It restates
+// the format arithmetic of the dot_* reference decoders, so the dequant kernel
+// has an independent oracle for every value it writes.
+float dequant_ref_value(yuuka_dtype dtype, const uint8_t * row, int64_t index) {
+    if (dtype == YUUKA_DTYPE_Q4_K) {
+        const uint8_t * blk = row + (index / 256) * 144;
+        const float d = half_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+        const float dm = half_to_float(uint16_t(blk[2] | (blk[3] << 8)));
+        const int sub = int((index % 256) / 32);
+        const int within = int(index & 31);
+        uint8_t sc = 0, m = 0;
+        get_scale_min_k4(sub, blk + 4, sc, m);
+        const uint8_t qs = blk[16 + (sub / 2) * 32 + within];
+        const int q = (sub & 1) ? (qs >> 4) : (qs & 0xF);
+        return d * float(sc) * float(q) - dm * float(m);
+    }
+    if (dtype == YUUKA_DTYPE_Q5_K) {
+        const uint8_t * blk = row + (index / 256) * 176;
+        const float d = half_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+        const float dm = half_to_float(uint16_t(blk[2] | (blk[3] << 8)));
+        const int sub = int((index % 256) / 32);
+        const int within = int(index & 31);
+        uint8_t sc = 0, m = 0;
+        get_scale_min_k4(sub, blk + 4, sc, m);
+        const uint8_t ql = blk[48 + (sub / 2) * 32 + within];
+        const uint8_t qh = blk[16 + within];
+        int q = (sub & 1) ? (ql >> 4) : (ql & 0xF);
+        if (qh & uint8_t(1u << sub)) q += 16;
+        return d * float(sc) * float(q) - dm * float(m);
+    }
+    const uint8_t * blk = row + (index / 256) * 210;
+    const uint8_t * ql = blk;
+    const uint8_t * qh = blk + 128;
+    const int8_t * sc = reinterpret_cast<const int8_t *>(blk + 192);
+    const float d = half_to_float(uint16_t(blk[208] | (blk[209] << 8)));
+    const int n = int((index % 256) / 128);
+    const int l = int(index & 127);
+    const uint8_t * qlN = ql + n * 64;
+    const uint8_t * qhN = qh + n * 32;
+    const int8_t * scN = sc + n * 8;
+    int q = 0;
+    int sidx = 0;
+    if (l < 32) {
+        q = (qlN[l] & 0xF) | (((qhN[l] >> 0) & 3) << 4);
+        sidx = l / 16 + 0;
+    } else if (l < 64) {
+        q = (qlN[l] & 0xF) | (((qhN[l - 32] >> 2) & 3) << 4);
+        sidx = (l - 32) / 16 + 2;
+    } else if (l < 96) {
+        q = (qlN[l - 64] >> 4) | (((qhN[l - 64] >> 4) & 3) << 4);
+        sidx = (l - 64) / 16 + 4;
+    } else {
+        q = (qlN[l - 64] >> 4) | (((qhN[l - 96] >> 6) & 3) << 4);
+        sidx = (l - 96) / 16 + 6;
+    }
+    return d * float(scN[sidx]) * float(q - 32);
+}
+
 using DotFn = float (*)(const uint8_t *, const float *, int64_t);
 
 uint64_t row_bytes(yuuka_dtype dtype, int64_t n) {
@@ -483,13 +541,14 @@ bool test_blas(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
         x[i] = dist(rng);
         x16[i] = float_to_half(x[i]);
     }
-    Buffer wb, xb, ob;
+    Buffer wb, xb, ob, ob16;
     bool ok = alloc(device, wb, packed.size()) && alloc(device, xb, x16.size() * 2) &&
               alloc(device, ob, size_t(n_out * rows) * 4) &&
+              alloc(device, ob16, size_t(n_out * rows) * 2) &&
               upload(wb, packed.data(), packed.size()) && upload_vec(xb, x16);
     if (ok) {
-        ok = check(yuuka_gemm_blas(stream, ob.buf, xb.buf, wb.buf, n_in, n_out, rows,
-                                   event), "gemm blas") &&
+        ok = check(yuuka_gemm_blas(stream, ob.buf, ob16.buf, xb.buf, wb.buf, n_in,
+                                   n_out, rows, event), "gemm blas") &&
              check(yuuka_event_wait(event), "blas wait");
     }
     std::vector<float> got(size_t(n_out * rows));
@@ -510,13 +569,15 @@ bool test_blas(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
             }
         }
     }
-    std::printf("rocBLAS F16 baseline: %s\n", ok ? "ok" : "FAILED");
+    std::printf("rocBLAS F16 route: %s\n", ok ? "ok" : "FAILED");
 
     // The plan path must produce the same result through an explicit cast.
-    Buffer src32, dst16;
+    Buffer src32, dst16, o16;
     yuuka_plan * plan = nullptr;
     bool plan_ok = ok && alloc(device, src32, x.size() * 4) &&
-                   alloc(device, dst16, x.size() * 2) && upload_vec(src32, x) &&
+                   alloc(device, dst16, x.size() * 2) &&
+                   alloc(device, o16, size_t(n_out * rows) * 2) &&
+                   upload_vec(src32, x) &&
                    check(yuuka_plan_create(device, &plan), "plan create");
     if (plan_ok) {
         yuuka_op cast{};
@@ -530,6 +591,7 @@ bool test_blas(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
         gemm.buf[0] = wb.buf;
         gemm.buf[1] = dst16.buf;
         gemm.buf[2] = ob.buf;
+        gemm.buf[3] = o16.buf;
         gemm.n[0] = uint64_t(n_in);
         gemm.n[1] = uint64_t(n_out);
         gemm.n[2] = uint64_t(rows);
@@ -559,12 +621,143 @@ bool test_blas(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
         std::printf("rocBLAS F16 plan path: %s (max abs %.3g)\n", plan_ok ? "ok" : "FAILED", max_abs);
     }
     if (plan != nullptr) yuuka_plan_destroy(plan);
+    release(o16);
     release(dst16);
     release(src32);
+    release(ob16);
     release(ob);
     release(xb);
     release(wb);
     return ok && plan_ok;
+}
+
+// test_dequant_f16 checks the dequantization kernel element by element. Every
+// element of the expanded matrix must match an independent decoder of the
+// packed format; the kernel rounds its result to FP16, so the comparison allows
+// one FP16 unit of relative headroom for a contracted multiply-add.
+bool test_dequant_f16(yuuka_device * device, yuuka_stream * stream,
+                      yuuka_event * event, yuuka_dtype dtype, const char * name,
+                      int64_t n_in, int64_t n_out, std::mt19937 & rng) {
+    std::vector<uint8_t> packed = pack_weights(dtype, rng, n_in, n_out);
+    Buffer wb, w16;
+    bool ok = alloc(device, wb, packed.size()) &&
+              alloc(device, w16, size_t(n_in * n_out) * 2) &&
+              upload(wb, packed.data(), packed.size());
+    if (ok) {
+        ok = check(yuuka_dequant_f16(stream, w16.buf, wb.buf, n_in, n_out, dtype,
+                                     event), "dequant f16") &&
+             check(yuuka_event_wait(event), "dequant wait");
+    }
+    std::vector<uint16_t> got(size_t(n_in * n_out));
+    ok = ok && download_vec(w16, got);
+    const uint64_t rb = row_bytes(dtype, n_in);
+    double max_rel = 0.0;
+    for (int64_t col = 0; col < n_out && ok; ++col) {
+        const uint8_t * wrow = packed.data() + col * rb;
+        for (int64_t i = 0; i < n_in; ++i) {
+            const float expected = dequant_ref_value(dtype, wrow, i);
+            const float value = half_to_float(got[size_t(col * n_in + i)]);
+            const double rel = std::fabs(double(value) - double(expected)) /
+                               (1.0 + std::fabs(double(expected)));
+            max_rel = std::max(max_rel, rel);
+            if (std::fabs(double(value) - double(expected)) >
+                9.77e-4 * (1.0 + std::fabs(double(expected)))) {
+                std::fprintf(stderr, "%s element [%lld,%lld]: got %.6f expected %.6f\n",
+                             name, static_cast<long long>(col),
+                             static_cast<long long>(i), value, expected);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s: %s (max rel %.3g)\n", name, ok ? "ok" : "FAILED", max_rel);
+    release(w16);
+    release(wb);
+    return ok;
+}
+
+// test_gemm_blas_dequant checks the dequant-plus-rocBLAS route end to end: the
+// packed K-quant matrix is expanded into FP16, multiplied by FP16 activations
+// with an FP32 accumulator, and the FP16 result is cast back to FP32.
+//
+// The reference is built from the downloaded FP16 weights and the FP16
+// activations in float64, so it implements the same operand rounding the route
+// uses and the bound covers only the accumulator and the single FP16 rounding
+// of the result. Comparing against full-precision weights instead would measure
+// the operand rounding of a strongly cancelling synthetic row, which reaches
+// 2e-2 here for any FP16-staged route and hides the accumulator behavior.
+bool test_gemm_blas_dequant(yuuka_device * device, yuuka_stream * stream,
+                            yuuka_event * event, yuuka_dtype dtype,
+                            const char * name, int64_t n_in, int64_t n_out,
+                            int64_t rows, std::mt19937 & rng) {
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> x(size_t(n_in * rows));
+    for (float & v : x) v = dist(rng);
+    std::vector<uint16_t> x16(x.size());
+    for (size_t i = 0; i < x.size(); ++i) x16[i] = float_to_half(x[i]);
+    std::vector<uint8_t> packed = pack_weights(dtype, rng, n_in, n_out);
+    Buffer wb, w16, xb, o16, ob;
+    bool ok = alloc(device, wb, packed.size()) &&
+              alloc(device, w16, size_t(n_in * n_out) * 2) &&
+              alloc(device, xb, x16.size() * 2) &&
+              alloc(device, o16, size_t(n_out * rows) * 2) &&
+              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              upload(wb, packed.data(), packed.size()) && upload_vec(xb, x16);
+    if (ok) {
+        ok = check(yuuka_dequant_f16(stream, w16.buf, wb.buf, n_in, n_out, dtype,
+                                     event), "dequant f16") &&
+             check(yuuka_event_wait(event), "dequant wait");
+    }
+    if (ok) {
+        ok = check(yuuka_gemm_blas(stream, ob.buf, o16.buf, xb.buf, w16.buf, n_in,
+                                   n_out, rows, event), "gemm blas dequant") &&
+             check(yuuka_event_wait(event), "blas-dequant wait");
+    }
+    std::vector<uint16_t> host_w16(size_t(n_in * n_out));
+    std::vector<float> got(size_t(n_out * rows));
+    ok = ok && download_vec(w16, host_w16) && download_vec(ob, got);
+    // The full element set of these shapes is tens of billions of reference
+    // multiply-adds. The first eight rows cover the row stride, the column
+    // mapping, and the tile edge; the elementwise dequant check above covers
+    // every expanded weight, and the WMMA test covers row indexing at these
+    // shapes.
+    const int64_t checked_rows = rows < 8 ? rows : 8;
+    if (ok) {
+        double max_abs = 0.0;
+        double max_rel = 0.0;
+        for (int64_t row = 0; row < checked_rows && ok; ++row) {
+            for (int64_t col = 0; col < n_out; ++col) {
+                float expected = 0.0f;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    const float w = half_to_float(host_w16[size_t(col * n_in + i)]);
+                    expected += w * half_to_float(x16[size_t(row * n_in + i)]);
+                }
+                const double value = double(got[size_t(row * n_out + col)]);
+                const double diff = std::fabs(value - expected);
+                max_abs = std::max(max_abs, diff);
+                max_rel = std::max(max_rel, diff / (1.0 + std::fabs(expected)));
+                // One FP16 unit roundoff of the result, plus the extra
+                // roundings rocBLAS performs when it splits K on tall shapes:
+                // the FP16 destination forces that reduction through FP16, so
+                // the bound is two units rather than one.
+                if (diff > 2e-3 * (1.0 + std::fabs(expected))) {
+                    std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
+                                 name, static_cast<long long>(row),
+                                 static_cast<long long>(col), value, expected);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        std::printf("%s: %s (max abs %.3g, max rel %.3g)\n", name,
+                    ok ? "ok" : "FAILED", max_abs, max_rel);
+    }
+    release(ob);
+    release(o16);
+    release(xb);
+    release(w16);
+    release(wb);
+    return ok;
 }
 
 bool test_norm_and_rope(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
@@ -1143,6 +1336,34 @@ int main() {
         }
     }
     ok = test_blas(device, stream, event, rng) && ok;
+    const struct {
+        yuuka_dtype dtype;
+        const char * name;
+    } blasq_cases[] = {
+        {YUUKA_DTYPE_Q4_K, "blas-dequant Q4_K"},
+        {YUUKA_DTYPE_Q5_K, "blas-dequant Q5_K"},
+        {YUUKA_DTYPE_Q6_K, "blas-dequant Q6_K"},
+    };
+    const struct {
+        int64_t n_in;
+        int64_t n_out;
+        int64_t rows;
+    } blasq_shapes[] = {
+        {2560, 9216, 256},
+        {2560, 9216, 512},
+        {9216, 2560, 64},
+        {9216, 2560, 512},
+        {2560, 8192, 256},
+        {768, 160, 70},
+    };
+    for (const auto & c : blasq_cases) {
+        ok = test_dequant_f16(device, stream, event, c.dtype, c.name, 2560, 256,
+                              rng) && ok;
+        for (const auto & s : blasq_shapes) {
+            ok = test_gemm_blas_dequant(device, stream, event, c.dtype, c.name,
+                                        s.n_in, s.n_out, s.rows, rng) && ok;
+        }
+    }
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;

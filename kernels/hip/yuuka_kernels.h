@@ -59,8 +59,10 @@ void launch_gemm_f16(float * out, const float * x, const void * w,
                      hipStream_t stream);
 
 /* Prefill GEMM family. launch_gemm_wmma_f32out accepts every supported weight
- * dtype and FP32 activations. launch_gemm_blas_f16 is the rocBLAS baseline and
- * requires FP16 activations; it returns 0 on success or a rocBLAS status. */
+ * dtype and FP32 activations. launch_gemm_blas_f16 is the rocBLAS route: FP16
+ * weights, FP16 activations, FP32 compute, and an FP16 output scratch that this
+ * call casts to the FP32 result. rocBLAS therefore accumulates in FP32 and
+ * rounds only the result. It returns 0 on success or a rocBLAS status. */
 void launch_gemm_wmma_f32out(float * out, const float * x, const void * w,
                              uint64_t n_in, uint64_t n_out, uint64_t batch,
                              uint32_t dtype, hipStream_t stream);
@@ -72,11 +74,23 @@ void launch_gemm_wmma_swiglu_f32out(float * out, const float * x,
                                     const void * w_gate, const void * w_up,
                                     uint64_t n_in, uint64_t n_out, uint64_t batch,
                                     uint32_t dtype, hipStream_t stream);
-int launch_gemm_blas_f16(float * out, const void * x, const void * w,
+int launch_gemm_blas_f16(float * out, void * out16, const void * x16, const void * w,
                          uint64_t n_in, uint64_t n_out, uint64_t batch,
                          hipStream_t stream);
 void launch_cast_f32_to_f16(void * dst, const float * src, uint64_t n,
                             hipStream_t stream);
+void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,
+                            hipStream_t stream);
+
+/* Dequantizes a packed K-quant weight matrix into FP16.
+ *
+ * dst holds n_in*n_out FP16 elements. src holds the packed [n_out, n_in] matrix
+ * with the dtype's row stride. The decoded values are bit-identical to the
+ * values the rocWMMA path stages for the same tile, so only the accumulation
+ * differs. Only Q4_K, Q5_K, and Q6_K are supported; an unknown dtype writes
+ * nothing. */
+void launch_dequant_f16(void * dst, const void * w, uint64_t n_in, uint64_t n_out,
+                        uint32_t dtype, hipStream_t stream);
 
 void launch_rmsnorm_f32(float * dst, const float * src, const float * weight,
                         int64_t n, float eps, hipStream_t stream);

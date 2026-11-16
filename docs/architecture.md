@@ -300,6 +300,17 @@ on the assumption that zero-copy access is optimal.
 | **Staging** | Host/device transfer buffers | Transient | Reused; explicit synchronization |
 | **Graph workspace** | Stable-address buffers for replay | Session lifetime | Address stability is required while a captured graph is installed |
 
+Prefill scratch is part of the activation pool and is sized from the model
+configuration when the chunk size changes. `xF16` holds the chunk activations
+cast to FP16, `yF16` holds the widest FP16 matmul result, and `wF16` holds the
+largest dequantized K-quant weight matrix the prefill matmuls read; the last two
+exist for the rocBLAS prefill route, which writes FP16 results and expands one
+weight tile per call. `token_embd` and `output` are excluded from the weight
+scratch size because the embedding op gathers the first and only the single-row
+LM head reads the second. Ownership stays with the model's prefill scratch, and
+`configurePrefill` reallocates all three together so a plan never outlives the
+buffer it references.
+
 ### 7.3 KV cache summary
 
 Current implementation: CPU and HIP use paged KV pools addressed by allocator

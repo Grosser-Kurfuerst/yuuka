@@ -750,15 +750,18 @@ type GemmPath uint32
 const (
 	// GemmAuto uses the compiled default for the dtype.
 	GemmAuto GemmPath = 0
-	// GemmBLAS is the rocBLAS FP16 baseline and requires an FP16 x buffer.
-	GemmBLAS GemmPath = 1
 	// GemmWMMA is the custom rocWMMA kernel with FP32 activations.
 	GemmWMMA GemmPath = 2
+
+	// gemmPathBLAS is the rocBLAS route. It is not part of the public path
+	// selection: it needs an FP16 output scratch in addition to FP16 weights and
+	// activations, so it is only appended through AddGemmBlasAt.
+	gemmPathBLAS GemmPath = 1
 )
 
 // AddGemmPathAt appends a GEMM with an explicit implementation path and byte
-// offsets. Path GemmBLAS requires dtype F16 and an FP16 input buffer. Path
-// GemmWMMA accepts FP32 input and every supported weight dtype.
+// offsets. Only GemmAuto and GemmWMMA are accepted here; the rocBLAS route is
+// appended with AddGemmBlasAt because it needs an FP16 output scratch.
 func (p *Plan) AddGemmPathAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut, batch int64, dtype tensor.DType, path GemmPath) error {
 	if nIn <= 0 || nOut <= 0 || batch <= 0 {
 		return errors.New("hip: GEMM dimensions must be positive")
@@ -766,10 +769,7 @@ func (p *Plan) AddGemmPathAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out
 	if err := checkGemvDType(dtype, nIn); err != nil {
 		return err
 	}
-	if path == GemmBLAS && dtype != tensor.F16 {
-		return fmt.Errorf("hip: rocBLAS GEMM requires F16 weights, got %s", dtype)
-	}
-	if path > GemmWMMA {
+	if path != GemmAuto && path != GemmWMMA {
 		return fmt.Errorf("hip: unknown GEMM path %d", path)
 	}
 	if err := p.check(w, x, out); err != nil {
@@ -787,6 +787,89 @@ func (p *Plan) AddGemmPathAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out
 	op.n[2] = C.uint64_t(batch)
 	op.u[0] = C.uint32_t(dtype)
 	op.u[1] = C.uint32_t(path)
+	return p.add(op)
+}
+
+// AddGemmBlasAt appends a rocBLAS GEMM. w holds FP16 weights, x16 holds
+// batch*nIn FP16 activations, and out16 is an FP16 scratch of nOut*batch
+// elements that receives the product before it is cast into out. rocBLAS
+// accumulates in FP32 and rounds each output once, so only the FP16 form of the
+// result is lost.
+func (p *Plan) AddGemmBlasAt(w *Buffer, wOff uint64, x16, out16, out *Buffer, outOff uint64, nIn, nOut, batch int64) error {
+	if nIn <= 0 || nOut <= 0 || batch <= 0 {
+		return errors.New("hip: GEMM dimensions must be positive")
+	}
+	if err := p.check(w, x16, out16, out); err != nil {
+		return err
+	}
+	want, err := tensor.F16.RowBytes(nIn)
+	if err != nil {
+		return fmt.Errorf("hip: rocBLAS GEMM shape: %w", err)
+	}
+	if wOff > w.bytes || int64(want)*nOut > int64(w.bytes-wOff) {
+		return fmt.Errorf("hip: rocBLAS GEMM weight buffer holds %d bytes, want %d",
+			w.bytes-wOff, int64(want)*nOut)
+	}
+	if batch*nIn*2 > int64(x16.bytes) {
+		return fmt.Errorf("hip: rocBLAS GEMM activation buffer holds %d bytes, want %d",
+			x16.bytes, batch*nIn*2)
+	}
+	if nOut*batch*2 > int64(out16.bytes) {
+		return fmt.Errorf("hip: rocBLAS GEMM scratch buffer holds %d bytes, want %d",
+			out16.bytes, nOut*batch*2)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMM}
+	op.off[0] = C.uint64_t(wOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.buf[0] = w.ptr
+	op.buf[1] = x16.ptr
+	op.buf[2] = out.ptr
+	op.buf[3] = out16.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(batch)
+	op.u[0] = C.uint32_t(tensor.F16)
+	op.u[1] = C.uint32_t(gemmPathBLAS)
+	return p.add(op)
+}
+
+// AddDequantF16At appends a dequantization of one packed K-quant weight matrix
+// into dst. dst must hold nIn*nOut FP16 elements; the decoded values match the
+// tiles the WMMA path stages, so only the accumulation differs downstream.
+func (p *Plan) AddDequantF16At(src *Buffer, srcOff uint64, dst *Buffer, nIn, nOut int64, dtype tensor.DType) error {
+	if nIn <= 0 || nOut <= 0 {
+		return errors.New("hip: dequant dimensions must be positive")
+	}
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+	default:
+		return fmt.Errorf("hip: dequant supports K-quants only, got %s", dtype)
+	}
+	if nIn%256 != 0 {
+		return fmt.Errorf("hip: dequant input width %d is not a multiple of 256", nIn)
+	}
+	if err := p.check(src, dst); err != nil {
+		return err
+	}
+	rowBytes, err := dtype.RowBytes(nIn)
+	if err != nil {
+		return fmt.Errorf("hip: dequant shape: %w", err)
+	}
+	if srcOff > src.bytes || int64(rowBytes)*nOut > int64(src.bytes-srcOff) {
+		return fmt.Errorf("hip: dequant source holds %d bytes, want %d",
+			src.bytes-srcOff, int64(rowBytes)*nOut)
+	}
+	if nIn*nOut*2 > int64(dst.bytes) {
+		return fmt.Errorf("hip: dequant destination holds %d bytes, want %d",
+			dst.bytes, nIn*nOut*2)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_DEQUANT_F16}
+	op.off[0] = C.uint64_t(srcOff)
+	op.buf[0] = src.ptr
+	op.buf[1] = dst.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.u[0] = C.uint32_t(dtype)
 	return p.add(op)
 }
 

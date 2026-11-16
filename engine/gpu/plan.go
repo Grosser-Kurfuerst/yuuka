@@ -19,8 +19,17 @@ func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint
 		if err := plan.AddCastF16At(x, xOff, m.prefill.xF16, 0, rows*nIn); err != nil {
 			return err
 		}
-		return plan.AddGemmPathAt(w.buf, 0, m.prefill.xF16, 0, out, outOff,
-			nIn, nOut, rows, w.dtype, hip.GemmBLAS)
+		return plan.AddGemmBlasAt(w.buf, 0, m.prefill.xF16, m.prefill.yF16, out,
+			outOff, nIn, nOut, rows)
+	case hip.PrefillDequantBLAS:
+		if err := plan.AddDequantF16At(w.buf, 0, m.prefill.wF16, nIn, nOut, w.dtype); err != nil {
+			return err
+		}
+		if err := plan.AddCastF16At(x, xOff, m.prefill.xF16, 0, rows*nIn); err != nil {
+			return err
+		}
+		return plan.AddGemmBlasAt(m.prefill.wF16, 0, m.prefill.xF16, m.prefill.yF16,
+			out, outOff, nIn, nOut, rows)
 	default:
 		return plan.AddGemmPathAt(w.buf, 0, x, xOff, out, outOff,
 			nIn, nOut, rows, w.dtype, hip.GemmWMMA)
