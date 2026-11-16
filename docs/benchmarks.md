@@ -483,6 +483,75 @@ Resource report for the two selected variants:
 | `gemm_wmma_kernel<Q4_K,64,2>` | 72 | 29 | 32,768 B | 0 | 16 waves/SIMD | 0 |
 | `gemm_wmma_k32_kernel<Q4_K>` | 48 | 30 | 14,336 B | 0 | 16 waves/SIMD | 0 |
 
+### Prefill GEMM span decode (2026-11-16)
+
+The weight loader in both rocWMMA kernels decodes one contiguous span per
+thread instead of one element, and the 64x64 tile now stages a 32-wide K step,
+16 KiB of shared memory instead of 32 KiB. Environment: `gfx1151`, the pinned
+ROCm/HIP toolchain, `Qwen3.5-4B-Q4_K_M.gguf` for the end-to-end number and
+in-process random weights for the isolated GEMM, FP32 activations, one stream,
+no concurrent work.
+
+Two isolation protocols were run on the same binary pair (the
+`libyuuka_hip.so` built before and after the change, selected with
+`LD_PRELOAD`):
+
+- `bench/hip/prefill_sweep`: two warmups and five measured submissions per
+  shape, exactly as committed; each binary was run three times and the per-shape
+  median is reported.
+- Focused A/B: five warmups and 40 measured submissions per shape (200 for the
+  small-batch checks), two passes.
+
+`bench/hip/prefill_sweep`, milliseconds per submission, `M = 512`:
+
+| Shape | Q4_K | Q5_K | Q8_0 | Q6_K | F16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2560 → 9216 | 5.60 → 2.78 | 6.26 → 2.89 | 5.46 → 2.81 | 6.23 → 4.78 | 6.86 → 5.24 |
+| 2560 → 8192 | 4.93 → 2.45 | 5.47 → 2.69 | 4.63 → 2.39 | 5.45 → 4.23 | 6.08 → 5.24 |
+| 9216 → 2560 | 5.58 → 2.91 | 6.23 → 3.16 | 4.26 → 2.91 | 6.25 → 6.05 | 6.13 → 7.28 |
+
+Q4_K improves 48-50%, Q5_K 49-54%, Q8_0 32-49%, Q6_K 3-23%, and F16 14% on both
+wide shapes. The sweep's five-submission window is too short for the 0.4-1 ms
+shapes and for the 7 ms F16 tall-K shape, so four shapes it reports as
+regressions were re-measured with 200 submissions after ten warmups:
+
+| Shape | Baseline | New | Change |
+| --- | ---: | ---: | ---: |
+| Q6_K 9216 → 2560, M=16 | 0.718 | 0.702 | 2.2% faster |
+| Q6_K 9216 → 2560, M=32 | 0.812 | 0.807 | 0.6% faster |
+| Q6_K 9216 → 2560, M=512 | 6.348 | 5.795 | 9.7% faster |
+| Q6_K 2560 → 9216, M=16 | 0.438 | 0.422 | 3.7% faster |
+| F16 8192 → 2560, M=8 | 0.840 | 0.782 | 7.4% faster |
+| F16 9216 → 2560, M=16 | 1.244 | 1.107 | 11.0% faster |
+| F16 9216 → 2560, M=512 | 7.472 | 7.438 | 0.5% faster |
+
+The sweep under-reports the F16 tall-K baseline (6.13 ms against the 7.47 ms
+steady-state value), which is what produced the apparent 19% regression there.
+The remaining sweep variance at small `M` is clock-state noise: the same kernel
+binary reproduces within 2% under the longer protocol. F32, F16, and Q6_K run
+the element mapping in both binaries, so their kernels are unchanged apart from
+the shared helper signature.
+
+End-to-end, same model, backend, KV format, chunk size, and repetition count as
+the 2026-11-15 tables, `--prompt-tokens 512 --decode-tokens 1 --warmup 1
+--reps 3 --chunk-size 512`:
+
+| Measurement | 2026-11-15 build | 2026-11-16 build |
+| --- | ---: | ---: |
+| Prefill p50 | 0.940 s | 0.581 s |
+| Prefill rate p50 | 544.3 tok/s | 880.8 tok/s |
+| TTFT p50 | 0.940 s | 0.581 s |
+
+That is 38% lower TTFT and 62% higher prefill throughput, above the 10% gate and
+above the 750 tok/s stretch target. Correctness is unchanged: `ctest` passes
+9/9, and `TestGPUChunkedPrefillLongContext` keeps top-1 token 33075 with a zero
+logit difference against the CPU reference at chunk sizes 128, 512, and 1024.
+
+The sweep was not re-tuned for this change. Because its five-submission window
+cannot separate a 2% kernel change from clock-state noise at small shapes,
+dispatch decisions that depend on a few percent should use a longer protocol
+like the focused A/B above.
+
 ### Prefill attention tiling (2026-11-15)
 
 The prefill attention kernels now process 16 query rows per workgroup with 512

@@ -215,13 +215,13 @@ the measured F16 shape classes, not a fallback for unsupported quantization.
 
 ### 6.2 Custom WMMA GEMM
 
-Two rocWMMA tile variants share the packed-load helper and are selected inside
+Two rocWMMA tile variants share the packed-load helpers and are selected inside
 `launch_gemm_wmma_f32out` from the measured row and shape class:
 
 - `gemm_wmma_k32_kernel`: 32x64 output tile, eight waves, one 16x16 fragment
   per wave, 32-wide K step. This is the original Phase 3 kernel.
-- `gemm_wmma_kernel<DType, 64, 2>`: 64x64 output tile, eight waves, one A
-  fragment and two B fragments per wave, 64-wide K step with double-buffered
+- `gemm_wmma_kernel<DType, 64, 2, 32>`: 64x64 output tile, eight waves, one A
+  fragment and two B fragments per wave, 32-wide K step with double-buffered
   shared-memory staging. One decoded weight tile feeds two accumulator
   fragments and 64 activation rows.
 
@@ -229,26 +229,53 @@ Both variants:
 
 1. Load the FP32 `X` tile and convert it to FP16 in shared memory.
 2. Stream and decode the weight tile directly into the FP16 shared tile, one
-   32-value quantization sub-block at a time.
+   contiguous span per thread.
 3. Accumulate in FP32 with 16x16x16 WMMA operations.
 4. Stage the FP32 accumulator tile in shared memory and write only valid
    output elements, so non-aligned `M` and `N` edges are safe.
 
-A 64-wide K step consumes two 32-value segments in order. Each segment keeps
-its own Q4_K/Q5_K scale and min pair, or its two 16-value Q6_K scales, so a
-segment never crosses a scale boundary. No dequantized weight matrix is
-materialized. `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, and `F32` share the tile
-path; only the packed-load helper differs.
+`load_b_tile` gives each of the 64 weight rows four threads, so one thread
+decodes a contiguous span of 8 values at a 32-wide K step (16 at a 64-wide
+step). A span stays inside one 32-value quantization segment, so the block
+header, scale, and min are loaded once per span. Q4_K and Q5_K read their
+packed values with `uint2`/`uint4` global loads: their row byte sizes are
+multiples of 16 and the span offsets are 8/16-byte aligned by construction.
+Decoded halves are written straight to the shared tile, so no span is staged in
+registers or scratch. An earlier version that buffered the span in a local
+array spilled 48 B/lane to scratch and lost 6-12% on the wide 512-row shapes,
+so the direct shared-memory write is the accepted form. Q4_0, Q5_0, and Q8_0
+decode the span with scalar loads.
 
-The 64x64 variant is selected for `rows >= 64` when `K <= N`; the 32x64 variant
-remains selected for tall-K projections and smaller batches. This rule comes
-from the 2026-11-15 sweep: the 64x64 tile improved wide 512-row shapes by 3-7%
-and did not win for `K > N`, where the 32x64 tile is 5-20% faster. The
-double-buffered variant reports 64-75 VGPRs, 28-34 SGPRs, 32 KiB static LDS, no
-spills, and 16 waves/SIMD. The 32x64 variant reports 39-50 VGPRs, 26-34 SGPRs,
-14 KiB static LDS, no spills, and 16 waves/SIMD. The isolated improvements did
-not move the 512-row chunk GEMM total outside run-to-run noise (944 ms before,
-895 ms after in the last diagnostic), so the 500 ms workstream gate is not met.
+F32, F16, and Q6_K keep the element mapping, in which consecutive lanes read
+consecutive row bytes. They have no block header worth hoisting above the
+per-value cost, and the span walk measured slower for them: Q6_K lost up to 54%
+on small batches and F16 lost 12-16% on tall-K shapes, because a thread's bytes
+are then strided across rows instead of coalesced across lanes. Q6_K row stride
+210 also rules out aligned vector loads. No dequantized weight matrix is
+materialized; every supported dtype shares the tile path and differs only in
+the packed-load helper.
+
+The 64x64/K32 variant is selected for `rows >= 64` when `K <= N`; the 32x64
+variant remains selected for tall-K projections and smaller batches. Tall-K was
+re-measured with the span loader instead of assumed: at `M = 64` and `M = 128`
+the 64-row tile costs 40-90% on F16 and Q6_K tall-K and about 10% on Q4_K,
+because halving the output columns per CTA doubles the number of CTAs that hide
+the long K loop. At `M = 512` tall-K the two tiles are within 10%, so the 32x64
+tile stays for every `K > N` shape. A 64-wide K step was also measured for the
+64x64 tile and is 15-30% slower than the 32-wide step with the span loader
+(Q4_K 2560 -> 9216 at `M = 512`: 3.3 ms against 2.85 ms), so only `BlockK = 32`
+is instantiated.
+
+The 64x64/K32 kernel stages 16 KiB, so four CTAs fit the 64 KiB LDS of a CU
+instead of two for the previous 32 KiB, 64-wide staging, and reports 84-86
+VGPRs, 28-48 SGPRs, no spills, no scratch, and 16 waves/SIMD. The 32x64 variant
+reports 42-43 VGPRs, 25-46 SGPRs, 14 KiB static LDS, no spills, and 16
+waves/SIMD. Measured on 2026-11-16 with the same binary pair, `M = 512` shapes
+improve 48-50% for Q4_K, 49-54% for Q5_K, 32-49% for Q8_0, 3-23% for Q6_K, and
+14-27% for F16, and the 512-token prefill moves from 544 to 881 tok/s. See
+[benchmarks.md](benchmarks.md#prefill-gemm-span-decode-2026-11-16). The 500 ms
+chunk GEMM gate is still not met, but the wide Q4_K shape now runs at 8.5
+TFLOP/s instead of the 4.6-4.7 TFLOP/s the earlier tile reported.
 
 A CTA-order experiment that mapped consecutive blocks to M tiles was measured
 and rejected: it reduced the tall-K time but raised the wide-projection time,
@@ -293,13 +320,14 @@ from assumptions about other RDNA parts.
 The isolated GEMM is weight-reuse limited: with a 32-row M tile, each
 workgroup reloads the weight tile, so a 512-row chunk reads every weight tile
 16 times. The 64-row tile halves that for wide projections at large row counts.
-The 2026-11-15 measurements put a 512-token prompt at 516 tok/s, versus
-llama.cpp HIP at about 2163 tok/s on the same GGUF and device. In the
-position-0 chunk attribution, GEMM is 895 ms (87%), the gated delta-net chunk
-is 63.7 ms, and prefill attention is 17.8 ms; attention dominates at long
-positions and was reduced from 2030 ms to 643 ms at position 7680. The ordered
-optimization plan and its per-workstream status are in
-[roadmap2.md](roadmap2.md).
+The 2026-11-15 measurements put a 512-token prompt at 516 tok/s; the
+2026-11-16 span-decoding build measures 881 tok/s on the same GGUF and device,
+against llama.cpp HIP at about 2163 tok/s. The per-operation split was not
+re-profiled for the 2026-11-16 change, so the 2026-11-15 attribution still
+describes it: GEMM 895 ms (87%), the gated delta-net chunk 63.7 ms, and prefill
+attention 17.8 ms. Attention dominates at long positions and was reduced from
+2030 ms to 643 ms at position 7680. The ordered optimization plan and its
+per-workstream status are in [roadmap2.md](roadmap2.md).
 
 ## 7. Attention
 

@@ -38,7 +38,7 @@ in the same change.
 | --- | --- | --- |
 | A1-A3 | Implemented | Recurrent chunk 551 → 67.6 ms |
 | A4 | Not needed | A1-A3 met the 150 ms gate |
-| B1-B2 | Partially implemented | 64x64/K64 tile for wide rows; chunk GEMM 944 → 895 ms before fusion |
+| B1-B2 | Partially implemented | 64x64/K32 tile for wide rows with the shared span loader; isolated `M=512` GEMM 48-54% faster |
 | B3 | Rejected | M-first CTA order regressed the chunk total |
 | B4 | Rejected | FP16 and INT8 WMMA issue at the same rate; kernel is not operand bound |
 | B5 gate/up | Implemented | Chunk 994 → 938 ms; 512-token 515.9 → 549.8 tok/s |
@@ -48,11 +48,12 @@ in the same change.
 | C4 | Not used | Native tile path met the F32 gate; no rocWMMA attention |
 | D | Implemented | Path names, per-op profile, no autotuner |
 
-The full 512-token chunk is 938 ms wall at position 0, down from 1553 ms. The
-512-token prefill rate is 549.8 tok/s, the 8192 rate is 412.6 tok/s, and the
-32768 rate is 209.3 tok/s. The 450 ms step-4 chunk target and the 250 tok/s
-32768 target are not met; the remaining gap is the GEMM kernel structure, not
-the stages implemented here.
+The full 512-token chunk is 581 ms wall at position 0, down from 1553 ms. The
+512-token prefill rate is 880.8 tok/s; the 8192 and 32768 rates (412.6 and
+209.3 tok/s) were not re-measured after the 2026-11-16 loader change, and the
+2048 rate was last measured at 511.0 tok/s. The 450 ms step-4 chunk target and
+the 250 tok/s 32768 target are not met; the remaining gap is the GEMM kernel
+structure, not the stages implemented here.
 
 ## 2. Baseline attribution
 
@@ -353,6 +354,20 @@ is therefore applied as written: it was not accepted. The gate/up part of B5 is
 implemented in section 4.8; B4 is rejected in section 4.9, and the remaining
 B5 fusions are unstarted. See
 [benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
+
+A 2026-11-16 follow-up replaced the loader: it decodes one contiguous span per
+thread, hoists the block header per span, and reads Q4_K/Q5_K spans with
+`uint2`/`uint4` loads. Both kernels share it, the 64x64 tile stages a 32-wide K
+step (16 KiB, four CTAs per LDS CU), and the element-at-a-time decoder is gone.
+Isolated `M = 512` shapes improved 48-54% for Q4_K/Q5_K, 32-49% for Q8_0, 3-23%
+for Q6_K, and 14% on the wide F16 shapes, which lifts the wide Q4_K shape from
+4.6 to 8.5 TFLOP/s. The 512-token prefill moves from 544 to 881 tok/s and TTFT
+from 0.940 s to 0.581 s. The 64-row tile was measured again for tall-K and still
+loses at `M = 64`/`M = 128` by 40-90% for F16 and Q6_K, so the `K <= N`
+condition stays; a 64-wide K step for the 64x64 tile measured 15-30% slower than
+32-wide and is not instantiated. The gate/up fused kernel is unchanged. The
+500 ms GEMM gate is still not met. See
+[benchmarks.md](benchmarks.md#prefill-gemm-span-decode-2026-11-16).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)
 

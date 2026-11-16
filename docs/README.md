@@ -127,8 +127,9 @@ Implemented and tested:
   with per-chunk KV writes, and the measured `SelectPrefillPath` dispatch
   table.
 - A split-register gated delta-net chunk kernel that keeps the recurrent state
-  resident for the whole chunk. The 512-token prefill rate improved from 313 to
-  550 tok/s, and position-7680 attention dropped from 2030 ms to 643 ms; the
+  resident for the whole chunk. With the span-decoding prefill GEMM the
+  512-token prefill rate is 881 tok/s, up from 313 tok/s before the delta-net
+  and GEMM work, and position-7680 attention dropped from 2030 ms to 643 ms; the
   measured status is in [roadmap2.md](roadmap2.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
