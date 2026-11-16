@@ -962,6 +962,87 @@ The 32768 result is essentially unchanged from the pre-fusion C measurement
 (208.9 tok/s): at that length attention dominates and the FFN pair is a smaller
 share of the chunk.
 
+### Prefill gap closure: Q6_K span loader, parallel convolution, grouped attention (2026-11-16)
+
+Same machine, GGUF, and protocol as the sections above: `yuuka bench --backend
+hip`, `--chunk-size 512`, sequential runs, `--warmup 2 --reps 5` at 512 tokens
+and `--warmup 1 --reps 2` at 8192. llama.cpp `b1b770d90` (build 12359) reports
+`pp512 = 2174.81 ± 35.77 t/s` and `pp8192 = 1974.74 ± 18.98 t/s`
+(`llama-bench -m <gguf> -p 512,8192 -n 0 -r 3 -ngl 99`).
+
+| Change | 512 p50 | 8192 p50 | 8192 tok/s |
+| --- | ---: | ---: | ---: |
+| Before | 0.472 s / 1085 tok/s | 12.688 s | 646 |
+| Q6_K span loader | 0.444 s / 1154 tok/s | — | — |
+| Parallel chunk convolution | 0.423 s / 1209 tok/s | 11.694 s | 701 |
+| Grouped prefill attention | 0.423 s / 1209 tok/s | 11.056 s | 741 |
+
+The 512-token rows are 49 ms faster than the starting point, 11% more
+throughput, and the 8192-token row is 15% faster. Neither row reaches
+llama.cpp's 2175/1975 tok/s.
+
+Per-operation split from `TestGPUProfilePrefill` (512 rows, F32 KV, HIP events
+around every plan operation), before against after:
+
+| Component | Position 0 before | Position 0 after | Position 7680 before | Position 7680 after |
+| --- | ---: | ---: | ---: | ---: |
+| Matmul (`gemm`) | 373.3 ms (248) | 293.4 ms (248) | 372.6 ms | 284.9 ms |
+| Gated delta-net chunk | 66.3 ms | 50.2 ms | 66.7 ms | 50.2 ms |
+| Prefill attention | 18.0 ms | 19.5 ms | 614.8 ms | 561.7 ms |
+| Q6_K dequant (`dequant_f16`) | 36.0 ms (179) | 26.1 ms (120) | 35.8 ms | 26.2 ms |
+| F16 cast (`cast_f16`) | 11.7 ms | 11.5 ms | 11.5 ms | 11.5 ms |
+| Total (profiled) | 480.1 ms | 421.9 ms | 1025.1 ms | 952.2 ms |
+
+The matmul total falls even though the Q6_K kernel itself is faster, because 59
+of the 179 K-quant calls now take the measured-fastest path for their shape: the
+engine re-measures the isolated per-shape timings, and the improved WMMA Q6_K
+kernel wins shapes that the dequant route used to hold.
+
+Isolated Q6_K cells from `yuuka_prefill_sweep` (`wmma` column, same binary pair):
+
+| Shape | Before | After |
+| --- | ---: | ---: |
+| `M=512 N=2560 K=9216` | 6.115 ms | 3.589 ms |
+| `M=512 N=9216 K=2560` | 4.882 ms | 3.175 ms |
+
+Decoder gates for this round, and their outcome:
+
+| Gate | Target | Measured | Result |
+| --- | --- | --- | --- |
+| Tall K-quant dequant route | max logit diff <= 0.045, top-1 33075 | Q4_K 0.047 (FFN down only), 0.061 (whole tall class); Q5_K 0.079 | rejected, route removed |
+| Q6_K loader | isolated tall cell <= 4.5 ms | 3.589 ms | met, (-41%) |
+| Gated delta-net chunk | `recurrent_chunk` <= 40 ms | 50.2 ms | not met; convolution 26.4 -> 8.7 ms kept, recurrence restored |
+| Grouped attention | position-7680 attention <= 450 ms | 561.7 ms | not met, (-9%); kernel kept because staging is only 70 ms of the old 615 ms |
+| 512-token prefill | <= 0.340 s, else >= 35 ms below 0.480 s | 0.423 s | met on the fallback gate (-49 ms) |
+| 8192-token prefill | >= 750 tok/s | 741 tok/s | not met (-1.2%) |
+| Greedy tokens and chunk invariance | same top-1, max logit diff <= 0.045 | top-1 33075, 0.0419 (baseline 0.042) | met |
+
+Two rewrite attempts were measured and rejected on correctness, not speed. An
+eight-lane split of the recurrent column (16 state rows per lane, 256
+workgroups) reduces `recurrent_chunk` to 27.0 ms, but the reduction reassociates
+the per-column dot products and the 1024-token chunk gate moves from 0.042 to
+0.081 logits; a four-lane variant with pre-normalized q/k, one block barrier per
+row, and shuffle-derived decay and beta preserves the summation order and
+measures 0.0419 on the same gate, but it is no faster than the in-kernel form
+(40.3 ms against 39.9 ms), so the original kernel stayed. The grouped attention
+kernel keeps the reference at 4.1e-07 maximum absolute difference on a native
+2048-position case and is bit-identical to the one-head kernel on the 1024-token
+chunk gate.
+
+Reproduction:
+
+```bash
+MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf
+go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
+/tmp/yuuka-hip bench --model "$MODEL" --backend hip --prompt-tokens 512 \
+  --decode-tokens 1 --warmup 2 --reps 5 --chunk-size 512
+/tmp/yuuka-hip bench --model "$MODEL" --backend hip --prompt-tokens 8192 \
+  --decode-tokens 1 --warmup 1 --reps 2 --chunk-size 512
+YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
+  -run TestGPUProfilePrefill -v -count=1
+./build/yuuka_prefill_sweep | grep Q6_K
+```
+
 ### Short-prompt latency and correctness
 
 The Phase 2 baseline at the top of this document submitted 16 prompt tokens

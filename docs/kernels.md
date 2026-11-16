@@ -246,14 +246,27 @@ array spilled 48 B/lane to scratch and lost 6-12% on the wide 512-row shapes,
 so the direct shared-memory write is the accepted form. Q4_0, Q5_0, and Q8_0
 decode the span with scalar loads.
 
-F32, F16, and Q6_K keep the element mapping, in which consecutive lanes read
+Q6_K decodes four values per thread from one `ql` word and one `qh` word
+(`q6k_span4`), which retires the per-value byte loads of the element mapping.
+The group shares one scale byte and one block header, and its four values always
+sit in one 32-value segment, so the 16-bit halves of the two words are all the
+block reads it needs. A block is 210 bytes, so the words are assembled from two
+16-bit loads: a 32-bit load would be undefined-aligned on the odd blocks. Eight
+lanes cover one 64-column row and a pass stages 32 rows. This replaced the
+element mapping for Q6_K, which measured 6.115 ms on `9216 -> 2560` at `M = 512`
+and 4.882 ms on `2560 -> 9216`; the span loader measures 3.589 ms and 3.175 ms
+on the same cells, and the earlier span walk's 54% regression on small batches
+does not recur because the span now amortizes the header over four values
+instead of eight. The decoded values are bit-identical to `q6k_value`, so the
+chunk gate did not move.
+
+F32 and F16 keep the element mapping, in which consecutive lanes read
 consecutive row bytes. They have no block header worth hoisting above the
-per-value cost, and the span walk measured slower for them: Q6_K lost up to 54%
-on small batches and F16 lost 12-16% on tall-K shapes, because a thread's bytes
-are then strided across rows instead of coalesced across lanes. Q6_K row stride
-210 also rules out aligned vector loads. This kernel never materializes a
-dequantized weight matrix: every supported dtype shares the tile path and
-differs only in the packed-load helper. The separate rocBLAS route does
+per-value cost, and the span walk measured 12-16% slower for F16 on tall-K
+shapes because a thread's bytes are then strided across rows instead of
+coalesced across lanes. This kernel never materializes a dequantized weight
+matrix: every supported dtype shares the tile path and differs only in the
+packed-load helper. The separate rocBLAS route does
 materialize one FP16 weight tile per call, in a caller-owned scratch sized from
 the largest quantized matrix, and it is used only for the wide K-quant class
 described below.
@@ -350,11 +363,11 @@ halves that, but halving it again with the measured 128-row tile only bought
 bound: 114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS.
 The 2026-11-15 measurements put a 512-token prompt at 516 tok/s; the
 2026-11-16 span-decoding build measures 881 tok/s on the same GGUF and device,
-against llama.cpp HIP at 2163 tok/s for the 2026-11-14 baseline and 2216 tok/s
-for the current build. The per-operation split was not re-profiled for the
-2026-11-16 loader change, and the 2026-11-16 gap attribution supersedes the
-2026-11-15 numbers: matmul 476 ms, the gated delta-net chunk 67 ms, and prefill
-attention 19 ms. Attention dominates at long positions and was reduced from
+and the Q6_K span loader plus the parallel convolution measure 1209 tok/s on a
+512-token prompt, against llama.cpp HIP at 2175 tok/s for the 512-token row of
+the current reference build. The 2026-11-16 split is matmul 293 ms, the gated
+delta-net chunk 50 ms, and prefill attention 19 ms at position 0 and 562 ms at
+position 7680. Attention dominates at long positions and was reduced from
 2030 ms to 643 ms at position 7680. The ordered optimization plan and its
 per-workstream status are in [roadmap2.md](roadmap2.md).
 
@@ -427,6 +440,20 @@ staged K row and each V read through the block table. `launch_kv_write_paged_f32
 and `launch_kv_write_paged_dynamic_f32` map written positions through the same
 table; the batch case is selected by the row count, not a separate kernel name.
 
+`attention_prefill_paged_gqa_f32_kernel` runs the four query heads that share one
+KV head in one workgroup, so a staged K/V tile serves all four instead of being
+reloaded by four workgroups. Each of the 16 waves owns one head and four of the
+block's 16 query rows; the tile layout, staging walk, and online-softmax update
+are the ones the one-head kernel uses, applied to the four rows independently
+with their own causal stops. It is selected only when `heads / kv_heads == 4`
+and `position + rows >= 2048`: below that the staging cost is small and the
+larger workgroup count of the one-head kernel wins, so a 512-token prompt at
+position 0 is unchanged. Position 7680 attention in the 512-row profile moved
+from 615 ms to 562 ms and the 8192-token prefill from 700 to 741 tok/s. The
+saving is bounded by the score and value arithmetic, which is unchanged: staging
+is only 70 ms of the 615 ms at that position, so the measured 562 ms is above
+the 450 ms this kernel was expected to reach.
+
 ### 7.3 KV cache formats
 
 The paged KV family accepts an F32, F16, or Q8_0 pool selected by the plan. The
@@ -455,7 +482,10 @@ Current limits:
 
 - Q8_0 KV is supported but not faster than F32 at short context; its benefit is
   cache memory.
-- One workgroup per head; split-KV and WMMA attention are not implemented.
+- One workgroup per head, or per group of four query heads above 2048
+  positions; split-KV and WMMA attention are not implemented. Attention is
+  6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic at long context,
+  which is the remaining long-context gap.
 - No mixed prefill/decode batch. Each step belongs to one request plan.
 - Block-table entries are immutable for a request; all blocks are allocated at
   admission, so replay and kernels never observe a changing table.
@@ -510,9 +540,15 @@ traffic without reducing occupancy:
 - KV-write batching for a prompt chunk.
 - Prefill attention online softmax, value reduction, and attention gate.
 - Gated delta-net chunk: convolution state update, q/k L2 normalization, the
-  128x128 recurrent update, and gated RMSNorm per head. It replaces five
-  launches and one normalized intermediate per token with two launches per
-  layer. The register-resident path (`gdn_chunk_splitreg_f32_kernel`) covers
+  128x128 recurrent update, and gated RMSNorm per head. The convolution is a
+  plain `kernel-1`-tap FIR over the raw chunk, because the carry state holds
+  only the previous raw inputs, so one thread per output element replaces a
+  serial per-channel walk over the chunk; a second small kernel writes the
+  trailing raw inputs for the next chunk. That is four launches per layer on the
+  register path (convolution, carry state, recurrence, gated RMSNorm) against
+  three before, and the convolution dropped from 26.4 ms to 8.7 ms per 512-row
+  chunk, with the outputs unchanged because the tap summation order is the
+  same. The register-resident path (`gdn_chunk_splitreg_f32_kernel`) covers
   state size 128, where four lanes cooperate on one state column and each lane
   holds 32 of the 128 state rows in registers for the whole chunk. A layer
   exposes `heads * (state / 32)` workgroups instead of `heads` workgroups; q/k

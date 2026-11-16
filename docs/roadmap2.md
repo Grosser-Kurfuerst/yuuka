@@ -250,6 +250,29 @@ repeatability in `tests/hip/prefill_test.cpp`. The A1 time target (at most
 (1077 ms) because the GEMM path is unchanged. See
 [benchmarks.md](benchmarks.md#gated-delta-net-register-state-2026-11-15).
 
+### 3.7 Status (2026-11-16): chunk convolution
+
+`conv1d_chunk_f32_kernel` was a serial walk over the chunk, one thread per
+channel, with the carry state shifted in place. The carry state holds only the
+previous `kernel-1` raw inputs, so the output row is a plain `kernel-1`-tap FIR
+over the raw chunk and every `(row, channel)` pair is independent. It now runs
+one thread per output element, and a second small kernel (`conv1d_state_f32_kernel`)
+writes the trailing raw inputs for the next chunk; the tap summation order is
+unchanged, so the outputs are bit-identical. The recurrent-chunk op drops from
+66.3 ms to 50.2 ms per 512-row chunk: the convolution is 8.7 ms instead of
+26.4 ms, and the recurrence itself is unchanged at about 40 ms.
+
+The recurrence was re-examined in the same round and left alone. An eight-lane
+column split (16 state rows per lane, 256 workgroups) measures 27.0 ms for the
+whole op but reassociates the per-column dot products, which moves the
+1024-token chunk gate from 0.042 to 0.081 logits; a four-lane variant with
+pre-normalized q/k, one block barrier per row, and shuffle-derived decay and
+beta keeps the summation order and passes at 0.0419, but measures 40.3 ms
+against 39.9 ms for the in-kernel form. The 40 ms op target is therefore not met
+by any parity-preserving mapping measured so far. The phase-2 chunked form
+(`KK^T`, `QK^T`, the `(I + L)` solve, `K^T @ W`) is the remaining option that
+does not depend on reassociation.
+
 ## 4. Workstream B: prefill GEMM
 
 ### 4.1 Problem
@@ -452,6 +475,23 @@ does apply. llama.cpp's int8 MMQ kernel reaches 24.9 TFLOP/s against yuuka's 8.5
 TFLOP/s on the same device. See
 [benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
+### 4.10 Status (2026-11-16): Q6_K span loader and the tall-K route
+
+`q6k_span4` decodes four consecutive Q6_K values from one `ql` word and one
+`qh` word, assembled from 16-bit halves because a 210-byte block start is only
+2-byte aligned. The decoded values are bit-identical to `q6k_value`, and the
+isolated cells move from 6.115 ms to 3.589 ms on `9216 -> 2560` at `M = 512` and
+from 4.882 ms to 3.175 ms on `2560 -> 9216`. `tests/hip/prefill_test.cpp`
+covers the dtype; the chunk gate does not move.
+
+The tall-K dequant route stays rejected, now with chunk-gate evidence instead of
+the relative-error argument alone: Q4_K measures 0.047 logits for the FFN down
+projections and 0.061 for the whole tall class, Q5_K measures 0.079, and the
+gate accepts at 0.045. Q4_K for the FFN down projections alone clears the
+0.05 test bound, so the remaining numeric cost is concentrated in the K-split
+reduction of the `4096 -> 2560` output projection and in the FFN down shapes at
+1024-row batches.
+
 ## 5. Workstream C: prefill attention
 
 ### 5.1 Problem
@@ -533,6 +573,23 @@ identical logits at chunk sizes 128, 512, and 1024 with the same top-1 token,
 and the attention reference test passes at `2.98e-08` maximum absolute
 difference. See
 [benchmarks.md](benchmarks.md#prefill-attention-tiling-2026-11-15).
+
+### 5.8 Status (2026-11-16): grouped query heads above 2048 positions
+
+`attention_prefill_paged_gqa_f32_kernel` puts the four query heads that share
+one KV head into one workgroup, so a staged K/V tile serves four heads. Each of
+the 16 waves owns one head and four of the block's 16 rows. It is selected only
+when `heads / kv_heads == 4` and `position + rows >= 2048`, which keeps the
+short-prompt kernel unchanged. Position-7680 attention moves from 615 ms to
+562 ms and the 8192-token prefill from 700 to 741 tok/s; the native
+2048-position case passes at 4.1e-07 and the 1024-token chunk gate is unchanged.
+
+The 450 ms position-7680 target is not met. Staging is only 70 ms of the old
+615 ms, so the grouped tile removes most of the reload but the score and value
+arithmetic is unchanged and dominates: the kernel issues about 25 wave
+instructions per `(query row, key)` with a five-step shuffle reduction and two
+`expf` in a dependent chain, which measures about 6.5% of peak issue. Reaching
+450 ms needs the arithmetic restructured, not the tile.
 
 ## 6. Workstream D: dispatch and planning
 
@@ -633,7 +690,12 @@ Open questions:
 - Does int8 WMMA plus Q8 activation quantization stay inside the token-level
   correctness gate for Q4_K_M?
 - Can attention group the four query heads that share a KV head without
-  spilling the online-softmax accumulators?
+  spilling the online-softmax accumulators? Yes at four rows per wave (113-114
+  VGPRs, 12 waves/SIMD, no spills, see 5.8); the remaining long-context limit is
+  the per-key FP32 arithmetic, not the accumulators.
+- Does any gated delta-net remapping reach the 40 ms op target without
+  reassociating the per-column sum? Every reassociating variant measured so far
+  fails the 1024-token chunk gate (0.081 against 0.042).
 - Is the long-context gain from F16 KV stable across prompts and chunk sizes?
 - Would an int4 WMMA path for Q4_K pay off after the scales and mins are
   handled in the epilogue, or is int8 the practical stopping point?
