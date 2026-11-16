@@ -1617,3 +1617,83 @@ go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
 
 The benchmark tool reports P50 and P95 over the measured repetitions. It does
 not yet record power, clock, or thermal state.
+
+## 2026-11-17 gfx1151 Qwen3.5-4B Q4_K_M prefill tuning
+
+This is a fresh single-request A/B measurement of the exact validated Unsloth
+`Qwen3.5-4B-Q4_K_M.gguf` on the AMD Ryzen AI Max+ 395 (`gfx1151`, 40 CUs),
+inside a Debian Trixie Incus LXC on `aia2`. Model SHA-256:
+`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`.
+ROCm 10.1 layout, HIP 7.16.26385, Go 1.24.4, F32 KV, 512-token prefill
+chunks, one concurrent request, one warmup and three measured repetitions,
+median (`p50`) reported. Decode length was one token solely to isolate prefill.
+The original source baseline was commit `0db8406`; all variants used the same
+GGUF and GPU. These are observations, not guaranteed speedups: device clock,
+power, and thermal state were not pinned.
+
+| Prompt tokens | Original prefill (s) | Reused FFN activation cast, cache off (s) | Optional 3072 MiB FFN cache (s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 0.189 | 0.202 | 0.192 |
+| 512 | 0.491 | 0.431 | 0.609 |
+| 2048 | 2.745 | 2.808 | 2.728 |
+| 8192 | 15.610 | 15.193 | 15.143 |
+
+The one-pass comparisons are sensitive to changing power/clock conditions. To
+check the seemingly large 512-token effect, we also compiled the original and
+optimized Go sources into separate binaries linked against the *same* original
+HIP library and ran them in three interleaved cycles. Each row still includes
+one warmup and three repetitions:
+
+| Cycle | Original 512-token p50 (ms) | Optimized 512-token p50 (ms) |
+| ---: | ---: | ---: |
+| 1 | 530 | 489 |
+| 2 | 580 | 603 |
+| 3 | 595 | 566 |
+
+The cross-cycle medians are 580 and 566 ms (about 2.5%), with overlapping
+variation. **No large or consistent default-path improvement is established.**
+The source optimization nonetheless removes one redundant FP32-to-FP16 cast
+per FFN gate/up pair whenever both select the dequant+rocBLAS path.
+
+`YUUKA_PREFILL_F16_CACHE_MIB` explicitly reserves an upper limit of MiB for
+*only* FFN gate/up weights decoded into FP16 when opening a GPU model. It is
+disabled by default (`unset`, `0`). Supported values are 0-16384. The original
+quantized buffers remain loaded and continue to serve decode. The cache
+fills once per shared model and is released with it. `3072` fits this model's
+FFN gate/up weights but materially slows the 512-token case; **leave it off
+for ordinary requests**. Test it only after characterizing your workload and
+checking device memory headroom. Cache initialization latency is excluded
+from prefill measurements above.
+
+Example reproduction inside the development container:
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:/root/yuuka/build
+MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
+sha256sum "$MODEL"
+for N in 128 512 2048 8192; do
+  ./bin/yuuka-hip bench --model "$MODEL" --backend hip \
+    --prompt-tokens "$N" --decode-tokens 1 --warmup 1 --reps 3 \
+    --chunk-size 512 --kv-type f32
+done
+# Optional, memory-expensive comparison:
+YUUKA_PREFILL_F16_CACHE_MIB=3072 ./bin/yuuka-hip bench \
+  --model "$MODEL" --backend hip --prompt-tokens 8192 \
+  --decode-tokens 1 --warmup 1 --reps 3 --chunk-size 512 --kv-type f32
+```
+
+Correctness: 9/9 native CTest tests passed. With the FP16 cache enabled,
+`TestGPUChunkedPrefillLongContext` and `TestGPUMatchesCPU` passed on the real
+model; chunk 128 versus chunk 512 had maximum logit difference 0.04193, inside
+the existing 0.05 gate. The common cast reuse and optional cache do not change
+the quantization choice or the rocBLAS GEMM accumulation type.
+
+Profile with `TestGPUProfilePrefill`: at absolute position 0, GEMM took about
+348.5/499.9 ms of profiled execution (69.7%). At position 7680, paged prefill
+attention took about 579.9/1010.4 ms (57.4%). Larger gains likely require
+improving GEMM at short contexts and the long-context attention kernel rather
+than expanding all weights by default. A tested alternative that changed
+rocBLAS C/D to FP32 reduced throughput severely (512-token p50 0.862 s);
+substituting a conditional online-softmax update in the GQA attention kernel
+also regressed the 8192-token p50 from 15.610 to 15.964 s. Both changes were
+rejected and are not part of the branch.
