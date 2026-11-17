@@ -1265,6 +1265,36 @@ func (p *Plan) AddAttentionPrefillPagedAt(q *Buffer, qOff uint64, kPool, vPool, 
 	return p.AddAttentionPrefillPagedFormatAt(q, qOff, kPool, vPool, out, outOff, table, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, tensor.F32)
 }
 
+// AddAttentionPrefillPagedBlasFormatAt selects the experimental FP16 KV
+// matrix-multiplication attention path. It uses the ordinary plan validator,
+// with buf[5] carrying the scratch and flags bit 0 requesting rocBLAS.
+func (p *Plan) AddAttentionPrefillPagedBlasFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, scratch *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 ||
+		heads%kvHeads != 0 || kvDim != kvHeads*headDim || capacity < rows ||
+		blockSize <= 0 || blockSize > capacity || headDim > 256 {
+		return errors.New("hip: invalid BLAS attention shape")
+	}
+	if err := p.check(q, kPool, vPool, out, table, scratch); err != nil {
+		return err
+	}
+	qElems := uint64(heads) * uint64(rows) * uint64(headDim)
+	kvElems := uint64(kvHeads) * uint64(capacity) * uint64(headDim)
+	scoreElems := uint64(heads) * uint64(rows) * uint64(capacity)
+	want := 6*qElems + 4*kvElems + 6*scoreElems
+	if scratch.bytes < want {
+		return fmt.Errorf("hip: BLAS attention scratch %d < %d", scratch.bytes, want)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_ATTENTION_PREFILL_PAGED, flags: C.YUUKA_OP_FLAG_PREFILL_BLAS}
+	op.buf[0], op.buf[1], op.buf[2], op.buf[3], op.buf[4], op.buf[5] =
+		q.ptr, kPool.ptr, vPool.ptr, out.ptr, table.ptr, scratch.ptr
+	op.off[0], op.off[3] = C.uint64_t(qOff), C.uint64_t(outOff)
+	op.n[0], op.n[1], op.n[2], op.n[3], op.n[4] =
+		C.uint64_t(kvHeads), C.uint64_t(heads), C.uint64_t(headDim), C.uint64_t(kvDim), C.uint64_t(rows)
+	op.u[0], op.u[1], op.u[2] = C.uint32_t(blockSize), C.uint32_t(capacity), C.uint32_t(tensor.F16)
+	op.f[0] = C.float(scale)
+	return p.add(op)
+}
+
 // AddAttentionPrefillPagedFormatAt appends causal tiled attention with an
 // explicit pool dtype.
 func (p *Plan) AddAttentionPrefillPagedFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {

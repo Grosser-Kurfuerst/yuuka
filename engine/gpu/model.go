@@ -4,6 +4,8 @@ package gpu
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
@@ -15,6 +17,9 @@ import (
 
 type weight struct {
 	buf *hip.Buffer
+	// prefill16 is an optional, bounded cache for BLAS prefill only. Decode
+	// continues to use the original quantized buffer.
+	prefill16 *hip.Buffer
 	// elements is the unpacked element count from the GGUF directory. Prefill
 	// scratch sizing uses it to cover the largest quantized matrix.
 	elements uint64
@@ -43,25 +48,26 @@ type activations struct {
 }
 
 type prefillActivations struct {
-	x       *hip.Buffer
-	norm    *hip.Buffer
-	q       *hip.Buffer
-	k       *hip.Buffer
-	v       *hip.Buffer
-	attn    *hip.Buffer
-	tmp     *hip.Buffer
-	qkv     *hip.Buffer
-	z       *hip.Buffer
-	beta    *hip.Buffer
-	alpha   *hip.Buffer
-	conv    *hip.Buffer
-	gdnNorm *hip.Buffer
-	ffnGate *hip.Buffer
-	ffnUp   *hip.Buffer
-	xF16    *hip.Buffer
-	yF16    *hip.Buffer
-	wF16    *hip.Buffer
-	tokens  *hip.Buffer
+	attentionBlas *hip.Buffer
+	x             *hip.Buffer
+	norm          *hip.Buffer
+	q             *hip.Buffer
+	k             *hip.Buffer
+	v             *hip.Buffer
+	attn          *hip.Buffer
+	tmp           *hip.Buffer
+	qkv           *hip.Buffer
+	z             *hip.Buffer
+	beta          *hip.Buffer
+	alpha         *hip.Buffer
+	conv          *hip.Buffer
+	gdnNorm       *hip.Buffer
+	ffnGate       *hip.Buffer
+	ffnUp         *hip.Buffer
+	xF16          *hip.Buffer
+	yF16          *hip.Buffer
+	wF16          *hip.Buffer
+	tokens        *hip.Buffer
 }
 
 // Options configures a shared GPU model and its KV pool.
@@ -101,9 +107,10 @@ type Model struct {
 	kvType    tensor.DType
 	kvRow     uint64
 
-	prefillRows int
-	prefillGen  int64
-	prefillAll  []*hip.Buffer
+	attentionBlasEnabled bool
+	prefillRows          int
+	prefillGen           int64
+	prefillAll           []*hip.Buffer
 
 	specLogits *hip.Buffer
 
@@ -146,20 +153,22 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		_ = device.Close()
 		return nil, err
 	}
+	useBlasAttention := os.Getenv("YUUKA_ATTENTION_BLAS") == "1" && opts.KVType == tensor.F16
 	m := &Model{
-		device:    device,
-		stream:    stream,
-		event:     event,
-		config:    model.Config,
-		alloc:     alloc,
-		weights:   make(map[string]weight, len(reader.Tensors())),
-		blockSize: opts.BlockSize,
-		blocks:    opts.Blocks,
-		capacity:  opts.Blocks * opts.BlockSize,
-		kvType:    opts.KVType,
-		kvRow:     kvRow,
-		poolK:     make([]*hip.Buffer, model.Config.BlockCount),
-		poolV:     make([]*hip.Buffer, model.Config.BlockCount),
+		attentionBlasEnabled: useBlasAttention,
+		device:               device,
+		stream:               stream,
+		event:                event,
+		config:               model.Config,
+		alloc:                alloc,
+		weights:              make(map[string]weight, len(reader.Tensors())),
+		blockSize:            opts.BlockSize,
+		blocks:               opts.Blocks,
+		capacity:             opts.Blocks * opts.BlockSize,
+		kvType:               opts.KVType,
+		kvRow:                kvRow,
+		poolK:                make([]*hip.Buffer, model.Config.BlockCount),
+		poolV:                make([]*hip.Buffer, model.Config.BlockCount),
 	}
 	if err := m.setup(reader, model); err != nil {
 		_ = m.Close()
@@ -175,11 +184,81 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 	if chunk > m.capacity {
 		chunk = m.capacity
 	}
+	if err := m.cacheFFNPrefillWeights(); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
 	if err := m.configurePrefill(chunk); err != nil {
 		_ = m.Close()
 		return nil, err
 	}
 	return m, nil
+}
+
+// cacheFFNPrefillWeights optionally keeps only FFN gate/up projections in
+// FP16 for repeated prefill chunks. The quantized model remains authoritative
+// and is still used by decode. The byte budget is explicit and defaults to zero;
+// the wider projection cache can cost several GiB on an APU.
+func (m *Model) cacheFFNPrefillWeights() error {
+	value := os.Getenv("YUUKA_PREFILL_F16_CACHE_MIB")
+	if value == "" || value == "0" {
+		return nil
+	}
+	mib, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || mib > 16384 {
+		return fmt.Errorf("gpu: YUUKA_PREFILL_F16_CACHE_MIB must be between 0 and 16384")
+	}
+	budget := mib << 20
+	width := int64(m.config.HiddenSize)
+	ffn := int64(m.config.FFNSize)
+	var plan *hip.Plan
+	defer func() {
+		if plan != nil {
+			_ = plan.Close()
+		}
+	}()
+	used := uint64(0)
+	for layer := 0; layer < m.config.BlockCount; layer++ {
+		for _, kind := range []string{"ffn_gate", "ffn_up"} {
+			name := fmt.Sprintf("blk.%d.%s.weight", layer, kind)
+			w, ok := m.weights[name]
+			if !ok || w.elements != uint64(width)*uint64(ffn) {
+				continue
+			}
+			switch w.dtype {
+			case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+			default:
+				continue
+			}
+			bytes := w.elements * 2
+			if bytes > budget-used {
+				continue
+			}
+			if plan == nil {
+				plan, err = m.device.NewPlan()
+				if err != nil {
+					return err
+				}
+			}
+			buf, err := m.allocDevice(bytes)
+			if err != nil {
+				return fmt.Errorf("gpu: cache prefill %s: %w", name, err)
+			}
+			if err := plan.AddDequantF16At(w.buf, 0, buf, width, ffn, w.dtype); err != nil {
+				return fmt.Errorf("gpu: prefill cache dequant %s: %w", name, err)
+			}
+			w.prefill16 = buf
+			m.weights[name] = w
+			used += bytes
+		}
+	}
+	if plan == nil {
+		return nil
+	}
+	if err := plan.Execute(m.stream, 0, 0, true, m.event); err != nil {
+		return fmt.Errorf("gpu: fill prefill cache: %w", err)
+	}
+	return m.event.Wait()
 }
 
 const (
@@ -391,6 +470,23 @@ func (m *Model) configurePrefill(rows int) error {
 		{&p.xF16, uint64(rows) * uint64(maxWidth) * 2},
 		{&p.yF16, uint64(rows) * uint64(maxOutWidth) * 2},
 		{&p.tokens, uint64(rows) * 4},
+	}
+	if m.attentionBlasEnabled {
+		// Per-chunk reusable FP16 Q/K/V, attention-score, and PV matrices.
+		// Total scratch is limited to 4096 MiB to bound the opt-in cost.
+		qElems := uint64(cfg.HeadCount) * uint64(rows) * uint64(cfg.HeadDim)
+		kvElems := uint64(cfg.KVHeadCount) * uint64(m.capacity) * uint64(cfg.HeadDim)
+		scoreElems := uint64(cfg.HeadCount) * uint64(rows) * uint64(m.capacity)
+		bytes := 6*qElems + 4*kvElems + 6*scoreElems
+		if bytes > 4096<<20 {
+			return fmt.Errorf("gpu: BLAS prefill attention needs %d MiB scratch, exceeds 4096 MiB budget", (bytes+(1<<20)-1)>>20)
+		}
+		entries = append(entries, struct {
+			dst   **hip.Buffer
+			bytes uint64
+		}{&p.attentionBlas, bytes})
+	} else {
+		p.attentionBlas = nil
 	}
 	if maxWeightElems > 0 {
 		entries = append(entries, struct {

@@ -1617,3 +1617,144 @@ go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
 
 The benchmark tool reports P50 and P95 over the measured repetitions. It does
 not yet record power, clock, or thermal state.
+
+## 2026-11-17 gfx1151 Qwen3.5-4B Q4_K_M prefill tuning
+
+This is a fresh single-request A/B measurement of the exact validated Unsloth
+`Qwen3.5-4B-Q4_K_M.gguf` on the AMD Ryzen AI Max+ 395 (`gfx1151`, 40 CUs),
+inside a Debian Trixie Incus LXC on `aia2`. Model SHA-256:
+`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`.
+ROCm 10.1 layout, HIP 7.16.26385, Go 1.24.4, F32 KV, 512-token prefill
+chunks, one concurrent request, one warmup and three measured repetitions,
+median (`p50`) reported. Decode length was one token solely to isolate prefill.
+The original source baseline was commit `0db8406`; all variants used the same
+GGUF and GPU. These are observations, not guaranteed speedups: device clock,
+power, and thermal state were not pinned.
+
+| Prompt tokens | Original prefill (s) | Reused FFN activation cast, cache off (s) | Optional 3072 MiB FFN cache (s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 0.189 | 0.202 | 0.192 |
+| 512 | 0.491 | 0.431 | 0.609 |
+| 2048 | 2.745 | 2.808 | 2.728 |
+| 8192 | 15.610 | 15.193 | 15.143 |
+
+The one-pass comparisons are sensitive to changing power/clock conditions. To
+check the seemingly large 512-token effect, we also compiled the original and
+optimized Go sources into separate binaries linked against the *same* original
+HIP library and ran them in three interleaved cycles. Each row still includes
+one warmup and three repetitions:
+
+| Cycle | Original 512-token p50 (ms) | Optimized 512-token p50 (ms) |
+| ---: | ---: | ---: |
+| 1 | 530 | 489 |
+| 2 | 580 | 603 |
+| 3 | 595 | 566 |
+
+The cross-cycle medians are 580 and 566 ms (about 2.5%), with overlapping
+variation. **No large or consistent default-path improvement is established.**
+The source optimization nonetheless removes one redundant FP32-to-FP16 cast
+per FFN gate/up pair whenever both select the dequant+rocBLAS path.
+
+`YUUKA_PREFILL_F16_CACHE_MIB` explicitly reserves an upper limit of MiB for
+*only* FFN gate/up weights decoded into FP16 when opening a GPU model. It is
+disabled by default (`unset`, `0`). Supported values are 0-16384. The original
+quantized buffers remain loaded and continue to serve decode. The cache
+fills once per shared model and is released with it. `3072` fits this model's
+FFN gate/up weights but materially slows the 512-token case; **leave it off
+for ordinary requests**. Test it only after characterizing your workload and
+checking device memory headroom. Cache initialization latency is excluded
+from prefill measurements above.
+
+Example reproduction inside the development container:
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:/root/yuuka/build
+MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
+sha256sum "$MODEL"
+for N in 128 512 2048 8192; do
+  ./bin/yuuka-hip bench --model "$MODEL" --backend hip \
+    --prompt-tokens "$N" --decode-tokens 1 --warmup 1 --reps 3 \
+    --chunk-size 512 --kv-type f32
+done
+# Optional, memory-expensive comparison:
+YUUKA_PREFILL_F16_CACHE_MIB=3072 ./bin/yuuka-hip bench \
+  --model "$MODEL" --backend hip --prompt-tokens 8192 \
+  --decode-tokens 1 --warmup 1 --reps 3 --chunk-size 512 --kv-type f32
+```
+
+Correctness: 9/9 native CTest tests passed. With the FP16 cache enabled,
+`TestGPUChunkedPrefillLongContext` and `TestGPUMatchesCPU` passed on the real
+model; chunk 128 versus chunk 512 had maximum logit difference 0.04193, inside
+the existing 0.05 gate. The common cast reuse and optional cache do not change
+the quantization choice or the rocBLAS GEMM accumulation type.
+
+Profile with `TestGPUProfilePrefill`: at absolute position 0, GEMM took about
+348.5/499.9 ms of profiled execution (69.7%). At position 7680, paged prefill
+attention took about 579.9/1010.4 ms (57.4%). Larger gains likely require
+improving GEMM at short contexts and the long-context attention kernel rather
+than expanding all weights by default. A tested alternative that changed
+rocBLAS C/D to FP32 reduced throughput severely (512-token p50 0.862 s);
+substituting a conditional online-softmax update in the GQA attention kernel
+also regressed the 8192-token p50 from 15.610 to 15.964 s. Both changes were
+rejected and are not part of the branch.
+
+## 2026-11-17 gfx1151: matrixized attention (opt-in)
+
+Experimental `YUUKA_ATTENTION_BLAS=1` enables a distinct paged-GQA prefill
+kernel when **F16 KV cache** is selected and the current attention context
+reaches 2048 tokens. It packs queries, gathers logical K/V pages, uses rocBLAS
+QK and PV GEMMs, performs a causal FP32 softmax, then applies Qwen3.5 attention
+gating. It uses a reusable bounded scratch buffer (maximum 4096 MiB) shared by
+all attention layers; the F32 path and earlier contexts retain the existing
+kernel. The regular decode backend is unchanged. The default is **off**.
+
+The benchmark used the same verified Unsloth `Qwen3.5-4B-Q4_K_M.gguf`
+(`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`),
+on the same `aia2` Strix Halo gfx1151 (40 CUs), Debian Trixie Incus LXC, ROCm
+10.1 / HIP 7.16.26385, F16 KV, single request, 1 warmup and 2 repetitions
+for the BLAS rows. Times are median prefill latency. The full 512-token
+microbatch configuration is reproduced below, rather than quoting mixed
+historical numbers.
+
+| Prompt | Yuuka tiled baseline F16 KV / chunk | Yuuka BLAS attention F16 KV / chunk | llama.cpp F16 KV, FA on, ubatch 512 |
+| ---: | ---: | ---: | ---: |
+| 512 | 0.472s / 512 | 0.525s / 512 | ~1948 tok/s |
+| 2048 | 2.593s / 512 | 2.113s / 512 | ~1828 tok/s |
+| 8192 | 15.443s / 512 | 8.235s / 512 | ~1585 tok/s |
+
+Under their respective 512-token chunk settings, the 8192-token rate improves
+from about **530 tok/s to 995 tok/s** (1.88x), still below llama.cpp (1585
+tok/s). At prompt 2048, opting for a single 2048-token Yuuka chunk yields
+1.952s (1049 tok/s); at 8192 with a 2048-token chunk, materializing the
+larger score matrices is counterproductive: 9.049s (905 tok/s).
+
+A full-model F16-KV differential test in
+`engine/gpu/blas_attention_compare_test.go` measures maximum logit difference
+from Yuuka's original tiled path of **0.0132079** after a 2048-token prompt
+and **0.00757194** after an 8192-token prompt. Both preserve top-1, below the
+existing 0.05 tolerance. The paged native test also validates against CPU
+reference (head_dim=64, position 2048) within 2e-4. No speedup is assumed for
+short prompts; this path is off by default. The optimized attention scratch
+is ephemeral to the model and can be expensive at high context capacities.
+
+Reproduce:
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:/root/yuuka-blas-attn/build
+MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
+YUUKA_ATTENTION_BLAS=1 ./bin/yuuka-hip bench \
+  --model "$MODEL" --backend hip --kv-type f16 --chunk-size 512 \
+  --prompt-tokens 8192 --decode-tokens 1 --warmup 1 --reps 3
+YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
+  -run "^TestGPUBlasAttentionMatchesTiled$" -count=1 -v
+YUUKA_TEST_MODEL="$MODEL" YUUKA_TEST_BLAS_LONG=1 go test -tags hip ./engine/gpu \
+  -run "^TestGPUBlasAttentionMatchesTiled$" -count=1 -v
+```
+
+Further required work to reach llama.cpp: optimize Q4_K/Q6_K dense and tall
+GEMM kernels, reduce matrixized attention workspace traffic and per-head
+rocBLAS dispatch, and verify accuracy on diverse prompts. A 128-row WMMA tall-K
+candidate and 64-row K32/K64 variants were benchmarked but did **not** give a
+repeatable combined win with matrixized attention; they remain outside this
+branch. Splitting the original GQA key traversal into four partitions yielded
+only a ~2.2% 8192-token gain and is also excluded.
