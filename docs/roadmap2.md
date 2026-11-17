@@ -248,7 +248,7 @@ layers of a 512-row chunk, no spills, 93 VGPRs, 16 waves/SIMD, and bitwise
 repeatability in `tests/hip/prefill_test.cpp`. The A1 time target (at most
 150 ms) is met. The provisional total-chunk target of 1050 ms was not met
 (1077 ms) because the GEMM path is unchanged. See
-[benchmarks.md](benchmarks.md#gated-delta-net-register-state-2026-11-15).
+[benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 ### 3.7 Status (2026-11-16): chunk convolution
 
@@ -349,7 +349,7 @@ And the kernel's ceiling is the per-block FP32 scale application: the same
 geometry with the scale work removed measures 48 TFLOP/s, so the remaining 3.5x
 would need a formulation that scales fewer than 32 accumulator elements per
 32-value block. See
-[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-int8-mmq-prefill-gemm).
+[benchmarks.md](benchmarks.md#isolated-kernels).
 
 ### 4.6 B5: small fusions
 
@@ -385,7 +385,7 @@ M-first CTA order were all measured slower and are not in the kernel. B3's
 acceptance rule is therefore applied as written: it was not accepted. The
 gate/up part of B5 is implemented in section 4.8; B4 is rejected in section
 4.9, and the remaining B5 fusions are unstarted. See
-[benchmarks.md](benchmarks.md#prefill-gemm-tiles-2026-11-15).
+[benchmarks.md](benchmarks.md#isolated-kernels).
 
 A 2026-11-16 follow-up replaced the loader: it decodes one contiguous span per
 thread, hoists the block header per span, and reads Q4_K/Q5_K spans with
@@ -399,7 +399,7 @@ loses at `M = 64`/`M = 128` by 40-90% for F16 and Q6_K, so the `K <= N`
 condition stays; a 64-wide K step for the 64x64 tile measured 15-30% slower than
 32-wide and is not instantiated. The gate/up fused kernel is unchanged. The
 500 ms GEMM gate is still not met. See
-[benchmarks.md](benchmarks.md#prefill-gemm-span-decode-2026-11-16).
+[benchmarks.md](benchmarks.md#isolated-kernels).
 
 A same-machine attribution against llama.cpp (`pp512` 2216 tok/s) splits the
 remaining 2.5x gap into matmul 476 vs 186 ms, the gated delta-net chunk 67 vs
@@ -410,7 +410,7 @@ WMMA in llama.cpp's int8 MMQ kernel (128-row x 128-token tile, Q8_1 shared
 staging, 256-wide K step). The int8 geometry is now implemented (4.5);
 `launch_gemm_blas_f16` still requests fp32 compute with fp32 output, which
 selects Tensile kernels at 3.3-4.7 TFLOP/s. See
-[benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
+[benchmarks.md](benchmarks.md#llamacpp-comparison).
 
 A 2026-11-16 experiment adopted a library route for the wide K-quant class and
 rejected the 128-row tile. Dequantize-to-F16 plus fp16-compute rocBLAS runs the
@@ -432,7 +432,7 @@ range stayed inside the run-to-run band, so it is not selected. Remaining matmul
 headroom is instructions per MAC: the int8 MMQ geometry is the next attempt, and
 its int8 activation quantization must clear the same gate rather than inherit
 exactness from its integer accumulator. See
-[benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
+[benchmarks.md](benchmarks.md#decisions-and-rejected-routes).
 
 ### 4.8 B5 status: fused gate/up (2026-11-15)
 
@@ -479,7 +479,7 @@ staging path halves the stored bytes and the per-value conversion work even
 though it does not raise the MMA issue rate, so the operand-density argument
 does apply. llama.cpp's int8 MMQ kernel reaches 24.9 TFLOP/s against yuuka's 8.5
 TFLOP/s on the same device. See
-[benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
+[benchmarks.md](benchmarks.md#llamacpp-comparison).
 
 ### 4.10 Status (2026-11-16): Q6_K span loader and the tall-K route
 
@@ -578,7 +578,7 @@ prefill reaches 515.9 tok/s at 512 tokens, 480.2 tok/s at 2048, 382.9 tok/s at
 identical logits at chunk sizes 128, 512, and 1024 with the same top-1 token,
 and the attention reference test passes at `2.98e-08` maximum absolute
 difference. See
-[benchmarks.md](benchmarks.md#prefill-attention-tiling-2026-11-15).
+[benchmarks.md](benchmarks.md#decisions-and-rejected-routes).
 
 ### 5.8 Status (2026-11-16): grouped query heads above 2048 positions
 
@@ -608,7 +608,7 @@ from the tiled path is 0.0132079 after 2048 tokens and 0.00757194 after 8192
 tokens, with the same top-1 token. F32/Q8_0 and F16 contexts below 2048 tokens
 retain the tiled kernels, and pools whose scratch would exceed 4096 MiB fall
 back to the tiled path. See
-[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-matrixized-attention-default-for-f16-kv).
+[benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 ## 6. Workstream D: dispatch and planning
 

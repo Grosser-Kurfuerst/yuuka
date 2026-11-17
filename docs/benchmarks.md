@@ -1,1427 +1,132 @@
 # Benchmark Report: Qwen3.5-4B Q4_K_M
 
-This report records single-request CPU-versus-HIP measurements, the Phase 2
-decode baseline, the Phase 3 prefill results, Phase 4 serving results, the
-release decode-length matrix, and the Phase 5 KV-format,
-speculative-decoding, MoE, and quantization measurements. It
-follows the metadata requirements in [testing.md](testing.md) as far as the
-current tooling allows. The early decode section is a correctness-phase
-baseline, not a tuned performance result; the Phase 3 section records measured
-prefill behavior and its known gap to llama.cpp.
+This file is the current performance record for the repository: every table
+below was measured on the code in the tree at the commit listed under
+[Environment and protocol](#environment-and-protocol), with the stated
+protocol. Superseded phase-by-phase reports are kept in git history and are not
+repeated here. Numbers are observations on one machine, not guarantees; device
+clock, power, and thermal state are not pinned.
 
-## Environment
+## Environment and protocol
 
 | Field | Value |
 | --- | --- |
-| Date | 2026-11-11 |
+| Date | 2026-11-17 |
 | Model | `Qwen3.5-4B-Q4_K_M.gguf` |
 | Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
 | Model size | 2,740,937,888 bytes |
-| Architecture | `qwen35`, 32 layers, 8 full-attention, 24 gated delta-net |
-| Quantization | Q4_K_M, mixed per-tensor dtypes |
-| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
+| Architecture | `qwen35`, 32 layers (8 full attention, 24 gated delta-net) |
+| Quantization | Q4_K_M (the GGUF carries mixed per-tensor dtypes; no requantization is applied) |
+| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs, 122,880 MiB reported VRAM |
 | ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
-| Host | Ryzen AI MAX+ 395, 32 threads, 120 GiB shared memory |
-| Kernel | 6.17.13-21-pve |
+| Host | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S, 32 threads, 120 GiB shared memory |
+| Kernel | 7.0.14-28-pve |
+| Power performance level | `auto` (amdgpu sysfs) |
+| Go | go1.24.4, Release `cmake --build build` |
+| Commit | `9767284` |
+| Tokenizer / chat template | GGUF-embedded Qwen3.5 vocabulary and template |
 | Sampling | Greedy, temperature 0 |
-| Warmup | 1 request |
-| Repetitions | 3 measured requests |
-| Context capacity | CPU 88, HIP 96 |
-| Prompt | 16 tokens from repeated English prose |
-| Decode | CPU 8 tokens, HIP 16 tokens |
+| Prefill chunk | 512 tokens (`--chunk-size 512`), except where a row states otherwise |
+| Warmup / repetitions | 2 / 5 for prefill rows, 2 / 3 for decode and serving rows, median reported |
 
-Current-host note (2026-11-13): the machine now reports kernel
-`7.0.14-28-pve`; the tables below were recorded on `6.17.13-21-pve` and have
-not been re-baselined after the kernel change.
+Protocol:
 
-The CPU and HIP runs use different decode lengths, so compare throughput and
-latency, not total wall time. The prompt construction and sampling settings are
-identical.
+- `build/yuuka_prefill_sweep` measures isolated kernels (GEMM, GEMV) per dtype,
+  shape, and row count; each cell is the median of five timed submissions after
+  two warmups, and the K-quant `mmq` cell includes the Q8_1 activation pass.
+- `yuuka bench` measures end to end through the engine. TTFT is measured from
+  submission; decode throughput is `(decode_tokens - 1) / decode p50`, matching
+  the CLI report.
+- `bench/serving` measures the scheduler path (queue wait, TTFT, prefill,
+  decode, sampling) and reports aggregate throughput over its wall interval.
+- The server comparison drives the OpenAI-compatible HTTP surface of
+  `yuuka-server` and `llama-server` with a stock streaming client on the same
+  host, so TTFT includes HTTP and SSE overhead. Prompt caching is disabled on
+  both sides (`--prefix-cache=false`, `"cache_prompt": false`).
+- Only one benchmark process may use the GPU at a time; two processes sharing
+  the device invalidate both results.
+- The llama.cpp reference is `strix-llama.cpp` commit `c8912d7f5` (build 12216,
+  version 0.6.0-dev), ROCm backend, `-ngl 99 -b 512 -ub 512`. `llama-bench`
+  rejects an `f32` KV cache type, so its rows use llama.cpp's default `f16` KV;
+  yuuka rows state their KV format.
 
-## Results
+## Correctness gates
 
-| Metric | CPU reference p50 | CPU p95 | HIP p50 | HIP p95 |
-| --- | ---: | ---: | ---: | ---: |
-| Prefill | 7.260 s | 7.350 s | 1.433 s | 1.433 s |
-| Prefill throughput | 2.20 tok/s | — | 11.17 tok/s | — |
-| TTFT | 7.260 s | 7.350 s | 1.433 s | 1.433 s |
-| Decode | 3.631 s / 8 tokens | 3.644 s | 1.519 s / 16 tokens | 1.521 s |
-| Decode throughput | 1.93 tok/s | — | 9.87 tok/s | — |
+Current tree, same commit:
 
-Effective weight-read bandwidth during decode, estimated as model bytes times
-tokens per second:
+| Check | Result |
+| --- | --- |
+| `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE) | 9 / 9 pass |
+| `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
+| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00309944`, greedy tokens match |
+| `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.7e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
+| `go build ./...`, `go vet ./...`, `go test ./...`, `go test -tags hip ./...` | pass |
 
-| Backend | Effective bandwidth |
-| --- | ---: |
-| CPU reference | 5.3 GB/s |
-| HIP | 27.0 GB/s |
+The Q8_1 prefill path moves logits against an FP16-activation reference
+(measured earlier at 0.0031 maximum for the tiny prompt and 0.264 for a
+2048-token prompt, top-1 preserved). Chunk sizes stay inside the 0.05 chunk
+gate; the quantization grid itself is the source of that delta, and it is the
+regime llama.cpp's K-quant prefill also runs in.
 
-This is an effective estimate, not a hardware counter. The HIP GEMV path is
-still far below the measured `hipMemset` rate (about 190-230 GB/s across the
-recorded runs). The current kernel launches one 256-thread workgroup per output
-channel and performs a block-wide reduction per quantization block. Reducing
-launch and reduction overhead, increasing per-workgroup output reuse, and
-vectorizing packed loads are the obvious next optimizations.
+## Prefill: prompt length
 
-## Per-quantization decode baseline
+`yuuka bench --backend hip --decode-tokens 1 --chunk-size 512`, F32 KV unless
+stated, median of five repetitions:
 
-The Q4_K_M source model was requantized with llama.cpp to Q8_0, Q6_K, and a
-Q5_K/Q6_K mix. These files are test variants, not independently quality-tuned
-models. Conditions: `gfx1151`, HIP backend, prompt 16 tokens, decode 16 tokens,
-greedy sampling, context 128, warmup 1, repetitions 2.
-
-| Model variant | File type | File size | Prefill p50 | Prefill tok/s | Decode p50 | Decode tok/s |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_K_M | `15` | 2,740,937,888 | 1.878 s | 8.52 | 1.731 s | 8.67 |
-| Q8_0 | `7` | 4,482,403,488 | 0.807 s | 19.82 | 1.053 s | 14.24 |
-| Q6_K | `18` | 3,464,055,968 | 1.528 s | 10.47 | 1.311 s | 11.44 |
-| Q5_K/Q6_K mixed | `18` | 3,074,987,168 | 1.572 s | 10.18 | 1.651 s | 9.09 |
-
-SHA-256 values: Q4_K_M `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`,
-Q8_0 `dc3021458088a6fb0e8629c096ea7e95f743e434d96dc4351d2107c669be1fa9`,
-Q6_K `438c752e79f8cfdf80483b7017ebc672f16eaf717f198c298740eb6caec097e4`,
-Q5_K `68060caab98d455ed40683ab44181599d9ac528ec2378f1c10683b8b8c790637`.
-The CPU/GPU agreement test passes for all four variants.
-
-Effective weight-read bandwidth, estimated as model bytes times decode tok/s:
-Q4_K_M 23.8 GB/s, Q8_0 63.8 GB/s, Q6_K 39.6 GB/s, and the Q5_K mix 28.0 GB/s.
-These remain below the measured memset range of about 190-230 GB/s.
-
-## Decode kernel attribution
-
-`TestGPUProfileDecode` runs one ordinary decode step after a fixed prompt with
-HIP events around every submitted plan operation. This is event-instrumented
-attribution, not a hardware-counter profile; total time includes event overhead.
-
-| Operation | Time | Share |
-| --- | ---: | ---: |
-| GEMV | 92.859 ms | 90.5% |
-| GDN | 7.308 ms | 7.1% |
-| RMSNorm | 0.807 ms | 0.8% |
-| residual add | 0.374 ms | 0.4% |
-| L2Norm | 0.258 ms | 0.3% |
-| gated RMSNorm | 0.237 ms | 0.2% |
-| conv1d | 0.174 ms | 0.2% |
-| SwiGLU | 0.161 ms | 0.2% |
-| attention | 0.139 ms | 0.1% |
-| head RMSNorm | 0.096 ms | 0.1% |
-
-The profiled step submitted 579 operations and took 102.580 ms. The GEMV path is
-the clear decode bottleneck, consistent with the effective bandwidth remaining
-far below device copy rates.
-
-## Batched GEMV dispatch
-
-`build/yuuka_gemv_sweep` compares one GEMV per batch row against the batched
-GEMV kernel for `n_in = n_out = 2560`, two warmups, ten repetitions, on gfx1151.
-Values are the batched speedup over per-row submission; host timing includes the
-completion wait for both paths.
-
-| Dtype | batch 1 | batch 2 | batch 4 | batch 8 | batch 16 | Batched path from |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Q4_K | 0.98 | 1.58 | 2.34 | 3.20 | 3.88 | batch 2 |
-| Q5_K | 1.02 | 1.71 | 2.57 | 3.55 | 4.22 | batch 2 |
-| Q6_K | 1.02 | 1.25 | 1.90 | 2.49 | 3.16 | batch 2 |
-| Q8_0 | 0.61 | 0.86 | 1.26 | 1.59 | 1.71 | batch 4 |
-| F16 | 0.81 | 0.94 | 1.22 | 1.37 | 1.51 | batch 4 |
-
-The table is the measured record behind the batched-GEMV path;
-`backend/hip.SelectPrefillPath` selects that path for the small row classes it
-covers, and batches above 16 fall back to per-row submission. The current
-single-token decode path always uses batch 1, so the batched path is a
-prefill/batching building block. There is no separate runtime GEMV batch
-selector.
-`tests/hip/gemv_test.cpp` checks the batched kernel against the reference for
-F32, F16, Q8_0, Q4_K, Q5_K, and Q6_K at batch sizes 1, 2, 3, 4, 8, and 16.
-
-## Correctness evidence
-
-For the prompt `The capital of France is`:
-
-- CPU and HIP greedy tokens are identical for the first six generated tokens:
-  `[11751, 13, 198, 32, 13, 2912]`.
-- A direct sequential `Step` run of the decode graph gives a first-step maximum
-  absolute logit difference of `4.58e-5`; `TestGPUDecodePathMatchesCPU` covers
-  that path. Phase 3 routes multi-token prompts through chunked prefill; the
-  same prompt in that path differs from the CPU reference by `3.65e-3` in the
-  worst logit and selects the same top-1 token. Both numbers are observations
-  under the current kernels; the chunked-path test enforces a loose `5.0` logit
-  guard, and the decode-path test enforces `1e-3`.
-- The checked-in `TestGPUMatchesCPU` compares chunked-prefill final logits and
-  greedy tokens with the CPU reference and reports `3.65e-3` for the same
-  prompt, not `4.58e-5`. The checked-in `TestGPULayerTraceMatchesCPU` compares
-  every layer's hidden state for the same prompt; the worst recorded layer
-  difference is `5.53e-5`.
-- Golden CPU token tests also cover `1+1=` and `Once upon a time`.
-
-## Phase 3 prefill
-
-### Environment
-
-Same model, device, ROCm/HIP, and host as the top of this document. Conditions
-for the prefill measurements: Qwen3.5-4B Q4_K_M, `gfx1151`, greedy sampling,
-`chunk-size` 512 except where a full prompt chunk is smaller, two warmup
-iterations for the GEMM sweep and one for prompt curves unless stated
-otherwise. The prompt text is the repeated-prose corpus used by `bench`.
-
-### Prefill GEMM path comparison
-
-`build/yuuka_prefill_sweep` compares, for one GEMM submission followed by a
-completion wait:
-
-- `row`: one plan containing `M` single-row GEMV operations (the pre-Phase-3
-  prefill path);
-- `batch`: the Phase 2 batched GEMV (`M <= 16`);
-- `wmma`: the custom rocWMMA kernel with FP32 activations converted to FP16 in
-  LDS;
-- `rocblas`: the rocBLAS FP16 baseline, including the FP32-to-FP16 cast
-  submitted immediately before the GEMM.
-
-Values are milliseconds per submission, the mean of five measured iterations
-after two warmups. `N` is output width and `K` is input width. Host timing
-includes the completion wait.
-
-`Q4_K`, milliseconds:
-
-| M | 2560→9216 row | batch | wmma | 9216→2560 row | batch | wmma |
+| Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.364 | 0.364 | 0.362 | 0.315 | 0.333 | 0.685 |
-| 4 | 1.385 | 0.572 | 0.376 | 1.231 | 0.507 | 0.730 |
-| 8 | 2.748 | 0.862 | 0.384 | 2.447 | 0.795 | 0.711 |
-| 16 | 5.468 | 1.461 | 0.400 | 4.876 | 1.298 | 0.724 |
-| 32 | 10.945 | — | 0.392 | 9.752 | — | 0.813 |
-| 64 | 21.902 | — | 0.734 | 19.448 | — | 0.900 |
-| 128 | 43.823 | — | 1.520 | 38.978 | — | 1.261 |
+| 128 | 0.121 s | 1061.7 | - | - | - | - |
+| 512 | 0.387 s | 1323.7 | 0.387 s | 1323.0 | 0.387 s | 1323.3 |
+| 1024 | 0.793 s | 1290.5 | - | - | - | - |
+| 2048 | 1.742 s | 1175.9 | 1.697 s | 1207.2 | 1.739 s | 1177.4 |
+| 4096 | 4.069 s | 1006.6 | - | - | - | - |
+| 8192 | 10.390 s | 788.4 | 7.384 s | 1109.4 | - | - |
 
-`Q6_K`, milliseconds:
+The F16 KV column rises above F32 from 2048 tokens because the matrixized
+rocBLAS prefill-attention path is selected for F16 KV once the attention
+context reaches 2048; at 8192 tokens it is 1.41x faster than the tiled path.
+F32 and Q8_0 KV keep the tiled kernel, and the two KV formats are within noise
+of each other. At 512 tokens the chunk cost is dominated by the quantized GEMM
+([isolated kernels](#isolated-kernels)); at long context the tiled attention
+kernel is the limiter.
 
-| M | 2560→9216 row | batch | wmma | 9216→2560 row | batch | wmma |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.283 | 0.359 | 0.418 | 0.261 | 0.328 | 0.688 |
-| 4 | 1.106 | 0.593 | 0.429 | 1.032 | 0.528 | 0.726 |
-| 8 | 2.294 | 0.888 | 0.432 | 2.103 | 0.787 | 0.698 |
-| 16 | 4.618 | 1.471 | 0.443 | 4.279 | 1.322 | 0.739 |
-| 32 | 9.253 | — | 0.474 | 8.574 | — | 0.845 |
-| 64 | 19.526 | — | 0.974 | 17.488 | — | 1.058 |
-| 128 | 38.525 | — | 1.861 | 35.854 | — | 1.451 |
+## Decode: output length
 
-`F16`, milliseconds, including the cast for `rocblas`:
+`yuuka bench --backend hip --prompt-tokens 128 --decode-tokens 128|256`,
+F32 KV, median of three repetitions:
 
-| M | 2560→9216 row | batch | wmma | blas | 9216→2560 row | batch | wmma | blas |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.295 | 0.370 | 0.606 | 0.313 | 0.286 | 0.389 | 1.149 | 0.290 |
-| 4 | 1.163 | 0.577 | 0.695 | 0.930 | 1.125 | 0.839 | 0.987 | 0.573 |
-| 8 | 2.310 | 0.919 | 0.705 | 0.942 | 2.261 | 1.401 | 1.640 | 0.575 |
-| 16 | 4.571 | 1.606 | 0.716 | 0.977 | 4.498 | 2.162 | 1.138 | 0.582 |
-| 32 | 9.158 | — | 0.831 | 1.042 | 9.052 | — | 1.500 | 0.602 |
-| 64 | 18.245 | — | 1.537 | 1.476 | 18.128 | — | 1.301 | 1.079 |
-| 128 | 36.424 | — | 2.751 | 1.612 | 35.975 | — | 1.581 | 2.298 |
-
-`Q8_0`, `Q5_K`, and `Q4_K` follow the same crossover: the small-row paths are
-fastest at `M = 1` (per-row GEMV for `Q8_0`, batched GEMV for `Q5_K`, and
-effectively tied for `Q4_K`); WMMA wins from `M = 4` for wide projections
-(`K <= N`) and from `M = 8` for tall projections (`K > N`). Rows 2560→9216 and
-2560→8192 were measured; the shorter `Q8_0` table is omitted because the
-selected path is identical. `SelectPrefillPath` uses batched GEMV below four
-rows for every dtype; at `M = 1` the sweep shows per-row submission is faster
-for `F16`, `Q8_0`, and `Q6_K` (about 20-30%), so the small-row dispatch remains
-a follow-up.
-
-The dispatch table in `backend/hip.SelectPrefillPath` encodes these crossovers.
-For F16 it selects batched GEMV below `M = 8` for wide projections, rocBLAS
-where the measured baseline wins, and WMMA otherwise; for quantized dtypes it
-selects batched GEMV only at the measured small-row points. Differences below
-5% are treated as run-to-run noise: the table selects rocBLAS only where it was
-decisively faster and WMMA otherwise. The 2560→9216 `M = 64` case is a 4%
-rocBLAS advantage left on WMMA by that rule; the tall `M = 4` cases select
-batched GEMV because it is decisively faster than WMMA.
-
-### Prompt-length performance
-
-`yuuka` HIP, Qwen3.5-4B Q4_K_M, greedy sampling, chunk size 512. Prefill and
-decode use the same process; context capacity is `prompt + 16 + 64`. Prompts up
-to 2048 use one warmup and three measured repetitions; 8192 and 32768 use one
-measured repetition without warmup because each run is long. P50 values:
-
-| Prompt tokens | Prefill | Prefill tok/s | TTFT | Decode tok/s (16 tokens) |
-| ---: | ---: | ---: | ---: | ---: |
-| 128 | 0.409 s | 313.05 | 0.409 s | 9.70 |
-| 512 | 1.635 s | 313.06 | 1.636 s | 9.16 |
-| 2048 | 6.690 s | 306.14 | 6.690 s | 7.47 |
-| 8192 | 37.687 s | 217.37 | 37.687 s | 4.31 |
-| 32768 | 340.357 s | 96.28 | 340.357 s | 1.60 |
-
-Prefill throughput is flat through 2048 tokens and then declines as attention
-work grows with context length. Decode throughput declines for the expected
-reason: the Phase 2 decode-attention kernel is linear in the cached context and
-is not part of the Phase 3 prefill work. The 32768 run completed with correct
-state; its long duration is a measured limitation of the scalar Flash Attention
-tile, not a failure or truncation.
-
-### llama.cpp comparison
-
-Same GGUF (`00fe7986...`), same device, greedy prompt processing only
-(`llama-bench -n 0`). `llama.cpp` used its default prompt batch 2048 and ubatch
-512 with flash attention `auto`; `yuuka` used chunk size 512. The build is
-`strix-llama.cpp` commit `c8912d7f5` (build 12216, version 0.6.0-dev). HIP used
-ROCm/HIP 7.16 on gfx1151; Vulkan used Mesa RADV 25.0.7 on gfx1151. Each
-`llama-bench` cell is the mean and standard deviation of two measured
-repetitions after its default warmup.
-
-| Prompt tokens | yuuka HIP tok/s | llama.cpp HIP tok/s | HIP ratio | llama.cpp Vulkan tok/s | Vulkan ratio |
+| Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 313.05 | 1589.53 ± 265.12 | 5.1x | 2154.59 ± 5.92 | 6.9x |
-| 512 | 313.06 | 2163.12 ± 94.78 | 6.9x | 2307.82 ± 7.93 | 7.4x |
-| 2048 | 306.14 | 2171.11 ± 24.63 | 7.1x | 2235.83 ± 16.82 | 7.3x |
-| 8192 | 217.37 | 2077.64 ± 10.40 | 9.6x | 2114.75 ± 22.70 | 9.7x |
-| 32768 | 96.28 | 1494.85 ± 12.68 | 15.5x | 1702.18 ± 31.82 | 17.7x |
+| 128 | 320 | 0.123 s | 0.123 s | 13.218 s | 9.61 |
+| 256 | 448 | 0.123 s | 0.123 s | 26.830 s | 9.50 |
 
-The custom path does not close the gap to llama.cpp. The gap is widest at long
-context, where the scalar Flash Attention tile and its single-wave-per-query
-structure dominate. At short and mid context the remaining gap is smaller. The
-GEMM itself is weight-reuse limited by its 32-row M tile: a 512-row chunk
-reloads each weight tile 16 times. llama.cpp's HIP and Vulkan kernels use
-larger tiles, matrix-core layouts, and pipelined loads. Closing the GEMM gap
-requires a larger M tile (with more accumulator fragments per wave) and
-double-buffered LDS; closing the long-context gap additionally requires a
-matrix-core or multi-query-tile attention kernel. The measured attribution and
-ordered work are in [roadmap2.md](roadmap2.md); none of those optimizations is
-claimed here.
+Decode is weight-bandwidth bound and essentially flat in output length: the two
+rows differ by about 1%. Effective weight-read bandwidth is
+$2.74\\,\\mathrm{GB} \\times 9.6\\,\\mathrm{s^{-1}} \\approx 26\\,\\mathrm{GB/s}$,
+roughly one sixth of what the same weights stream at in llama.cpp
+([llama.cpp comparison](#llamacpp-comparison)). The single-request GEMV path is
+the limiter, not attention ([isolated kernels](#isolated-kernels)).
 
-The comparison uses different prompt tokenization only in the sense that each
-runner builds its own prompt from the same token count; both use the same GGUF
-tokenizer and greedy prompt processing. `llama-bench` reports prefill only, so
-these ratios are not end-to-end generation comparisons.
+## Speculative decoding
 
-### Prefill attribution diagnostic (2026-11-14)
+Exact greedy prompt-lookup speculation, 512-token prompt, 128 generated tokens,
+F32 KV, median of three repetitions:
 
-This section records a diagnostic attribution of one 512-token prefill chunk.
-It is event-instrumented evidence for planning, not a benchmark under the full
-[testing.md](testing.md) protocol.
-
-| Field | Value |
-| --- | --- |
-| Date | 2026-11-14 |
-| Model | `Qwen3.5-4B-Q4_K_M.gguf`, SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
-| Comparison model | `Qwen3.5-4B-Q8_0.gguf`, SHA-256 `dc3021458088a6fb0e8629c096ea7e95f743e434d96dc4351d2107c669be1fa9` |
-| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
-| ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
-| Host kernel | Linux 7.0.14-28-pve |
-| Backend / KV | HIP, F32 KV unless stated |
-| Chunk | 512 rows |
-| Method | `Plan.ExecuteProfiled` with HIP events around every operation |
-| Warmup | one plan execution before the measured executions |
-| Repetitions | one diagnostic execution per position and KV format |
-
-Event overhead is included. The profiled total for the position-0 chunk was
-1534 ms against a 1553 ms wall time in the same run. Clocks, power, and
-thermal state were not controlled. Run-to-run variation of a few percent was
-observed across repeated diagnostics.
-
-Q4_K_M, 512 rows at position 0:
-
-| Operation | Time | Share |
-| --- | ---: | ---: |
-| WMMA GEMM | 909 ms | 59.3% |
-| Gated delta-net chunk | 551 ms | 36.0% |
-| Prefill attention | 48 ms | 3.1% |
-| LM-head GEMV | 12 ms | 0.8% |
-| Other operations | 14 ms | 0.9% |
-
-The same 512-row chunk on Q8_0 measured 723 ms of GEMM, 551 ms of gated
-delta-net work, and 48 ms of attention.
-
-Attention scales with the chunk's absolute position; all other phases stay
-essentially constant:
-
-| Chunk start position | F32 KV attention | F16 KV attention |
-| ---: | ---: | ---: |
-| 0 | 48.7 ms | 45.3 ms |
-| 2048 | 421.5 ms | 388.3 ms |
-| 7680 | 2030.1 ms | 1475.1 ms |
-
-At position 7680 attention is about 58% of the chunk with F32 KV and about 50%
-with F16 KV. The F16 pool reduces attention time by about 27% at that position
-and is within noise at position 0.
-
-Chunk-size scaling, one measured execution per size:
-
-| Chunk rows | Time | Throughput |
-| ---: | ---: | ---: |
-| 128 | 392.5 ms | 326.2 tok/s |
-| 512 | 1505.4 ms | 340.1 tok/s |
-| 1024 | 3132.6 ms | 326.9 tok/s |
-| 2048 | 6812.6 ms | 300.6 tok/s |
-
-These are single diagnostic runs. The formal Phase 3 curve above remains the
-reference throughput table.
-
-Derived limits (from GGUF tensor sizes, model dimensions, and kernel loop
-counts; not hardware counters):
-
-- The prefill matmul weights total about 2.161 GB. A 32-row M tile reads every
-  weight once per group of 32 tokens, so the amortized traffic is about
-  67.5 MB per token and about 34.6 GB per 512-token chunk. 909 ms of GEMM
-  corresponds to roughly 38 GB/s, below the measured read bandwidth of about
-  221 GB/s.
-- The same chunk performs about 3.66 TFLOP of prefill matmul work; 909 ms
-  corresponds to about 4.0 TFLOP/s, or about 6.8% of the documented
-  59.4 TFLOP/s FP16 WMMA peak.
-- The gated delta-net kernel visits each head's 128x128 FP32 state four times
-  per token row, about 155 GB of state traffic for the chunk, and performs
-  about 51.5 GFLOP. 551 ms corresponds to roughly 280 GB/s of state traffic
-  and about 94 GFLOP/s.
-
-The attribution shows three distinct limits: GEMM is limited by tile reuse,
-unpacking, and unpipelined loads; the gated delta-net kernel is limited by
-repeated state traffic and a 32-workgroup grid; long-context attention is
-limited by V traffic, exposed load latency, and the lack of query tiling. The
-ordered optimization work is in [roadmap2.md](roadmap2.md).
-
-Reproduction:
-
-```bash
-# Q4_K_M, F32 KV, three positions and per-operation attribution.
-YUUKA_TEST_MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  go test -tags hip ./engine/gpu -run TestGPUProfilePrefill -v -count=1
-
-# Same diagnostic with F16 KV.
-YUUKA_TEST_MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf \
-YUUKA_TEST_KV=f16 \
-  go test -tags hip ./engine/gpu -run TestGPUProfilePrefill -v -count=1
-
-# Q8_0 comparison.
-YUUKA_TEST_MODEL=/path/to/Qwen3.5-4B-Q8_0.gguf \
-  go test -tags hip ./engine/gpu -run TestGPUProfilePrefill -v -count=1
-```
-
-The test is opt-in because it loads the full model. It is a diagnostic path:
-do not use its numbers as release benchmarks without the metadata and
-repetition requirements in [testing.md](testing.md).
-
-### Gated delta-net register state (2026-11-15)
-
-The `gdn_chunk_splitreg_f32_kernel` path replaced the per-row global state
-traversal described above. Measurement conditions match the attribution run:
-`Qwen3.5-4B-Q4_K_M.gguf`, `gfx1151`, HIP, F32 KV, chunk size 512, one warmup,
-one diagnostic `ExecuteProfiled` execution. The same test command as the
-attribution section was used.
-
-| Operation | Before | After | Change |
-| --- | ---: | ---: | ---: |
-| Recurrent chunk, 24 layers | 551 ms | 67.6 ms | 8.1x faster |
-| WMMA GEMM, 248 submissions | 909 ms | 944 ms | unchanged path |
-| Prefill attention, position 0 | 48.7 ms | 50.2 ms | unchanged path |
-| Profiled chunk total, position 0 | 1534 ms | 1086 ms | 1.41x faster |
-| Wall chunk total, position 0 | 1553 ms | 1077 ms | 1.44x faster |
-
-The recurrent-chunk time is constant at positions 0, 2048, and 7680 (67.6,
-67.7, and 67.7 ms), so the register path removed the state traffic that scaled
-only with rows. This meets the A1 acceptance target of at most 150 ms and is
-below the sequencing target of 50-150 ms. The provisional A1-A3 total-chunk
-target of 1050 ms was not met at 1077 ms; the remaining gap is the GEMM path.
-
-`tests/hip/prefill_test.cpp` checks the register path against its float
-reference at state 128 and the fallback fused kernel at state 64, and repeats
-the same execution to require bitwise-identical output and conv scratch. The
-resource report for the new kernels:
-
-| Kernel | VGPR | SGPR | LDS | Scratch | Occupancy | Spills |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gdn_chunk_splitreg_f32_kernel<128>` | 93 | 34 | 1,064 B | 0 | 16 waves/SIMD | 0 |
-| `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 | 0 | 16 waves/SIMD | 0 |
-
-An earlier one-column-per-lane variant kept all 128 state values in one thread
-and compiled to 192 VGPRs with 90 spills, so it was rejected; the four-lane
-column split is the accepted mapping.
-
-### Prefill GEMM tiles (2026-11-15)
-
-`bench/hip/prefill_sweep` now includes `M = 256` and `M = 512`. The 64x64,
-two-fragment, K=64 double-buffered tile was compared with the original 32x64,
-one-fragment, K=32 tile on the same binary build for the selected-shape sweep.
-Q4_K, milliseconds per submission, mean of five measured iterations after two
-warmups:
-
-| Shape | 32x64 K32 | Selected path | Change |
-| --- | ---: | ---: | ---: |
-| 2560 → 9216, M=512 | 5.94 | 5.76 (64x64) | 3.1% faster |
-| 2560 → 8192, M=512 | 5.46 | 5.07 (64x64) | 7.2% faster |
-| 9216 → 2560, M=512 | 5.49 | 5.59 (32x64, unchanged) | within noise |
-| 9216 → 2560, M=256 | 2.45 | 2.42 (32x64, unchanged) | within noise |
-
-The 64x64 tile is selected only for `rows >= 64` with `K <= N`. At `M <= 32`,
-and for every `K > N` shape, the original 32x64 tile remains selected because
-the wider tile was slower there: for example, 2560 → 9216 at `M=32` moved from
-0.383 ms to 0.622 ms, and 9216 → 2560 at `M=512` moved to 6.65 ms when the
-64x64 tile was forced. A 64-row tile with a 2x2 fragment wave, a 128-row tile,
-and a 64x128 tile were also measured and were slower than both selected
-variants; they are not present in the kernel.
-
-Chunk effect, same diagnostic protocol as the gated delta-net table:
-
-| Measurement | Before | After |
-| --- | ---: | ---: |
-| GEMM, 248 submissions, position 0 | 944 ms | 895 ms |
-| Recurrent chunk, 24 layers | 67.6 ms | 63.7 ms |
-| Prefill attention, position 0 | 50.2 ms | 48.3 ms |
-| Profiled chunk total, position 0 | 1086 ms | 1030 ms |
-| Wall chunk total, position 0 | 1077 ms | 1025 ms |
-
-The GEMM change is a 5% improvement on the chunk, not the 2-3x that workstream B
-targeted: the 500 ms gate is not met. The isolated wide shapes followed the same
-4.6-4.7 TFLOP/s figure as the sweep's rocBLAS column, which suggested a
-hardware ceiling. The 2026-11-16 attribution shows that figure is the fp32
-compute path of both `launch_gemm_blas_f16` and the earlier WMMA tile, not the
-device: hipBLAS with fp16 compute and fp16 output reaches 20-33 TFLOP/s on the
-same shapes. See
-[prefill gap attribution](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
-The CTA-order experiment that mapped consecutive blocks to M tiles was rejected:
-it improved the tall-K isolated shape but raised the wide shape, and the chunk
-GEMM total regressed to 947 ms.
-
-Resource report for the two selected variants:
-
-| Kernel | VGPR | SGPR | LDS | Scratch | Occupancy | Spills |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gemm_wmma_kernel<Q4_K,64,2>` | 72 | 29 | 32,768 B | 0 | 16 waves/SIMD | 0 |
-| `gemm_wmma_k32_kernel<Q4_K>` | 48 | 30 | 14,336 B | 0 | 16 waves/SIMD | 0 |
-
-### Prefill GEMM span decode (2026-11-16)
-
-The weight loader in both rocWMMA kernels decodes one contiguous span per
-thread instead of one element, and the 64x64 tile now stages a 32-wide K step,
-16 KiB of shared memory instead of 32 KiB. Environment: `gfx1151`, the pinned
-ROCm/HIP toolchain, `Qwen3.5-4B-Q4_K_M.gguf` for the end-to-end number and
-in-process random weights for the isolated GEMM, FP32 activations, one stream,
-no concurrent work.
-
-Two isolation protocols were run on the same binary pair (the
-`libyuuka_hip.so` built before and after the change, selected with
-`LD_PRELOAD`):
-
-- `bench/hip/prefill_sweep`: two warmups and five measured submissions per
-  shape, exactly as committed; each binary was run three times and the per-shape
-  median is reported.
-- Focused A/B: five warmups and 40 measured submissions per shape (200 for the
-  small-batch checks), two passes.
-
-`bench/hip/prefill_sweep`, milliseconds per submission, `M = 512`:
-
-| Shape | Q4_K | Q5_K | Q8_0 | Q6_K | F16 |
+| Path | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 2560 → 9216 | 5.60 → 2.78 | 6.26 → 2.89 | 5.46 → 2.81 | 6.23 → 4.78 | 6.86 → 5.24 |
-| 2560 → 8192 | 4.93 → 2.45 | 5.47 → 2.69 | 4.63 → 2.39 | 5.45 → 4.23 | 6.08 → 5.24 |
-| 9216 → 2560 | 5.58 → 2.91 | 6.23 → 3.16 | 4.26 → 2.91 | 6.25 → 6.05 | 6.13 → 7.28 |
-
-Q4_K improves 48-50%, Q5_K 49-54%, Q8_0 32-49%, Q6_K 3-23%, and F16 14% on both
-wide shapes. The sweep's five-submission window is too short for the 0.4-1 ms
-shapes and for the 7 ms F16 tall-K shape, so four shapes it reports as
-regressions were re-measured with 200 submissions after ten warmups:
-
-| Shape | Baseline | New | Change |
-| --- | ---: | ---: | ---: |
-| Q6_K 9216 → 2560, M=16 | 0.718 | 0.702 | 2.2% faster |
-| Q6_K 9216 → 2560, M=32 | 0.812 | 0.807 | 0.6% faster |
-| Q6_K 9216 → 2560, M=512 | 6.348 | 5.795 | 9.7% faster |
-| Q6_K 2560 → 9216, M=16 | 0.438 | 0.422 | 3.7% faster |
-| F16 8192 → 2560, M=8 | 0.840 | 0.782 | 7.4% faster |
-| F16 9216 → 2560, M=16 | 1.244 | 1.107 | 11.0% faster |
-| F16 9216 → 2560, M=512 | 7.472 | 7.438 | 0.5% faster |
-
-The sweep under-reports the F16 tall-K baseline (6.13 ms against the 7.47 ms
-steady-state value), which is what produced the apparent 19% regression there.
-The remaining sweep variance at small `M` is clock-state noise: the same kernel
-binary reproduces within 2% under the longer protocol. F32, F16, and Q6_K run
-the element mapping in both binaries, so their kernels are unchanged apart from
-the shared helper signature.
-
-End-to-end, same model, backend, KV format, chunk size, and repetition count as
-the 2026-11-15 tables, `--prompt-tokens 512 --decode-tokens 1 --warmup 1
---reps 3 --chunk-size 512`:
-
-| Measurement | 2026-11-15 build | 2026-11-16 build |
-| --- | ---: | ---: |
-| Prefill p50 | 0.940 s | 0.581 s |
-| Prefill rate p50 | 544.3 tok/s | 880.8 tok/s |
-| TTFT p50 | 0.940 s | 0.581 s |
-
-That is 38% lower TTFT and 62% higher prefill throughput, above the 10% gate and
-above the 750 tok/s stretch target. Correctness is unchanged: `ctest` passes
-9/9, and `TestGPUChunkedPrefillLongContext` keeps top-1 token 33075 with a zero
-logit difference against the CPU reference at chunk sizes 128, 512, and 1024.
-
-The sweep was not re-tuned for this change. Because its five-submission window
-cannot separate a 2% kernel change from clock-state noise at small shapes,
-dispatch decisions that depend on a few percent should use a longer protocol
-like the focused A/B above.
-
-### Prefill gap attribution vs llama.cpp (2026-11-16)
-
-Same machine, same GGUF, both backends on the GPU: llama.cpp `b1b770d90` (build
-12359) run as `llama-bench -p 512 -n 1 -r 3 -ngl 99` reports `pp512 = 2216.25
-± 39.88 t/s`; `yuuka bench --prompt-tokens 512 --decode-tokens 1 --warmup 1
---reps 3 --chunk-size 512` reports 881 t/s (0.581 s against 0.233 s). This
-section attributes the 2.5x gap.
-
-Per-operation split. yuuka: `TestGPUProfilePrefill` HIP events around every plan
-operation, 512 rows, F32 KV, position 0. llama.cpp: `rocprofv3
---kernel-trace` over one `pp512` run, aggregated by kernel name. Both in
-milliseconds per 512-token prefill:
-
-| Component | yuuka | llama.cpp | Ratio |
-| --- | ---: | ---: | ---: |
-| Matmul (incl. LM head, activation quantize, Q6_K dequant, F16 cast) | 476.0 | 177.9 | 2.7x |
-| Gated delta-net chunk | 67.4 | 13.0 | 5.2x |
-| Prefill attention (incl. llama.cpp KV concat) | 18.8 | 17.6 | 1.07x |
-| Norm, RoPE, elementwise, copy, KV write | 6.7 | 24.5 | 0.3x |
-| Total | 568.9 | 233.0 | 2.44x |
-
-The matmul gap is 298 ms of the 336 ms difference and the delta-net gap is 54
-ms, partly offset by yuuka's 18 ms advantage on the elementwise kernels:
-llama.cpp pays a `concat_non_cont` KV copy (12.1 ms), a per-matmul activation
-quantize (`quantize_mmq_q8_1`, 6.5 ms), and a gate kernel for the SiLU product
-(9.7 ms).
-
-**llama.cpp mixes two matmul paths at 512 tokens.** `ggml_cuda_should_use_mmq`
-keeps Q4_K/Q5_K on the int8 `mul_mat_q` (MMQ) kernel but sends Q6_K to
-dequantize + hipBLAS when the batch exceeds 256 rows. In the trace that is
-`mul_mat_q<(ggml_type)12>` 205.1 ms and `<(ggml_type)13>` 71.7 ms over two runs,
-plus `dequantize_block_q6_K` 3.9 ms and the `Cijk_Alik_Bljk_HB_MT128x128x32`
-hipBLAS kernel 19.6 ms per run. The MMQ kernel is configured with I=128 weight
-rows, J=128 token columns, 256 threads, occupancy 2, 240 VGPR, K step 256, and
-Q8_1 shared staging: weights are dequantized to int8 once per 128-token pass and
-the activation is quantized once per matmul, so per 4096-MAC WMMA-equivalent the
-kernel issues about 22 instructions against yuuka's 114.
-
-**yuuka's kernel is decode and latency bound, not MMA bound.** Counters for the
-64x64/K32 Q4_K kernel on `2560 -> 9216, M=512` (`rocprofv3 --pmc`,
-2,949,120 WMMA instructions per launch):
-
-| Counter | Per WMMA |
-| --- | ---: |
-| `SQ_INSTS_ALL` | 114.0 |
-| `SQ_INSTS_VALU` | 54.0 |
-| `SQ_INSTS_LDS` | 9.9 |
-| `SQ_WAVE_CYCLES` | 2,922.6 |
-
-That launch moves 336.1 M instructions, 0.028 per MAC, for 8.5 TFLOP/s; issue
-occupancy is about 39% of the 160 SIMD issue slots. The same math in llama.cpp
-costs 0.0054 instructions per MAC. Three structural causes, in order of
-measured weight:
-
-1. Token-tile reuse: yuuka decodes each weight for 64 accumulation rows and
-   re-reads every weight tile 8 times for 512 tokens; llama.cpp's J=128 halves
-   both.
-2. Decode cost per weight: yuuka converts to FP16 and stores two bytes per value
-   into shared memory (9.9 LDS instructions per WMMA); llama.cpp stores one byte
-   as int8 and applies the block scale in the dot product.
-3. Synchronization granularity: yuuka synchronizes twice per 32 K values,
-   llama.cpp twice per 256.
-
-**The 4.6-4.7 TFLOP/s "ceiling" reported in the 2026-11-15 sections is a
-rocBLAS wrapper artifact, not hardware.** `launch_gemm_blas_f16` passes
-`rocblas_datatype_f32_r` as the compute type and `f32` output, which makes
-rocBLAS select fp32-compute Tensile kernels. The same GEMM with fp16 compute
-and fp16 output, which is what `ggml-cuda` requests, on the two prefill shape
-classes:
-
-| Shape (F16 in) | f32 compute, f32 out (yuuka) | f16 compute, f16 out (llama.cpp) |
-| --- | ---: | ---: |
-| 2560 -> 9216, M=512 | 5.14 ms, 4.70 TFLOP/s | 0.72 ms, 33.6 TFLOP/s |
-| 9216 -> 2560, M=512 | 7.29 ms, 3.31 TFLOP/s | 1.16 ms, 20.6 TFLOP/s |
-
-So gfx1151 reaches 20-33 TFLOP/s through the library on F16, while yuuka's own
-kernels reach 8.5 TFLOP/s on the wide Q4_K shape and 4.0 TFLOP/s on the Q6_K
-tall-K shape the model actually uses (`9216 -> 2560`, 6.05 ms against 1.16 ms
-for hipBLAS f16). Two implementation paths follow and are not yet implemented:
-
-- Fix `launch_gemm_blas_f16` to request fp16 compute and fp16 output with an
-  explicit cast, and route Q6_K through dequantize + hipBLAS as llama.cpp does.
-  Q6_K is about 100 ms of the 476 ms matmul total, so this is an estimated
-  70-80 ms of the chunk, roughly +12-15% prefill throughput.
-- Rebuild the custom kernel to the MMQ geometry for Q4_K/Q5_K: 128-token tile,
-  int8 shared staging, 256-wide K step. A dequantize-to-F16 route is not
-  obviously better for these types because the expanded weights are 2x larger
-  and are re-read once per 128-token pass, which makes that route memory limited
-  at 512 tokens (about 120 ms of traffic against about 110 ms of compute).
-
-The delta-net gap (67 against 13 ms) is independent of both.
-
-Measurement notes: the per-op split adds HIP event overhead and does not
-control clocks, so it is diagnostic under [testing.md](testing.md), not a
-release benchmark. The counter run uses the same shape in isolation with two
-warmups and three measured launches.
-
-### Prefill matmul route experiments (2026-11-16)
-
-The attribution above leaves 476 ms of a 569 ms 512-token prefill in quantized
-matmul, and llama.cpp runs the same math in 178 ms. This section records the
-route that was adopted, the two variants it beat, and the one tile experiment
-that was rejected. Conditions: same machine, GGUF, and CLI as [the
-attribution](#prefill-gap-attribution-vs-llamacpp-2026-11-16); gfx1151,
-Q4_K_M, F32 KV.
-
-#### Numeric gate before implementation
-
-A throwaway Go program decoded the first eight rows of three real weight
-matrices with `tensor.DequantizeRow`, built one deterministic activation row
-(`x[i] = sin(0.37 i) cos(0.11 i)`), and compared three dot products against a
-float64 reference: an FP32 accumulator, a simulated FP16 accumulator that
-rounds the running sum after every product, and one that rounds every 16
-products, which is the MMA shape. The entry is the max over the eight rows of
-`|acc - ref| / (1 + |ref|)`.
-
-| Tensor | Dtype | `K` | `N` | FP16, per product | FP16, per 16 | FP32 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `blk.0.ffn_up.weight` | Q4_K | 2560 | 9216 | 1.94e-3 | 4.20e-4 | 1.5e-7 |
-| `blk.0.ffn_down.weight` | Q6_K | 9216 | 2560 | 4.98e-3 | 4.07e-3 | 8.8e-7 |
-| `blk.0.attn_qkv.weight` | Q5_K | 2560 | 8192 | 2.13e-3 | 7.20e-4 | 4.4e-7 |
-
-The per-matmul gate that was set from this table, 5e-3 on the FP16
-accumulator, turned out to be too loose for the network: see the chunk-gate
-table below.
-
-#### Adopted: FP32-compute dequant + rocBLAS
-
-rocBLAS rejects FP16 compute with an FP32 destination on this build
-(`rocblas_status` 2) and rejects nothing for FP32 compute with an FP16
-destination, which is the combination that matters here. Same shape
-(`2560 -> 9216`, `M = 512`), one warmup call then three timed repeats:
-
-| rocBLAS types | Time | Rate | Adopted |
-| --- | ---: | ---: | --- |
-| FP16 compute, FP16 out | 0.672 ms | 35.9 TFLOP/s | No: 0.305 logits of drift |
-| FP32 compute, FP16 out | 1.098 ms | 22.0 TFLOP/s | Yes |
-| FP32 compute, FP32 out (the 2026-11-15 wrapper) | 5.107 ms | 4.7 TFLOP/s | No: slower than the WMMA kernel |
-
-FP32 compute keeps the FP32 accumulator and rounds each output once into an
-FP16 scratch, which a cast kernel converts to the FP32 result. The dequantized
-tile matches an independent format decoder within one FP16 unit (max relative
-error 2.4e-4 over every element of a 2560x256 Q4_K, Q5_K, and Q6_K matrix), so
-the route's only numeric difference from the WMMA path is that single rounding
-of the result.
-
-Isolated GEMM, milliseconds, 5 repeats, median. `dequant+rocBLAS` includes the
-weight expansion and the activation cast on every call:
-
-| Dtype | Shape | `M` | WMMA 64x64 | dequant + rocBLAS | Speedup |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Q4_K | 2560 -> 9216 | 128 | 0.716 | 0.733 | 0.98x |
-| Q4_K | 2560 -> 9216 | 256 | 1.339 | 1.077 | 1.24x |
-| Q4_K | 2560 -> 9216 | 512 | 2.767 | 1.607 | 1.72x |
-| Q4_K | 2560 -> 8192 | 512 | 2.440 | 1.479 | 1.65x |
-| Q4_K | 9216 -> 2560 | 128 | 0.606 | 1.313 | 0.46x |
-| Q4_K | 9216 -> 2560 | 512 | 2.865 | 1.619 | 1.77x |
-| Q5_K | 2560 -> 9216 | 512 | 2.857 | 1.566 | 1.82x |
-| Q5_K | 2560 -> 8192 | 512 | 2.529 | 1.441 | 1.76x |
-| Q5_K | 9216 -> 2560 | 512 | 3.113 | 1.611 | 1.93x |
-| Q6_K | 2560 -> 9216 | 128 | 1.172 | 1.053 | 1.11x |
-| Q6_K | 2560 -> 9216 | 512 | 4.567 | 1.882 | 2.43x |
-| Q6_K | 2560 -> 8192 | 512 | 4.018 | 1.587 | 2.53x |
-| Q6_K | 9216 -> 2560 | 512 | 5.758 | 1.854 | 3.11x |
-
-Below 128 rows the expansion dominates (0.31-0.64x at `M = 32` and `M = 64`),
-and from 128 rows up the route is neutral (0.95-1.16x) and then faster.
-
-End to end, `bench --prompt-tokens N --chunk-size 512 --warmup 2 --reps 5`,
-sequential runs on the same machine:
-
-| Prompt tokens | WMMA | Adopted route | Delta |
-| ---: | ---: | ---: | ---: |
-| 32 | 0.081 s / 393 tok/s | 0.082 s / 391 tok/s | -0.3% |
-| 100 | 0.139 s / 717 tok/s | 0.139 s / 717 tok/s | 0 |
-| 128 | 0.149 s / 858 tok/s | 0.157 s / 818 tok/s | -5% |
-| 512 | 0.583 s / 878 tok/s | 0.463 s / 1107 tok/s | **+26%** |
-
-The 128-token row is slower because the fused gate/up kernel is only selected
-on the WMMA path: at 128 rows the GEMMs are neutral and the route pays for two
-separate GEMMs plus `SILU_MUL` instead of one fused epilogue.
-
-#### The route is bounded by the chunk-invariance gate, not by the per-GEMM gate
-
-`TestGPUChunkedPrefillLongContext` requires the chunk-512 prefill to stay within
-0.05 logits of the chunk-128 prefill. It has no slack: the WMMA path is bitwise
-identical across chunk boundaries (0). Measured drift for the route variants,
-each with the same top-1 token (33075):
-
-| Route selection | Max logit diff | Gate |
-| --- | ---: | ---: |
-| WMMA everywhere (baseline) | 0 | 0.05 |
-| FP16 compute, every matmul, `M >= 256` | 0.305 | 0.05 |
-| FP32 compute, every matmul, `M >= 256` | 0.0686 | 0.05 |
-| FP32 compute, `K <= N`, `M >= 256` | 0.0577 | 0.05 |
-| FP32 compute, `K <= N`, `M >= 256`, `N <= 8192` | 0.0846 | 0.05 |
-| FP32 compute, `K <= N`, `M >= 128` (adopted) | **0.0419** | 0.05 |
-
-Two effects explain the shape of the table. First, a route that depends on the
-row count makes the chunk size change the numerics, and that difference
-(0.058) is larger than the route's own batch-size sensitivity (0.042), so
-the adopted rule keeps the row threshold at the smallest chunk size the gate
-uses. Second, the metric is a maximum over 248,320 logits, so it is an
-extreme-value statistic rather than a norm: the `N <= 8192` subset lands on a
-worse extreme than the full wide set even though it routes fewer matmuls.
-
-The tall-`K` class is excluded for a numeric reason, not a speed one: it
-measured 1.44-1.77x faster on `9216 -> 2560` at `M = 256` and above, but
-rocBLAS splits `K` there and the FP16 destination forces the split reduction
-through FP16. The native route test measures 1.1-1.5e-3 relative error on those
-shapes against 4.0-4.9e-4 on the wide ones, so tall-`K` keeps the WMMA path.
-
-Residual error of the adopted route, from
-`tests/hip/prefill_test.cpp`: 4.0-4.9e-4 relative per GEMM on the wide shapes,
-which is one FP16 unit roundoff of the result, and 1.1-1.5e-3 on the tall shapes
-the engine does not route. The test bound is 2e-3 per element.
-
-#### Rejected: FP32 destination and tall-`K` routing
-
-Two variants were measured against the adopted route on 2026-11-16 and rejected;
-neither ships, so the ABI, the scratch buffers, and the routing table are
-unchanged.
-
-An FP32 destination (`rocblas_datatype_f32_r` for C and D, FP16 operands, FP32
-compute) removes the FP16 rounding of the result but moves rocBLAS onto a
-different kernel. Isolated, one warmup then ten timed calls, milliseconds:
-
-| Shape | `M` | FP16 destination | FP32 destination | `blasq` (dequant + rocBLAS) before / after |
-| --- | ---: | ---: | ---: | ---: |
-| Q6_K 9216 -> 2560 | 512 | 1.03 | 7.31 | 1.815 / 8.617 |
-| Q4_K 2560 -> 9216 | 512 | 1.13 | 5.65 | 1.688 / 5.243 |
-| F16 2560 -> 9216 | 512 | 1.26 | 5.09 | - |
-
-That is 4.7 TFLOP/s against 19-20 TFLOP/s for the FP16 destination, and it
-would make the adopted wide route 3x slower. The earlier 2026-11-15 wrapper in
-the table above hit the same wall.
-
-The second variant kept the FP16 destination and routed tall-`K` matmuls
-(`9216 -> 2560` and `4096 -> 2560`) through the existing dequant + rocBLAS
-route. It is 1.7-2.2x faster isolated, but each subset was run through
-`TestGPUChunkedPrefillLongContext` (1024-token prompt, chunks 128/512/1024, all
-with top-1 33075). The engine's working bound is 0.045 logits, stricter than
-the test's 0.05:
-
-| Tall route selection | Max logit diff |
-| --- | ---: |
-| none (adopted) | 0.0419 |
-| every tall K-quant matmul | 0.0697 |
-| `K = 4096` only (`ssm_out`, `attn_output`) | 0.0685 |
-| `K = 9216` only (`ffn_down`) | 0.0494 |
-| `K = 9216`, `Q6_K` only | 0.0574 |
-| `K = 9216`, `Q4_K` only | 0.0474 |
-
-The metric is a maximum over 248,320 logits and is reproducible to the last
-digit across runs, so the smallest subset is genuinely above the working bound.
-Tall-`K` keeps WMMA until a route changes the accumulator instead of the output
-type.
-
-Known limitation: a prefill chunk below 128 rows (a prompt shorter than that, or
-an explicitly small `--chunk-size`) selects WMMA while larger chunks select the
-route, so those two produce logits that differ by about the 0.058 measured
-above. The gate compares 128 and 512, which both use the route.
-
-#### Prompt-length scaling
-
-The route's saving is a fixed amount of matmul work per 512-row chunk, so its
-relative value falls as the prompt grows and attention takes over. Same machine,
-`--chunk-size 512`, sequential runs, `--warmup 1 --reps 2` up to 8192 and
-`--warmup 1 --reps 1` above it:
-
-| Prompt tokens | WMMA | Route | Delta | Saving per chunk |
-| ---: | ---: | ---: | ---: | ---: |
-| 512 | 0.575 s / 890 tok/s | 0.475 s / 1077 tok/s | +21% | 0.100 s |
-| 2048 | 2.513 s / 815 tok/s | 2.096 s / 977 tok/s | +20% | 0.104 s |
-| 8192 | 13.795 s / 594 tok/s | 12.818 s / 639 tok/s | +7.6% | 0.061 s |
-| 16384 | 40.105 s / 409 tok/s | 37.302 s / 439 tok/s | +7.5% | 0.088 s |
-| 32768 | 129.245 s / 254 tok/s | 123.898 s / 264 tok/s | +4.3% | 0.084 s |
-
-The absolute saving is 0.08-0.10 s per 512-token chunk at every length, so the
-gain is `saving / total` and the total is dominated by attention from about 8k
-tokens on. The 8192 row measures a lower per-chunk saving than its neighbours;
-two repetitions cannot separate that from run-to-run noise, and the surrounding
-rows bracket it.
-
-The saving is bounded by the traffic the expansion costs. The routed class is
-120 tensors, 1.431 GB packed and 2432.7 M elements, so per chunk the route reads
-1.431 GB of packed weights, writes 4.865 GB of FP16 scratch, and the GEMM reads
-that scratch back: 9.73 GB more DRAM traffic than the WMMA path, which reads the
-1.431 GB once. At the 190 GB/s the hardware probe measures for a streaming
-kernel, that is 51 ms per chunk against a 0.13-0.15 s compute saving, which is
-why the route is 1.2x on the matmul and not the 2.5x the isolated GEMM shows. A kernel that keeps the weights packed
-(the int8 MMQ geometry) removes that term entirely, which is the strongest
-argument for it beyond the instruction count.
-
-Above 16k tokens the matmul is no longer where the time goes: 64 chunks of the
-route save 5.3 s of a 129 s prefill, so attention and the gated delta-net are the
-levers there.
-
-#### Rejected: 128-row WMMA tile
-
-The attribution ranks token-tile reuse first: the 64-row tile re-reads every
-weight tile eight times for 512 tokens, so a 128-row tile (`BlockM = 128`,
-four accumulator fragments per wave, 32-wide K step) halves that. The new tile
-stages 24 KiB of A/B double buffer (`2 * (128 + 64) * 32 * 2`), which leaves two
-CTAs per LDS CU instead of four, and its 128x64 FP32 result does not fit the
-staging alias, so the epilogue writes two 128x32 column halves with a barrier
-between them.
-
-Isolated GEMM, milliseconds, median of three sweep runs, against the committed
-64-row tile:
-
-| Dtype | Shape | `M` | WMMA 64x64 | WMMA 128x64 | Delta |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Q4_K | 2560 -> 9216 | 128 | 0.687 | 0.779 | -13.4% |
-| Q4_K | 2560 -> 9216 | 256 | 1.361 | 1.186 | +12.9% |
-| Q4_K | 2560 -> 9216 | 512 | 2.755 | 2.519 | +8.6% |
-| Q4_K | 2560 -> 8192 | 128 | 0.670 | 0.769 | -14.8% |
-| Q4_K | 2560 -> 8192 | 512 | 2.499 | 2.153 | +13.8% |
-| Q4_K | 9216 -> 2560 | 256 | 1.263 | 1.419 | -12.4% |
-| Q4_K | 9216 -> 2560 | 512 | 2.791 | 3.030 | -8.6% |
-| Q5_K | 2560 -> 9216 | 256 | 1.485 | 1.215 | +18.2% |
-| Q5_K | 2560 -> 9216 | 512 | 3.033 | 2.621 | +13.6% |
-| Q5_K | 9216 -> 2560 | 512 | 3.266 | 3.281 | -0.5% |
-| Q6_K | 2560 -> 9216 | 256 | 2.290 | 1.700 | +25.8% |
-| Q6_K | 2560 -> 9216 | 512 | 4.658 | 3.727 | +20.0% |
-| Q6_K | 9216 -> 2560 | 512 | 6.119 | 6.000 | +1.9% |
-
-The tile wins on wide, shallow-`K` shapes (+6% to +26%) and loses on tall-`K`
-shapes (-0.5% to -12%) and at 128 rows (-3% to -15%), where halving the CTA
-count costs more than the weight reuse saves.
-
-End to end with the tile selected for every `K <= N` shape at `M >= 128`:
-0.553 s / 926 tok/s. Restricted to `M >= 256`, `K <= 2560`, and `N >= 8192`:
-0.572 s / 895 tok/s. WMMA baseline over three consecutive runs: 0.559 s,
-0.563 s, 0.589 s (916, 909, 869 tok/s). Both variants sit inside that 2.4%
-run-to-run band while the sweep shows regressions outside it, so the tile is not
-selected, and the two-half epilogue was reverted.
-
-**What the tile experiment rules out.** Weight traffic is not the prefill matmul
-bottleneck: halving it buys 6-26% on the wide shapes and nothing on the tall
-ones. The route that was adopted instead removes work per weight rather than
-weights per work: the library kernel converts each packed weight to FP16 once
-per call and then runs a 128-column-token tile in registers, which is why it
-reaches 22 TFLOP/s where the custom 64-row kernel reaches 8.6.
-
-Reproduction: `./build/yuuka_prefill_sweep` prints the isolated columns, and the
-end-to-end numbers are the `bench` commands above. The numeric gate is a scratch
-Go module that replaces `github.com/yuuka-ai/yuuka` and uses `gguf.Open` plus
-`tensor.DequantizeRow`.
-
-### Long-context attention packed K tile (2026-11-16)
-
-The GQA prefill attention kernel gained a packed K tile and a 32-key staging
-block. Same machine, GGUF, and F32 KV as the other sections;
-`TestGPUProfilePrefill` at a 512-row chunk, `ExecuteProfiled` per-op totals:
-
-| Position | Before | Row-phase restructure | Packed K + 32-key tile | + key-pair scores |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 19.7 ms | 18.5 ms | 19.4 ms | 18.6 ms |
-| 2048 | 164.8 ms | 211.1 ms | 155.5 ms | 145.9 ms |
-| 7680 | 578.8 ms | 779.4 ms | 549.2 ms | 522.0 ms |
-
-The row-phase restructure (four rows advanced through the key loop in separate
-phases instead of one row at a time) is 35% slower at position 7680 and was
-reverted: the guarded phases cost more instructions than the independent chains
-save. The packed tile is the measured win, and it is what lets a 32-key block
-fit shared memory at `head_dim` 256 (55 KiB against 73.7 KiB for two FP32
-tiles). Halving the score instructions only moves the kernel 5%, which bounds
-how much of the cell is score arithmetic.
-
-Attribution, skipping the score and value loop entirely while keeping the
-staging walk and both barriers: 92.1 ms at position 7680. Staging is 16% of the
-cell, and the remaining 457 ms is the online softmax and value accumulation,
-which the two-change kernel reduces to 430 ms. Reaching the 400 ms target needs
-the staging walk shared across query-row blocks, which this change does not
-attempt.
-
-End to end, `bench --chunk-size 512`, `--warmup 2 --reps 5` at 512 and
-`--warmup 1 --reps 2` at 8192:
-
-| Prompt tokens | Before | After |
-| ---: | ---: | ---: |
-| 512 | 0.423 s | 0.428 s |
-| 8192 | 11.401 s / 718 tok/s | 10.894 s / 752 tok/s |
-
-The 512-token row is unchanged inside the run-to-run band because position 0
-uses the one-head kernel. The chunk-invariance gate is unchanged at 0.0419
-logits with top-1 33075, and the native packed case (`head_dim` 64, position
-2048) matches the reference sweep within 3.2e-06.
-
-### int8 dot throughput probe (2026-11-16)
-
-`./build/yuuka_dot_probe` runs four register-resident kernels, 4096 workgroups
-of 256 threads, 1024 iterations of eight independent accumulations, 20 repeats,
-and reports `2 * MACs / seconds`:
-
-| Kernel | Time | TFLOP/s-equivalent | MACs per instruction |
-| --- | ---: | ---: | ---: |
-| `fp32-fma` | 0.752 ms | 22.86 | 1 |
-| `fdot2` | 1.346 ms | 25.52 | 2 |
-| `sdot4` | unavailable | - | - |
-| `rocwmma-int8` | 5.004 ms | 54.93 | 4096 per wave call |
-
-`sdot4` does not exist on this target: gfx1151 has no `dot1-insts`, so
-`__builtin_amdgcn_sdot4` is a compile error, not a slow instruction. The int8
-MMQ route that the sdot4 probe was meant to clear is therefore not
-implementable on gfx1151, and no int8 GEMM, repack, or ABI entry was added. The
-rocWMMA int8 tile measures 2.4x the FP32 FMA rate, so an int8 tile route through
-rocWMMA is the remaining candidate; it needs a different kernel and numeric
-scheme than the sdot4 plan and is not measured end to end.
-
-Reproduction: `cmake --build build --target yuuka_dot_probe && ./build/yuuka_dot_probe`.
-CMake sets `YUUKA_PROBE_DOT1=0` for the gfx115x targets.
-
-### Gated delta-net blocked chunk (rejected, 2026-11-16)
-
-A 16-row blocked form of the gated delta-net chunk (forward substitution over
-the block's unit lower-triangular delta system, three dense products against the
-block-start state) was implemented and measured against the register-resident
-kernel. Native correctness passed on the first build: state-128 output 2.09e-07
-against the FP32 reference, state update within tolerance, repeatability
-bitwise. Performance did not:
-
-| Variant | `recurrent_chunk` per 512-row chunk | Note |
-| --- | ---: | --- |
-| Register-resident split (incumbent) | 50.9 ms | state held in registers for the whole chunk |
-| Blocked, one workgroup per head | 133.8 ms | 32 workgroups |
-| Blocked, four workgroups per head | 112.0 ms | 128 workgroups, 4-way column split |
-| Blocked, state reads replaced by one line | 106.5 ms | attribution probe, not a valid kernel |
-
-The attribution probe shows the loss is not state traffic: the blocked kernel
-reads and writes the 64 KiB state once per 16-row block (32 times per chunk)
-and making those reads free changes the time by 5%. The cost is the dependent
-instruction chains in the four sequential phases, which the row-serial kernel
-already hides with a register-resident state. The blocked kernel and its q/k
-normalization kernel were deleted; the incumbent kernel and its contract are
-unchanged.
-
-### Prefill attention tiling (2026-11-15)
-
-The prefill attention kernels now process 16 query rows per workgroup with 512
-threads, stage K and V together in 16-key blocks, and pad the per-lane shared
-stride by one float to remove the 8-way bank conflict in the lane-parallel dot
-product and value accumulation. Measurement conditions match the attribution
-run; the F32 KV diagnostic uses the same `ExecuteProfiled` command.
-
-| Chunk start position | F32 KV before | F32 KV after | F16 KV after |
-| ---: | ---: | ---: | ---: |
-| 0 | 48.7 ms | 17.8 ms | 18.5 ms |
-| 2048 | 421.5 ms | 159.4 ms | 174.3 ms |
-| 7680 | 2030.1 ms | 643.1 ms | 657.5 ms |
-
-The F32 position-7680 acceptance target of at most 800 ms is met; the F16
-target of at most 600 ms is not. F16 KV is slightly slower at every measured
-position after V staging because the staged tile is FP32 and the F16 load path
-adds conversion work without reducing the now-cached shared traffic. F32 KV
-therefore remains the default. The lane-padded shared layout is responsible for
-most of the gain; an intermediate version that staged K and V but kept the
-unpadded layout measured 1484 ms at position 7680.
-
-End-to-end prompt curves, `yuuka` HIP, Q4_K_M, greedy, chunk size 512, one
-measured repetition without warmup. These are the workstream C numbers before
-the FFN gate/up fusion; the final numbers are in the next section:
-
-| Prompt tokens | Before | After | Throughput after |
-| ---: | ---: | ---: | ---: |
-| 512 | 1.635 s | 0.992 s | 515.9 tok/s |
-| 2048 | 6.690 s | 4.265 s | 480.2 tok/s |
-| 8192 | 37.687 s | 21.394 s | 382.9 tok/s |
-| 32768 | 340.357 s | 156.868 s | 208.9 tok/s |
-
-The 32768-token run completes with unchanged greedy processing; the sequencing
-target of at least 250 tok/s at that length is not met, but the prefill time is
-2.17x shorter than the recorded Phase 3 run.
-
-The 512-token prefill rate improved from 313.06 to 515.9 tok/s. The
-position-0 chunk profile dropped from 1086 ms to 1001 ms profiled, and from
-1077 ms to 994 ms wall, with GEMM still at 895 ms of the total.
-
-At position 7680 the chunk profile is 1639 ms, with attention at 643 ms (39%),
-GEMM at 905 ms (55%), and the recurrent chunk at 66 ms. Resource report:
-
-| Kernel | VGPR | SGPR | Static LDS | Dynamic LDS | Spills |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `attention_prefill_f32_kernel` | 49 | 48 | 0 | 36,864 B at head_dim 256 | 0 |
-| `attention_prefill_paged_f32_kernel<dense>` | 51 | 63 | 0 | 36,864 B at head_dim 256 | 0 |
-| `attention_prefill_paged_f32_kernel<gated>` | 53 | 61 | 0 | 36,864 B at head_dim 256 | 0 |
-
-### Fused FFN gate/up (2026-11-15)
-
-The prefill FFN now submits one fused gate/up GEMM when both projections select
-the custom WMMA path. The kernel stages one activation tile and both weight
-tiles, accumulates both matrices, and applies SwiGLU in the epilogue, so no gate
-or up intermediate is written and the separate `SILU_MUL` pass is removed. The
-fused kernel uses a 32-wide K step because staging three tiles at the 64-wide
-step raised shared memory to 48 KiB and measured 528 ms for the 32 fused ops;
-the 32-wide step uses 24 KiB and measures 308 ms.
-
-Position-0 chunk, same diagnostic protocol:
-
-| Operation | Before fusion | After fusion |
-| --- | ---: | ---: |
-| Remaining GEMM submissions | 248 / 895 ms | 184 / 534 ms |
-| Fused gate/up submissions | — | 32 / 308 ms |
-| Separate `SILU_MUL` | 32 / 6.3 ms | removed |
-| Recurrent chunk | 63.7 ms | 64.0 ms |
-| Prefill attention | 17.8 ms | 18.1 ms |
-| Profiled chunk total | 1001 ms | 942 ms |
-| Wall chunk total | 994 ms | 938 ms |
-
-The fused path replaces 64 GEMM submissions and 32 elementwise submissions with
-32 fused submissions. Its combined FFN gate/up time is 308 ms against 379 ms
-for the removed GEMM submissions, a 19% reduction for that pair and 5.6% for
-the whole chunk. Greedy output is unchanged:
-`TestGPUChunkedPrefillLongContext` still reports bitwise identical logits at
-chunk sizes 128, 512, and 1024 with top-1 token 33075, and the native fused test
-passes F32/F16/Q4_K/Q6_K at 33 and 70 rows.
-
-Resource report: `gemm_wmma_swiglu_kernel<Q4_K,64,2>` uses 93 VGPRs, 38 SGPRs,
-24,576 B LDS, no spills, and 16 waves/SIMD; the 32-row variant uses the same
-VGPR count and 20,480 B LDS.
-
-End-to-end prefill with the fused path, one measured repetition without warmup:
-
-| Prompt tokens | Before all workstreams | After fusion |
-| ---: | ---: | ---: |
-| 512 | 1.635 s / 313.06 tok/s | 0.931 s / 549.8 tok/s |
-| 2048 | 6.690 s / 306.14 tok/s | 4.008 s / 511.0 tok/s |
-| 8192 | 37.687 s / 217.37 tok/s | 19.854 s / 412.6 tok/s |
-| 32768 | 340.357 s / 96.28 tok/s | 156.562 s / 209.3 tok/s |
-
-The 32768 result is essentially unchanged from the pre-fusion C measurement
-(208.9 tok/s): at that length attention dominates and the FFN pair is a smaller
-share of the chunk.
-
-### Prefill gap closure: Q6_K span loader, parallel convolution, grouped attention (2026-11-16)
-
-Same machine, GGUF, and protocol as the sections above: `yuuka bench --backend
-hip`, `--chunk-size 512`, sequential runs, `--warmup 2 --reps 5` at 512 tokens
-and `--warmup 1 --reps 2` at 8192. llama.cpp `b1b770d90` (build 12359) reports
-`pp512 = 2174.81 ± 35.77 t/s` and `pp8192 = 1974.74 ± 18.98 t/s`
-(`llama-bench -m <gguf> -p 512,8192 -n 0 -r 3 -ngl 99`).
-
-| Change | 512 p50 | 8192 p50 | 8192 tok/s |
-| --- | ---: | ---: | ---: |
-| Before | 0.472 s / 1085 tok/s | 12.688 s | 646 |
-| Q6_K span loader | 0.444 s / 1154 tok/s | — | — |
-| Parallel chunk convolution | 0.423 s / 1209 tok/s | 11.694 s | 701 |
-| Grouped prefill attention | 0.423 s / 1209 tok/s | 11.056 s | 741 |
-
-The 512-token rows are 49 ms faster than the starting point, 11% more
-throughput, and the 8192-token row is 15% faster. Neither row reaches
-llama.cpp's 2175/1975 tok/s.
-
-Per-operation split from `TestGPUProfilePrefill` (512 rows, F32 KV, HIP events
-around every plan operation), before against after:
-
-| Component | Position 0 before | Position 0 after | Position 7680 before | Position 7680 after |
-| --- | ---: | ---: | ---: | ---: |
-| Matmul (`gemm`) | 373.3 ms (248) | 293.4 ms (248) | 372.6 ms | 284.9 ms |
-| Gated delta-net chunk | 66.3 ms | 50.2 ms | 66.7 ms | 50.2 ms |
-| Prefill attention | 18.0 ms | 19.5 ms | 614.8 ms | 561.7 ms |
-| Q6_K dequant (`dequant_f16`) | 36.0 ms (179) | 26.1 ms (120) | 35.8 ms | 26.2 ms |
-| F16 cast (`cast_f16`) | 11.7 ms | 11.5 ms | 11.5 ms | 11.5 ms |
-| Total (profiled) | 480.1 ms | 421.9 ms | 1025.1 ms | 952.2 ms |
-
-The 59-call drop that this table used to attribute to route re-selection inside
-this round does not reproduce. Profiling the round's starting tree (`67d013d`)
-at positions 0, 2048, and 7680 measures `dequant_f16` at 120 calls and 26.2 ms at
-every position, and the tree before the wide-route adoption (`32d22d1`) submits
-no `dequant_f16` op at all (419 plan operations against 723). The Q6_K span
-loader changes only the WMMA kernel's inner loop and cannot move the route, and
-the shape-based rule is position-independent, so the count is 120 wherever the
-wide route is adopted and the 179-call/36.0 ms entry belongs to an intermediate
-route-experiment variant that routed more matrices through the dequant scratch.
-The round's measured starting point is therefore `gemm` 325.8 ms and
-`dequant_f16` 26.2 ms (120) at position 0, against 293.4 ms and 26.1 ms after;
-the table's before column is the earlier route-experiment tree.
-
-Isolated Q6_K cells from `yuuka_prefill_sweep` (`wmma` column, same binary pair):
-
-| Shape | Before | After |
-| --- | ---: | ---: |
-| `M=512 N=2560 K=9216` | 6.115 ms | 3.589 ms |
-| `M=512 N=9216 K=2560` | 4.882 ms | 3.175 ms |
-
-Decoder gates for this round, and their outcome:
-
-| Gate | Target | Measured | Result |
-| --- | --- | --- | --- |
-| Tall K-quant dequant route | max logit diff <= 0.045, top-1 33075 | Q4_K 0.047 (FFN down only), 0.061 (whole tall class); Q5_K 0.079 | rejected, route removed |
-| Q6_K loader | isolated tall cell <= 4.5 ms | 3.589 ms | met, (-41%) |
-| Gated delta-net chunk | `recurrent_chunk` <= 40 ms | 50.2 ms | not met; convolution 26.4 -> 8.7 ms kept, recurrence restored |
-| Grouped attention | position-7680 attention <= 450 ms | 561.7 ms | not met, (-9%); kernel kept because staging is only 70 ms of the old 615 ms |
-| 512-token prefill | <= 0.340 s, else >= 35 ms below 0.480 s | 0.423 s | met on the fallback gate (-49 ms) |
-| 8192-token prefill | >= 750 tok/s | 741 tok/s | not met (-1.2%) |
-| Greedy tokens and chunk invariance | same top-1, max logit diff <= 0.045 | top-1 33075, 0.0419 (baseline 0.042) | met |
-
-Two rewrite attempts were measured and rejected on correctness, not speed. An
-eight-lane split of the recurrent column (16 state rows per lane, 256
-workgroups) reduces `recurrent_chunk` to 27.0 ms, but the reduction reassociates
-the per-column dot products and the 1024-token chunk gate moves from 0.042 to
-0.081 logits; a four-lane variant with pre-normalized q/k, one block barrier per
-row, and shuffle-derived decay and beta preserves the summation order and
-measures 0.0419 on the same gate, but it is no faster than the in-kernel form
-(40.3 ms against 39.9 ms), so the original kernel stayed. The grouped attention
-kernel keeps the reference at 4.1e-07 maximum absolute difference on a native
-2048-position case and is bit-identical to the one-head kernel on the 1024-token
-chunk gate.
-
-Reproduction:
-
-```bash
-MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf
-go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
-/tmp/yuuka-hip bench --model "$MODEL" --backend hip --prompt-tokens 512 \
-  --decode-tokens 1 --warmup 2 --reps 5 --chunk-size 512
-/tmp/yuuka-hip bench --model "$MODEL" --backend hip --prompt-tokens 8192 \
-  --decode-tokens 1 --warmup 1 --reps 2 --chunk-size 512
-YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
-  -run TestGPUProfilePrefill -v -count=1
-./build/yuuka_prefill_sweep | grep Q6_K
-```
-
-### Short-prompt latency and correctness
-
-The Phase 2 baseline at the top of this document submitted 16 prompt tokens
-through the decode graph and measured 1.433 s prefill (11.17 tok/s) and 9.87
-decode tok/s on HIP. With chunked prefill on the same model and prompt length,
-`bench --prompt-tokens 16 --decode-tokens 8 --chunk-size 16` measures 0.137 s
-prefill (117.02 tok/s) and 9.88 decode tok/s. Decode is unchanged; short-prompt
-TTFT improved by 10.5x.
-
-Chunked prefill correctness is checked at two levels:
-
-- `tests/hip/prefill_test.cpp` compares the fused chunk kernels, WMMA GEMM, and
-  Flash Attention against independent float references.
-- `engine/gpu/prefill_test.go` runs the tiny hybrid fixture with chunk sizes 1,
-  3, 7, 16, 17, 33, and 64, requires the same top-1 token as the CPU reference,
-  and enforces a `2e-3` maximum logit difference. It also decodes one token
-  after each chunked prefill and compares that logit vector with the CPU state
-  produced by a single unchunked prefill.
-- `TestGPUChunkedPrefillLongContext` prefills 1024 real-model tokens with chunk
-  sizes 128, 512, and 1024. In the recorded run the three logit vectors were
-  bitwise identical (maximum absolute difference `0`) and selected the same
-  top-1 token. The checked-in test enforces the same top-1 token and a `0.05`
-  maximum absolute logit difference, so it does not by itself guarantee
-  bitwise identity. This is the KV/recurrent-state equivalence check at a
-  context length where the earlier shared-scratch race was observable; the
-  fixed kernel is also checked for bitwise repeatability in the native test.
-
-A 32-token real-model prompt ("Write a short list of colors...") produces the
-same greedy continuation with chunk sizes 7, 16, and 32 as the CPU reference.
-Chunk 7 exercises a partial final chunk (7,7,7,7,4) and mixes WMMA for wide
-projections with batched GEMV for tall ones; chunks 16 and 32 select WMMA for
-every projection. Prefill time is 0.526 s, 0.265 s, and 0.167 s respectively.
-
-### Kernel resource usage
-
-`scripts/kernel_resources.sh` compiles the dispatched kernel families with
-`-Rpass-analysis=kernel-resource-usage`. All listed kernels report zero scratch,
-zero VGPR spills, and 16 waves/SIMD occupancy.
-
-| Kernel | VGPR | SGPR | Static LDS | Dynamic LDS |
-| --- | ---: | ---: | ---: | ---: |
-| `gemm_wmma_kernel<*,64,2>` | 64-75 | 28-34 | 32,768 B | 0 |
-| `gemm_wmma_k32_kernel<*>` | 39-50 | 26-34 | 14,336 B | 0 |
-| `gemm_wmma_swiglu_kernel<*,64,2>` | 93 | 38 | 24,576 B | 0 |
-| `gemm_wmma_swiglu_kernel<*,32,1>` | 93 | 38 | 20,480 B | 0 |
-| `attention_prefill_f32_kernel` | 49 | 48 | 0 | 36,864 B at head_dim 256 |
-| `attention_prefill_paged_f32_kernel<dense>` | 51 | 63 | 0 | 36,864 B at head_dim 256 |
-| `attention_prefill_paged_f32_kernel<gated>` | 53 | 61 | 0 | 36,864 B at head_dim 256 |
-| `gdn_chunk_f32_kernel` | 37 | 70 | 8 B | 2,048 B at state 128 |
-| `gdn_chunk_splitreg_f32_kernel<128>` | 93 | 34 | 1,064 B | 0 |
-| `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 | 0 |
-| `rmsnorm_batch_f32_kernel` | 9 | 18 | 1,024 B | 0 |
-| `rmsnorm_heads_batch_f32_kernel` | 9 | 20 | 1,024 B | 0 |
-| `rope_batch_f32_kernel` | 19 | 18 | 0 | 0 |
-| `kv_write_batch_f32_kernel` | 14 | 34 | 0 | 0 |
-| `embedding_batch_f32_kernel` | 21 | 19 | 0 | 0 |
-| `conv1d_chunk_f32_kernel` | 26 | 34 | 0 | 0 |
-| `cast_f32_to_f16_kernel` | 7 | 18 | 0 | 0 |
-
-Dynamic LDS is set by the launcher and does not appear in the compiler's static
-figure.
-
-### Phase 3 reproduction
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)"
-go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
-
-build/yuuka_prefill_sweep
-scripts/kernel_resources.sh
-
-for p in 128 512 2048; do
-  /tmp/yuuka-hip bench \
-    --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
-    --prompt-tokens "$p" --decode-tokens 16 \
-    --warmup 1 --reps 3 --chunk-size 512
-done
-
-# The recorded 8192 and 32768 runs used one measurement and no warmup.
-for p in 8192 32768; do
-  /tmp/yuuka-hip bench \
-    --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
-    --prompt-tokens "$p" --decode-tokens 16 \
-    --warmup 0 --reps 1 --chunk-size 512
-done
-
-# llama.cpp comparison, same GGUF and device.
-build/bin/llama-bench -m /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  -p 128,512,2048,8192,32768 -n 0 -r 2 -o md
-LD_LIBRARY_PATH=$PWD/build-vk/bin build-vk/bin/llama-bench \
-  -m /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  -p 128,512,2048,8192,32768 -n 0 -r 2 -o md
-```
-
-The llama.cpp Vulkan build requires the Vulkan loader and a gfx1151 ICD. The
-recorded run used Mesa RADV 25.0.7. Warmup and repetition counts differ for the
-longest prompts in the yuuka curves; the values reported below state the actual
-count used.
-
-
-## Phase 4 serving
-
-### Environment and protocol
-
-| Field | Value |
-| --- | --- |
-| Date | 2026-11-11 |
-| Model | `Qwen3.5-4B-Q4_K_M.gguf` |
-| Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
-| Model size | 2,740,937,888 bytes |
-| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
-| ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
-| Host CPU / kernel | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S; Linux 6.17.13-21-pve |
-| Commit / Go | `6a9127e` plus the Phase 4 fixes in this change; Go 1.24.4. `bench/serving` prints `vcs.revision`, `-dirty`, and the toolchain metadata |
-| Power performance level | `auto` reported by the amdgpu sysfs interface |
-| Backend | HIP, paged FP32 KV, block size 16 |
-| Context | 256 positions |
-| Sampling | Greedy, temperature 0 |
-| Prompt | 64 tokens from repeated English prose |
-| Decode | 16 tokens per request |
-| Prefix cache | disabled unless stated |
-| Graph replay | enabled unless stated |
-| Warmup | one request for latency/throughput runs; none for prefix runs |
-
-Measurements use `bench/serving`, which reports queue wait, TTFT, prefill,
-decode, and sampling separately. TTFT is measured from request arrival and
-therefore includes queue wait; queue wait is also reported on its own. The
-benchmark prints the model hash and size, VCS revision (with `-dirty` when
-applicable), Go version, host CPU, kernel, `hipconfig` version, amdgpu power
-performance level, sampling mode, warmup, requests, and concurrency. Run one
-benchmark process at a time; two processes sharing the GPU invalidate both
-results.
-
-### Single-user latency and graph replay
-
-Concurrency 1, 3 measured requests, one warmup request.
-
-| Configuration | Latency P50 | TTFT P50 | Prefill P50 | Decode P50 | Sampling P50 | Tokens/s |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Graph replay | 1.796 s | 0.257 s | 0.245 s | 1.530 s | 1.69 ms | 8.91 |
-| Plain stream | 1.797 s | 0.258 s | 0.246 s | 1.529 s | 3.04 ms | 8.91 |
-
-Graph replay changes decode time by less than run-to-run noise at this context,
-so the server default is the plain stream path. Queue wait was about 2 µs in
-both runs.
-
-### Multi-request throughput
-
-Concurrency 4, 8 measured requests, 64 KV blocks, graph replay enabled.
-
-| Metric | P50 | P95 |
-| --- | ---: | ---: |
-| End-to-end latency | 6.919 s | 7.212 s |
-| Queue wait | 0.205 s | 0.452 s |
-| TTFT | 1.010 s | 1.084 s |
-| Prefill | 0.239 s | 0.245 s |
-| Decode | 1.533 s | 1.534 s |
-| Sampling | 1.64 ms | 1.65 ms |
-
-Aggregate throughput was 0.557 requests/s and 8.915 output tokens/s over a
-14.358 s wall interval. Per-request decode time is unchanged from the
-single-request run. TTFT is higher than in the single-user run because it
-includes queue wait and waits for decode/prefill opportunities on the shared
-stream. The scheduler interleaves request plans on one stream, so concurrency
-improves admission fairness and exposes queue wait, but does not raise aggregate
-token throughput; fused mixed-shape batched kernels are the missing
-optimization.
-
-### Prefix cache
-
-Three identical 64-token prompts at concurrency 1 with the prefix cache enabled
-and no warmup: one miss and two full-prompt hits. The first request's TTFT was
-0.265 s; the two hits had TTFT P50 of 4.78 ms and zero prefill time because the
-cached recurrent state and prompt logits were restored. TTFT includes arrival,
-admission, and sampling overhead, so it is not zero even for a full cache hit.
-Decode time remained 1.533 s. Aggregate throughput was 9.813 output tokens/s.
-
-### Phase 4 correctness evidence
-
-- `go test -tags hip ./engine/gpu ./model/qwen35 ./serving` with
-  `YUUKA_TEST_MODEL` set passes on the Q4_K_M model with the paged kernels and
-  graph replay enabled in the GPU serving tests.
-- Concurrent CPU and HIP requests reproduce isolated-run token sequences and
-  text at the configured concurrency (3 in the checked-in serving tests).
-- Full and partial prefix hits reproduce a fresh run's tokens and text on both
-  backends.
-- Cancellation leaves zero used KV blocks, no active requests, and balanced
-  allocator counters on both backends.
-- Twelve sequential request cycles with the prefix cache disabled leave zero
-  used blocks and no active requests.
-- Native `hip_paged_graph_correctness` covers paged KV writes, paged decode and
-  prefill attention against a float reference, device copies, dynamic graph
-  replay at several positions, and rejection of non-dynamic plans.
-
-### Phase 4 reproduction
-
-```bash
-go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
-
-# Single user, graph replay.
-/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
-  --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
-  --warmup 1 --graph
-
-# Same run on the plain stream path.
-/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
-  --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
-  --warmup 1 --graph=false
-
-# Four concurrent requests.
-/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  --backend hip --ctx 256 --block-size 16 --kv-blocks 64 \
-  --concurrency 4 --requests 8 --prompt-tokens 64 --decode-tokens 16 \
-  --warmup 1 --graph
-
-# Prefix reuse.
-/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
-  --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
-  --warmup 0 --graph --prefix-cache
-```
-
-## Phase 5 expansion features
-
-### Environment and protocol
-
-Phase 5 measurements use the same model, device, ROCm/HIP version, greedy
-sampling, warmup, and repetition settings as the Phase 2/4 sections unless a
-row states otherwise. The KV-format runs use a 128-token prompt and 32 generated
-tokens. The speculative HIP rows use the same 128/32 protocol; the CPU rows in
-that table are a 16-prompt/8-decode negative control. The MoE sweep measures the
-native grouped-expert kernel pipeline on a synthetic single-layer Q4_K shape; no
-supported model runtime executes that pipeline. NPU support is a future task and
-is not part of the Phase 5 benchmark set.
-
-### KV cache formats
-
-Qwen3.5-4B has 8 full-attention layers, 4 KV heads, and head size 256. One KV
-row is 1024 values per layer. The three formats store:
+| Plain greedy | 0.396 s | 0.396 s | 14.050 s | 9.04 | 1.00x |
+| Speculative (`--speculative`) | 0.396 s | 0.509 s | 3.500 s | 36.28 | 4.01x |
+
+The generated tokens are identical to the plain greedy path. TTFT rises because
+the first step drafts and verifies a block before emitting a token. Acceptance
+is prompt-dependent: the repeated-prose benchmark prompt accepts draft blocks
+almost fully, while a prompt with no repeated n-grams falls back to normal
+decode and gains nothing.
+
+## KV cache formats
+
+Qwen3.5-4B has 8 full-attention layers, 4 KV heads, and head size 256, so one
+KV row is 1024 values per layer:
 
 | Format | Bytes per token (K+V) | Relative to F32 | 4096-token request |
 | --- | ---: | ---: | ---: |
@@ -1429,551 +134,303 @@ row is 1024 values per layer. The three formats store:
 | F16 | 32,768 | 0.50x | 128 MiB |
 | Q8_0 | 17,408 | 0.266x | 68 MiB |
 
-| KV format | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
-| --- | ---: | ---: | ---: | ---: |
-| F32 | 0.412 s | 0.412 s | 3.203 s | 9.68 |
-| F16 | 0.411 s | 0.411 s | 3.192 s | 9.71 |
-| Q8_0 | 0.428 s | 0.428 s | 3.180 s | 9.75 |
+At a 128-token prompt and 32 generated tokens, median of three repetitions:
 
-The latency differences are within run-to-run noise. KV format is a memory
-feature, not a decode throughput feature, at this context length. The real-model
-correctness test generated the same six greedy tokens for F32, F16, and Q8_0;
-maximum logit differences from F32 were `1.12e-3` (F16) and `4.53e-2` (Q8_0).
+| KV format | Prefill p50 | Decode p50 | Decode tok/s |
+| --- | ---: | ---: | ---: |
+| F32 | 0.123 s | 3.203 s | 9.68 |
+| F16 | 0.123 s | 3.189 s | 9.72 |
+| Q8_0 | 0.123 s | 3.182 s | 9.74 |
 
-### Speculative decoding
+The differences are inside run-to-run noise: KV format is a memory-capacity
+feature at this context length, and the prefill effect appears only through the
+F16 matrixized-attention default at 2048 tokens or more. The real-model
+correctness test produced the same greedy tokens for all three formats, with
+maximum logit difference from F32 of `1.12e-3` (F16) and `4.53e-2` (Q8_0).
 
-Exact greedy prompt-lookup speculation with `--speculative`, four draft tokens,
-and two-token minimum match. The HIP comparison uses the 128-token
-repeated-prose prompt; the CPU negative control uses 16 prompt tokens and 8
-generated tokens:
+## Isolated kernels
 
-| Path | Prompt/decode | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s | Acceptance |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| HIP plain greedy | 128/32 | 0.412 s | 0.412 s | 3.203 s | 9.68 | — |
-| HIP speculative | 128/32 | 0.429 s | 0.575 s | 1.024 s | 30.26 | 32/32 draft tokens |
-| CPU plain greedy | 16/8 | 7.328 s | 7.329 s | 3.637 s | 1.92 | — |
-| CPU speculative | 16/8 | 7.327 s | 9.996 s | 6.277 s | 1.12 | 0/10 draft tokens |
+### Prefill GEMM
 
-The generated token sequence is identical to the plain greedy path. TTFT rises
-because the first step drafts and verifies a block before emitting its first
-token. The measured decode speedup is about 3.1x; repeated runs ranged from 30.3
-to 31.2 tok/s. On a 24-token real-model test the same settings produced 2.333 s
-baseline decode versus 0.719 s speculative decode with identical tokens.
-`TestSpeculativePartialAcceptanceMatchesGreedy` additionally forces a block
-with one accepted and one rejected draft through a scripted runtime and checks
-the rollback/replay result against plain greedy tokens.
+`build/yuuka_prefill_sweep`, TFLOP/s per cell, five timed repetitions after two
+warmups. `mmq` is the int8 Q8_1 route and includes its activation-quantization
+pass; `wmma` is the custom rocWMMA kernel. K-quant dispatch selects `mmq` for
+`M >= 128` and `N >= 64`.
 
-The CPU reference path is not a speculative target. On the same model with a
-16-token prompt and 8 generated tokens, plain CPU decode was 3.637 s (1.92
-tok/s); speculative decode was 6.277 s (1.12 tok/s) with 10 draft tokens and 0
-accepted. Per-candidate LM-head work and no accepted draft made it slower. GPU
-speedup therefore depends on batched verification and real acceptance; the CPU
-result is recorded as a negative experiment, not a claim.
+| dtype | shape (K -> N) | M | wmma | mmq |
+| --- | --- | ---: | ---: | ---: |
+| Q4_K | 2560 -> 9216 | 128 | 8.4 | 12.8 |
+| Q4_K | 2560 -> 9216 | 512 | 8.5 | 13.7 |
+| Q4_K | 9216 -> 2560 | 128 | 9.6 | 14.5 |
+| Q4_K | 9216 -> 2560 | 512 | 8.2 | 13.7 |
+| Q4_K | 2560 -> 8192 | 128 | 7.7 | 11.4 |
+| Q4_K | 2560 -> 8192 | 512 | 8.6 | 14.0 |
+| Q5_K | 2560 -> 9216 | 128 | 8.3 | 12.2 |
+| Q5_K | 2560 -> 9216 | 512 | 8.1 | 13.0 |
+| Q5_K | 9216 -> 2560 | 128 | 9.3 | 13.7 |
+| Q5_K | 9216 -> 2560 | 512 | 8.0 | 12.8 |
+| Q5_K | 2560 -> 8192 | 128 | 7.6 | 10.8 |
+| Q5_K | 2560 -> 8192 | 512 | 8.6 | 13.4 |
+| Q6_K | 2560 -> 9216 | 128 | 7.5 | 11.4 |
+| Q6_K | 2560 -> 9216 | 512 | 7.7 | 11.9 |
+| Q6_K | 9216 -> 2560 | 128 | 7.3 | 12.8 |
+| Q6_K | 9216 -> 2560 | 512 | 6.2 | 11.0 |
+| Q6_K | 2560 -> 8192 | 128 | 6.9 | 10.0 |
+| Q6_K | 2560 -> 8192 | 512 | 7.8 | 12.3 |
 
-Acceptance is prompt-dependent: a prompt with no repeated n-grams falls back to
-normal decode.
+F16 and Q8_0 rows are not routed through `mmq`; for reference, `wmma` reaches
+8.0-9.2 TFLOP/s on Q8_0 and 3.4-4.7 on F16, while dequantize-plus-rocBLAS
+reaches 16.0-19.0 on F16 for the wide shapes (8.1 on the tall-`K` row) plus the
+dequantize pass, and is rejected for K-quants on numeric grounds.
 
-### MoE grouped expert kernels
+The int8 route profiles at 41.0 instructions (24.8 VALU, 4.9 LDS) and 513 wave
+cycles per 4096-MAC WMMA on Q4_K `2560 -> 9216` at M=512, against an MMA-only
+ceiling of 48-52 TFLOP/s for the same tile geometry. The loop is latency-bound
+on the int32 accumulator dependency; see
+[decisions and rejected routes](#decisions-and-rejected-routes).
 
-Synthetic single-layer Q4_K shapes: 128 experts, top-8, hidden 2048, expert FFN
-768. Times are one route + grouped gate/up + SwiGLU + grouped down + weighted
-reduce on one HIP stream. Per-op times come from `yuuka_plan_execute_profiled`;
-total is the steady-state wall time including the plan submission.
+### Batched GEMV
+
+`build/yuuka_gemv_sweep` at `n_in = n_out = 2560`, two warmups and ten
+repetitions per cell. Values are the batched kernel's speedup over one GEMV
+submission per row:
+
+| dtype | batch 1 | batch 2 | batch 4 | batch 8 | batch 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K | 1.03 | 1.59 | 2.35 | 3.17 | 3.91 |
+| Q5_K | 1.15 | 1.68 | 2.51 | 3.51 | 4.32 |
+| Q6_K | 1.08 | 1.28 | 1.87 | 2.52 | 3.14 |
+| Q8_0 | 0.74 | 0.95 | 1.28 | 1.64 | 1.73 |
+| Q4_0 | 1.03 | 0.96 | 1.33 | 1.59 | 1.97 |
+| Q5_0 | 0.73 | 0.96 | 1.25 | 1.81 | 2.07 |
+| F16 | 0.71 | 0.89 | 1.17 | 1.31 | 1.49 |
+
+K-quants win from batch 2, the other types from batch 4; the dispatch table uses
+those thresholds. Single-request decode always runs batch 1, so this table is
+prefill and batching evidence, not decode evidence.
+
+### Grouped MoE pipeline
+
+Synthetic single-layer shape: 128 experts, top-8, hidden 2048, expert FFN 768,
+Q4_K weights. One route plus grouped gate/up, SwiGLU, grouped down, and weighted
+reduce on one stream:
 
 | Rows | Route ms | Gate/up ms | Down ms | Reduce ms | Total ms | Tokens/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.225 | 0.380 | 0.411 | 0.016 | 1.055 | 948 |
-| 2 | 0.231 | 1.022 | 0.778 | 0.018 | 2.061 | 970 |
-| 4 | 0.240 | 1.969 | 1.470 | 0.021 | 3.670 | 1090 |
-| 8 | 0.245 | 3.731 | 2.747 | 0.026 | 6.749 | 1185 |
-| 16 | 0.251 | 7.274 | 4.870 | 0.029 | 12.409 | 1289 |
-| 32 | 0.253 | 13.806 | 9.453 | 0.038 | 23.462 | 1364 |
+| 1 | 0.220 | 0.389 | 0.401 | 0.015 | 1.023 | 978 |
+| 2 | 0.222 | 0.992 | 0.761 | 0.016 | 1.989 | 1005 |
+| 4 | 0.228 | 1.875 | 1.410 | 0.018 | 3.530 | 1133 |
+| 8 | 0.223 | 3.559 | 2.603 | 0.025 | 6.418 | 1246 |
+| 16 | 0.231 | 6.800 | 4.602 | 0.031 | 11.621 | 1377 |
+| 32 | 0.231 | 12.631 | 8.838 | 0.036 | 21.607 | 1481 |
 
-These are kernel-pipeline numbers, not end-to-end model throughput. Routing and
-reduction are negligible; gate/up and down are limited by packed-weight reads.
-The native F32 grouped-MoE test agrees with a direct reference within `8.7e-9`.
-No supported model runtime executes the grouped HIP kernels, so there is no
-end-to-end MoE throughput number.
+These are kernel-pipeline numbers. No supported model runtime executes the
+grouped HIP kernels, so there is no end-to-end MoE throughput number.
 
-### Q4_0 and Q5_0 GEMV
+## Kernel resource usage
 
-`bench/hip/gemv_sweep` at 2560x2560, one projection per measurement:
+`scripts/kernel_resources.sh` compiles the dispatched families with
+`-Rpass-analysis=kernel-resource-usage`. Every listed kernel reports zero
+scratch and zero VGPR spills. Dynamic LDS is set by the launcher and does not
+appear in the compiler's static figure.
 
-| dtype | Batch 1 per-row ms | Batch 1 batched ms | Batch 8 batched ms | Batch 16 batched ms | Weight MiB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_0 | 0.060 | 0.093 | 0.240 | 0.409 | 3.5 |
-| Q5_0 | 0.102 | 0.092 | 0.263 | 0.433 | 4.3 |
+| Kernel | VGPR | SGPR | Static LDS |
+| --- | ---: | ---: | ---: |
+| `gemm_mmq_kernel<Q4_K>` / `<Q5_K>` / `<Q6_K>` | 176 / 177 / 162 | 48 / 48 / 52 | 0 (64512 B dynamic) |
+| `quantize_q8_1_kernel` | 20 | 27 | 0 |
+| `gemm_wmma_kernel<*,64,2>` | 84-89 | 28-48 | 16,384 B |
+| `gemm_wmma_k32_kernel<*>` | 42-58 | 25-46 | 14,336 B |
+| `gemm_wmma_swiglu_kernel<*,64,2>` | 85-138 | 28-50 | 24,576 B |
+| `gemm_wmma_swiglu_kernel<*,32,1>` | 85-90 | 30-49 | 20,480 B |
+| `gemv_f32_kernel` / `gemv_f16_kernel` | 11 / 11 | 17 / 17 | 1,024 B |
+| `gemv_q8_0_kernel` / `gemv_q6_k_kernel` | 12 / 24 | 17 / 20 | 1,024 B |
+| `gemv_packed_kernel<Q4_0>` / `<Q5_0>` | 13 / 15 | 17 / 17 | 1,024 B |
+| `gemv_k_kernel<Q4_K/Q5_K>` / `<Q6_K>` | 20 / 24 | 18 / 18 | 1,088 B |
+| `gemv_batch_kernel<*>` | 26-34 | 37 | 1,024 B |
+| `attention_prefill_f32_kernel` | 49 | 48 | 0 (36,864 B dynamic) |
+| `attention_prefill_paged_f32_kernel<*>` | 51-53 | 61-63 | 0 |
+| `attention_prefill_paged_gqa_f32_kernel<*>` | 108-119 | 78-79 | 0 |
+| `gdn_chunk_f32_kernel` / `gdn_chunk_splitreg_f32_kernel<128>` | 37 / 93 | 70 / 34 | 8 B / 1,064 B |
+| `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 |
+| `rmsnorm_batch_f32_kernel` / `rmsnorm_heads_batch_f32_kernel` | 9 / 9 | 18 / 20 | 1,024 B |
+| `rope_batch_f32_kernel` | 19 | 18 | 0 |
+| `kv_write_batch_f32_kernel` / `kv_write_paged_kv_kernel` | 14 / 30 | 34 / 36 | 0 |
+| `embedding_batch_f32_kernel` | 21 | 19 | 0 |
+| `conv1d_chunk_f32_kernel` / `conv1d_state_f32_kernel` | 20 / 7 | 40 / 17 | 0 |
+| `cast_f32_to_f16_kernel` / `cast_f16_to_f32_kernel` | 7 / 7 | 18 / 18 | 0 |
+| `moe_route_kernel` / `moe_gate_up_grouped_kernel` / `moe_down_grouped_kernel` / `moe_reduce_add_kernel` | 10 / 23 / 21 / 9 | 32 / 48 / 42 / 21 | 0 / 1,024 B / 1,024 B / 0 |
 
-Batched GEMV wins from batch 4 for Q4_0. The Q5_0 batch-1 difference was within
-run-to-run noise in repeated sweeps; the dispatch table uses batch 4 for both
-Q4_0 and Q5_0. The tensor, GEMV, embedding, and WMMA paths pass randomized
-tests; GEMV and WMMA additionally cover non-aligned dimensions. The embedded
-Q4_0/Q5_0 row test covers both `EMBEDDING` and `EMBEDDING_BATCH`.
+## Serving and server mode
 
-### Phase 5 kernel resource usage
+### In-process scheduler
 
-`scripts/kernel_resources.sh` also compiles the Phase 5 GEMV, WMMA, and MoE
-variants. All rows report zero scratch, zero VGPR spills, and 16 waves/SIMD
-occupancy.
+`bench/serving`, HIP backend, context 256, block size 16, 64-token prompt and 16
+generated tokens, greedy, p50 of three measured requests:
 
-| Kernel | VGPR | SGPR | Static LDS | Dynamic LDS |
-| --- | ---: | ---: | ---: | ---: |
-| `gemv_packed_kernel<Q4_0>` | 13 | 17 | 1,024 B | 0 |
-| `gemv_packed_kernel<Q5_0>` | 15 | 17 | 1,024 B | 0 |
-| `gemv_batch_kernel<Q4_0>` | 28 | 37 | 1,024 B | 0 |
-| `gemv_batch_kernel<Q5_0>` | 29 | 37 | 1,024 B | 0 |
-| `gemm_wmma_kernel<Q4_0>` | 46 | 26 | 14,336 B | 0 |
-| `gemm_wmma_kernel<Q5_0>` | 47 | 26 | 14,336 B | 0 |
-| `moe_route_kernel` | 10 | 32 | 0 | 0 |
-| `moe_gate_up_grouped_kernel` | 23 | 48 | 1,024 B | 0 |
-| `moe_down_grouped_kernel` | 21 | 42 | 1,024 B | 0 |
-| `moe_reduce_add_kernel` | 9 | 21 | 0 | 0 |
+| Configuration | Latency | Queue wait | TTFT | Prefill | Decode | Output tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single request, graph replay | 1.5605 s | 2 µs | 0.1064 s | 0.0935 s | 1.4505 s | 10.21 |
+| Single request, plain stream | 1.5595 s | 8 µs | 0.1044 s | 0.0925 s | 1.4517 s | 10.21 |
+| Concurrency 4, graph replay | 6.3596 s | 0.1051 s | 0.6142 s | 0.0934 s | 1.4896 s | 9.90 aggregate |
 
-### Phase 5 reproduction
+Graph replay is inside noise at this context, so the server default stays the
+plain stream path. Concurrency 4 admits four requests and exposes queue wait and
+scheduler overhead, but aggregate output throughput stays at the single-request
+rate: per-request decode time moves by under 3% from the single-user row because
+each request's decode step reads the full quantized weights on its own. Fused
+mixed-shape multi-request decode batching is not implemented.
 
-```bash
-go test ./...
-go test -tags hip ./...
-ctest --test-dir build --output-on-failure
+Prefix cache, three identical 64-token prompts, no warmup: the first request
+paid 0.109 s TTFT and 0.0956 s prefill; the two subsequent requests reported
+4.286 ms TTFT p50 with zero prefill time, and aggregate throughput over the run
+was 10.70 output tokens/s against 10.21 without the cache.
 
-go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
-  --prompt-tokens 128 --decode-tokens 32 --warmup 1 --reps 3 --kv-type f16
-go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
-  --prompt-tokens 128 --decode-tokens 32 --warmup 1 --reps 3 --speculative
+### OpenAI server
 
-./build/yuuka_gemv_sweep
-./build/yuuka_moe_sweep
-scripts/kernel_resources.sh
-go test ./engine -run TestSpeculativePartialAcceptanceMatchesGreedy -v
-YUUKA_TEST_MODEL="$YUUKA_TEST_MODEL" go test -tags hip ./engine/gpu/... \
-  -run 'TestGPURealModelKVFormats|TestGPURealModelSpeculativeMatchesGreedy' -v
-```
+`yuuka-server` with `--backend hip --ctx 4096 --kv-type f32 --max-concurrency 1`
+(4 for the concurrency row) and `llama-server` on the same model and device,
+driven by an identically configured streaming client on localhost, prompt cache
+off, greedy:
 
-## Release decode-length matrix
+| Request | Metric | llama.cpp | yuuka |
+| --- | --- | ---: | ---: |
+| 140-token prompt, ≤128 out | Prefill tok/s | 1028 | 765 |
+| | TTFT | 119 ms | 193 ms |
+| | Decode tok/s | 59.07 | 9.49 |
+| 530-token prompt, ≤128 out | Prefill tok/s | 1630 | 1157 |
+| | TTFT | 287 ms | 465 ms |
+| | Decode tok/s | 56.59 | 8.95 |
+| 2051-token prompt, ≤64 out | Prefill tok/s | 2148 | 1115 |
+| | TTFT | 946 ms | 1848 ms |
+| | Decode tok/s | 50.53 | 7.35 |
+| 4 concurrent, 140-token prompt, ≤64 out | Aggregate decode tok/s | 149.5 | 9.29 |
+| | Per-request decode tok/s | 39.17 | 2.41 |
+| | TTFT median | 371 ms | 690 ms |
 
-This matrix completes the output-length dimension of the first-release
-performance gate. The Phase 3 curves cover the prompt-length dimension; this
-run covers the required 128- and 256-token decode lengths on the validated
-Qwen3.5-4B Q4_K_M file.
+Both servers tokenize the benchmark prompt to the same length (140, 530, 2051),
+so the prefill comparison is like for like. yuuka-server prefill throughput sits
+5-28% below the CLI rows at comparable prompt lengths (28% at ~140 tokens, 13%
+at ~530, 5% at ~2050); that span covers the chat template, the HTTP path, and
+server scheduling, so CLI and server numbers are not interchangeable.
 
-| Field | Value |
-| --- | --- |
-| Date | 2026-11-13 |
-| Model | `Qwen3.5-4B-Q4_K_M.gguf` |
-| Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
-| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
-| ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
-| Host CPU / kernel | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S; Linux 6.17.13-21-pve |
-| Code commit / Go | `a67ec00`; Go 1.24.4 |
-| Backend / KV | HIP, F32 KV |
-| Execution path | Single request, plain stream (no HIP Graph replay) |
-| Prompt | 128 tokens from the bench prompt generator |
-| Sampling | Greedy, temperature 0 |
-| Warmup / repetitions | 1 / 3 |
-| Power performance level | `auto` reported by the amdgpu sysfs interface |
+## llama.cpp comparison
 
-| Decode tokens | Context | Prefill p50 / p95 | TTFT p50 / p95 | Decode p50 / p95 | Decode tok/s |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 320 | 0.409 s / 0.409 s | 0.409 s / 0.410 s | 13.223 s / 13.231 s | 9.60 |
-| 256 | 448 | 0.411 s / 0.412 s | 0.411 s / 0.412 s | 26.838 s / 26.846 s | 9.50 |
+`llama-bench -ngl 99 -b 512 -ub 512 -r 3`, F16 KV (llama.cpp's default; its
+`llama-bench` rejects an `f32` KV type), against the yuuka rows from
+[prefill](#prefill-prompt-length) and [decode](#decode-output-length):
 
-Decode throughput uses `(decode_tokens - 1) / decode p50`, matching the CLI
-report. Decode is weight-bandwidth bound; the two rows differ by about 1%.
+| Test | llama.cpp t/s | yuuka t/s | yuuka/llama |
+| --- | ---: | ---: | ---: |
+| pp128 | 1743.28 ± 233.98 | 1061.7 (F32 KV) | 0.61 |
+| pp512 | 2346.17 ± 80.87 | 1323.7 (F32 KV) | 0.56 |
+| pp2048 | 2409.70 ± 5.39 | 1175.9 (F32 KV) / 1207.2 (F16 KV) | 0.49 / 0.50 |
+| pp8192 | 2170.79 ± 4.19 | 788.4 (F32 KV) / 1109.4 (F16 KV) | 0.36 / 0.51 |
+| tg128 (prompt 128) | 62.29 ± 0.19 | 9.61 (F32 KV) | 0.15 |
 
-Reproduction:
+The remaining gaps, in order of size:
 
-```bash
-go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
+1. Decode, 6.5x: llama.cpp streams the 2.74 GB of quantized weights at about
+   170 GB/s, near the practical memory roofline; yuuka's single-request GEMV
+   path reaches roughly 26 GB/s, and its decode step is dominated by that pass.
+2. Prefill at short and mid prompt lengths, 1.6-2.1x: the quantized prefill GEMM
+   runs at 13-14 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
+   24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see
+   [isolated kernels](#isolated-kernels)), and the gated delta-net chunk adds
+   further time yuuka does not measure separately here.
+3. Long-context prefill, 2.0-2.8x: the gap narrows with the F16 matrixized
+   attention default and stays widest with F32 KV, where the tiled attention
+   kernel is the limiter.
+4. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
+   into one weight pass; yuuka re-reads the weights per request because fused
+   mixed-shape decode batching is not implemented.
 
-for n in 128 256; do
-  /tmp/yuuka-hip bench \
-    --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
-    --prompt-tokens 128 --decode-tokens "$n" --warmup 1 --reps 3
-done
-```
+## Decisions and rejected routes
+
+Each of these is a measured decision that still holds in the current code:
+
+- **FP32 accumulation is required.** FP16 compute with an FP16 destination
+  moves the 512-token prefill logits by 0.305 against the 0.05 chunk gate, so
+  every prefill matmul keeps an FP32 accumulator.
+- **The dequantize-plus-rocBLAS prefill route is removed** for K-quants. It was
+  1.6-3.3x faster per GEMM from 256 rows upward but numerically rejected on
+  tall-K shapes and needed an FP16 copy of every weight matrix; the int8 MMQ
+  route replaced it.
+- **MMQ schedule variants are rejected.** Vectorizing both scale tiles (0.98x
+  over 18 cells, and Q5_K began spilling), hoisting every per-lane index base
+  (1.00x), and a double-accumulator ping-pong (0.93x, 11 spill slots) all lost
+  to the committed schedule. The loop is latency-bound on the int32 accumulator
+  dependency, so instruction count and LDS traffic are not the limiter.
+- **128-row WMMA tiles and a 64-wide K step are rejected** for the custom GEMM.
+  The 64x64/K32 and 32x64 variants remain the dispatch choice for the paths they
+  serve, and the wide K-quant shapes in this report come from the int8 MMQ route
+  instead.
+- **Prefill attention** keeps the tiled kernel for F32 KV, for Q8_0 KV, and
+  below 2048 attention tokens; the matrixized rocBLAS path is the F16 default
+  from 2048 tokens. Restructuring the paged attention traversal by row phase
+  and splitting the GQA key traversal into four partitions were measured and
+  rejected.
+- **Disabled by default:** the FFN FP16 weight cache (removed with the
+  dequantize route) and HIP Graph replay (no gain at the serving contexts
+  measured). Speculative decoding is opt-in: exact and 4x faster on repetitive
+  prompts, no gain where draft acceptance is low.
+- **Known limits:** decode throughput is a single-request weight-bandwidth
+  number until fused multi-request decode batching exists; NPU execution is a
+  diagnostic probe only; MoE grouped kernels have no supported model runtime;
+  the longest measured prompt is 8192 tokens at chunk 512.
 
 ## Reproduction
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
-
-go build -o /tmp/yuuka-cpu ./cmd/yuuka
 go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
+go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
+MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf
 
-/tmp/yuuka-cpu bench \
-  --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
-  --prompt-tokens 16 --decode-tokens 8 --warmup 1 --reps 3 --hash
-
-/tmp/yuuka-hip bench \
-  --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
-  --prompt-tokens 16 --decode-tokens 16 --warmup 1 --reps 3 --hash
-```
-
-The benchmark tool reports P50 and P95 over the measured repetitions. It does
-not yet record power, clock, or thermal state.
-
-## 2026-11-17 gfx1151 Qwen3.5-4B Q4_K_M prefill tuning
-
-This is a fresh single-request A/B measurement of the exact validated Unsloth
-`Qwen3.5-4B-Q4_K_M.gguf` on the AMD Ryzen AI Max+ 395 (`gfx1151`, 40 CUs),
-inside a Debian Trixie Incus LXC on `aia2`. Model SHA-256:
-`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`.
-ROCm 10.1 layout, HIP 7.16.26385, Go 1.24.4, F32 KV, 512-token prefill
-chunks, one concurrent request, one warmup and three measured repetitions,
-median (`p50`) reported. Decode length was one token solely to isolate prefill.
-The original source baseline was commit `0db8406`; all variants used the same
-GGUF and GPU. These are observations, not guaranteed speedups: device clock,
-power, and thermal state were not pinned.
-
-| Prompt tokens | Original prefill (s) | Reused FFN activation cast, cache off (s) | Optional 3072 MiB FFN cache (s) |
-| ---: | ---: | ---: | ---: |
-| 128 | 0.189 | 0.202 | 0.192 |
-| 512 | 0.491 | 0.431 | 0.609 |
-| 2048 | 2.745 | 2.808 | 2.728 |
-| 8192 | 15.610 | 15.193 | 15.143 |
-
-The one-pass comparisons are sensitive to changing power/clock conditions. To
-check the seemingly large 512-token effect, we also compiled the original and
-optimized Go sources into separate binaries linked against the *same* original
-HIP library and ran them in three interleaved cycles. Each row still includes
-one warmup and three repetitions:
-
-| Cycle | Original 512-token p50 (ms) | Optimized 512-token p50 (ms) |
-| ---: | ---: | ---: |
-| 1 | 530 | 489 |
-| 2 | 580 | 603 |
-| 3 | 595 | 566 |
-
-The cross-cycle medians are 580 and 566 ms (about 2.5%), with overlapping
-variation. **No large or consistent default-path improvement is established.**
-The source optimization nonetheless removes one redundant FP32-to-FP16 cast
-per FFN gate/up pair whenever both select the dequant+rocBLAS path.
-
-> **Removed 2026-11-17.** The dequantize-plus-rocBLAS prefill route and the
-> `YUUKA_PREFILL_F16_CACHE_MIB` FFN weight cache were removed when the int8 MMQ
-> route replaced them for K-quant weights; the environment variable is no longer
-> read. The measurements below are the record of the removed route.
-
-`YUUKA_PREFILL_F16_CACHE_MIB` explicitly reserves an upper limit of MiB for
-*only* FFN gate/up weights decoded into FP16 when opening a GPU model. It is
-disabled by default (`unset`, `0`). Supported values are 0-16384. The original
-quantized buffers remain loaded and continue to serve decode. The cache
-fills once per shared model and is released with it. `3072` fits this model's
-FFN gate/up weights but materially slows the 512-token case; **leave it off
-for ordinary requests**. Test it only after characterizing your workload and
-checking device memory headroom. Cache initialization latency is excluded
-from prefill measurements above.
-
-Example reproduction inside the development container:
-
-```bash
-export LD_LIBRARY_PATH=/opt/rocm/lib:/root/yuuka/build
-MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
-sha256sum "$MODEL"
-for N in 128 512 2048 8192; do
-  ./bin/yuuka-hip bench --model "$MODEL" --backend hip \
-    --prompt-tokens "$N" --decode-tokens 1 --warmup 1 --reps 3 \
-    --chunk-size 512 --kv-type f32
-done
-# Optional, memory-expensive comparison:
-YUUKA_PREFILL_F16_CACHE_MIB=3072 ./bin/yuuka-hip bench \
-  --model "$MODEL" --backend hip --prompt-tokens 8192 \
-  --decode-tokens 1 --warmup 1 --reps 3 --chunk-size 512 --kv-type f32
-```
-
-Correctness: 9/9 native CTest tests passed. With the FP16 cache enabled,
-`TestGPUChunkedPrefillLongContext` and `TestGPUMatchesCPU` passed on the real
-model; chunk 128 versus chunk 512 had maximum logit difference 0.04193, inside
-the existing 0.05 gate. The common cast reuse and optional cache do not change
-the quantization choice or the rocBLAS GEMM accumulation type.
-
-Profile with `TestGPUProfilePrefill`: at absolute position 0, GEMM took about
-348.5/499.9 ms of profiled execution (69.7%). At position 7680, paged prefill
-attention took about 579.9/1010.4 ms (57.4%). Larger gains likely require
-improving GEMM at short contexts and the long-context attention kernel rather
-than expanding all weights by default. A tested alternative that changed
-rocBLAS C/D to FP32 reduced throughput severely (512-token p50 0.862 s);
-substituting a conditional online-softmax update in the GQA attention kernel
-also regressed the 8192-token p50 from 15.610 to 15.964 s. Both changes were
-rejected and are not part of the branch.
-
-## 2026-11-17 gfx1151: matrixized attention (default for F16 KV)
-
-The distinct paged-GQA prefill kernel is the default when the **F16 KV cache**
-is selected and the current attention context reaches 2048 tokens. It packs
-queries, gathers logical K/V pages, uses rocBLAS QK and PV GEMMs, performs a
-causal FP32 softmax, then applies Qwen3.5 attention gating. It uses a reusable
-bounded scratch buffer (maximum 4096 MiB) shared by all attention layers; F32,
-Q8_0, and earlier F16 contexts retain the existing tiled kernel. When the
-scratch would exceed the 4096 MiB budget, the model keeps the tiled kernel
-rather than failing to open. The regular decode backend is unchanged. The
-default is **on for F16 KV**.
-
-The benchmark used the same verified Unsloth `Qwen3.5-4B-Q4_K_M.gguf`
-(`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`),
-on the same `aia2` Strix Halo gfx1151 (40 CUs), Debian Trixie Incus LXC, ROCm
-10.1 / HIP 7.16.26385, F16 KV, single request, 1 warmup and 2 repetitions
-for the BLAS rows. Times are median prefill latency. The full 512-token
-microbatch configuration is reproduced below, rather than quoting mixed
-historical numbers.
-
-| Prompt | Yuuka tiled baseline F16 KV / chunk | Yuuka BLAS attention F16 KV / chunk | llama.cpp F16 KV, FA on, ubatch 512 |
-| ---: | ---: | ---: | ---: |
-| 512 | 0.472s / 512 | 0.525s / 512 | ~1948 tok/s |
-| 2048 | 2.593s / 512 | 2.113s / 512 | ~1828 tok/s |
-| 8192 | 15.443s / 512 | 8.235s / 512 | ~1585 tok/s |
-
-Under their respective 512-token chunk settings, the 8192-token rate improves
-from about **530 tok/s to 995 tok/s** (1.88x), still below llama.cpp (1585
-tok/s). At prompt 2048, opting for a single 2048-token Yuuka chunk yields
-1.952s (1049 tok/s); at 8192 with a 2048-token chunk, materializing the
-larger score matrices is counterproductive: 9.049s (905 tok/s).
-
-A full-model F16-KV differential test in
-`engine/gpu/blas_attention_compare_test.go` measures maximum logit difference
-from Yuuka's original tiled path of **0.0132079** after a 2048-token prompt
-and **0.00757194** after an 8192-token prompt. Both preserve top-1, below the
-existing 0.05 tolerance. The paged native test also validates against CPU
-reference (head_dim=64, position 2048) within 2e-4. No speedup is assumed for
-short prompts; contexts below 2048 tokens keep the tiled kernel. The optimized
-attention scratch is ephemeral to the model and can be expensive at high
-context capacities; the 4096 MiB bound makes such pools fall back to the tiled
-kernel.
-
-Reproduce:
-
-```bash
-export LD_LIBRARY_PATH=/opt/rocm/lib:/root/yuuka-blas-attn/build
-MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
-./bin/yuuka-hip bench \
-  --model "$MODEL" --backend hip --kv-type f16 --chunk-size 512 \
-  --prompt-tokens 8192 --decode-tokens 1 --warmup 1 --reps 3
-YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
-  -run "^TestGPUBlasAttentionMatchesTiled$" -count=1 -v
-YUUKA_TEST_MODEL="$MODEL" YUUKA_TEST_BLAS_LONG=1 go test -tags hip ./engine/gpu \
-  -run "^TestGPUBlasAttentionMatchesTiled$" -count=1 -v
-```
-
-Further required work to reach llama.cpp: optimize Q4_K/Q6_K dense and tall
-GEMM kernels, reduce matrixized attention workspace traffic and per-head
-rocBLAS dispatch, and verify accuracy on diverse prompts. A 128-row WMMA tall-K
-candidate and 64-row K32/K64 variants were benchmarked but did **not** give a
-repeatable combined win with matrixized attention; they remain outside this
-branch. Splitting the original GQA key traversal into four partitions yielded
-only a ~2.2% 8192-token gain and is also excluded.
-
-## 2026-11-17 gfx1151: int8 MMQ prefill GEMM
-
-Environment: gfx1151 (Ryzen AI Max+ 395 / Radeon 8060S), ROCm/HIP 7.16, 40 CUs,
-Release build, `cmake --build build -j32`, model
-`Qwen3.5-4B-Q4_K_M.gguf` (SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`).
-
-Protocol: `yuuka_prefill_sweep` with two warmups and five timed repetitions per
-cell, median reported; each timed submission includes a `yuuka_event_wait`, so
-the numbers include launch overhead. Activation inputs are a constant 0.25 and
-weights are a fixed-seed random payload with sane scale halfwords, so the
-quantization cost is representative of a steady-state chunk, not of a
-distribution-sensitive worst case. End-to-end runs use `yuuka bench` with
-`--backend hip --decode-tokens 1 --chunk-size 512 --kv-type f32`, two warmups
-and five repetitions, alternating the new binary and a baseline binary that was
-captured before the change; each round prints p50.
-
-### Isolated GEMM, TFLOP/s
-
-`wmma` is the custom rocWMMA kernel, `blasq` the removed dequantize-plus-rocBLAS
-route, `mmq` the new int8 kernel including the Q8_1 pass. Tall-`K` cells leave
-`blasq` empty because that route is numerically rejected there (0.047-0.079
-logits against the 0.045 gate).
-
-| Dtype | Shape | `M` | wmma | blasq | mmq |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Q4_K | 2560 -> 9216 | 128 | 8.5 | 8.2 | 13.1 |
-| Q4_K | 2560 -> 9216 | 512 | 8.4 | 13.8 | 13.5 |
-| Q4_K | 9216 -> 2560 | 128 | 9.7 | - | 14.8 |
-| Q4_K | 9216 -> 2560 | 512 | 8.1 | - | 13.6 |
-| Q4_K | 2560 -> 8192 | 512 | 8.5 | 14.9 | 14.0 |
-| Q5_K | 2560 -> 8192 | 512 | 7.9 | 15.9 | 13.2 |
-| Q6_K | 9216 -> 2560 | 512 | 6.3 | 13.0 | 11.0 |
-| Q6_K | 2560 -> 9216 | 128 | 7.3 | 5.8 | 11.3 |
-
-Full matrix and raw lines: the sweep covers Q4_K/Q5_K/Q6_K at `M` 1-512 and the
-three model shape classes. MMQ is 1.4-1.8x WMMA at every cell of 128 rows or
-more, 7-60% above the dequant route at 128-256 rows, and 2-17% below it on wide
-shapes at 512 rows. Envelope: the same tile with the scale application removed
-and with the fragment loads hoisted out of the loop measures 48 and 52 TFLOP/s,
-so the remaining gap to the int8 WMMA ceiling is the per-block FP32 scale
-application and its accumulator dependencies, not the integer MMA.
-
-### End-to-end 512-token chunk
-
-| Prompt tokens | Baseline p50 | New p50 | Change |
-| ---: | ---: | ---: | ---: |
-| 128 | 0.146 s (876 tok/s) | 0.121 s (1060 tok/s) | +17.4% |
-| 512 | 0.414 s (1237 tok/s) | 0.385 s (1329 tok/s) | +7.1% |
-| 2048 | 1.934 s (1059 tok/s) | 1.764 s (1161 tok/s) | +9.2% |
-
-Three interleaved rounds per size; the 512-token rounds measured 0.385/0.387 s
-against 0.413/0.416 s. The 512-token gain misses the 10% target that was set for
-this port, because the route it replaces was already the faster option on wide
-shapes at that row count: the win comes from the tall projections, where the
-dequant route is numerically rejected and WMMA runs at 6.3-8.1 TFLOP/s.
-
-Numerics: `TestGPUChunkedPrefillLongContext` passes with top-1 `33075` preserved
-and chunk 512/1024 logit difference 0 against the chunk-128 reference;
-`TestGPUMatchesCPU` measures 0.0031 maximum logit difference. Against the
-previous FP16 routes, a 2048-token prompt (chunk 512, F16 KV) measures 0.264
-maximum logit delta and 0.045 mean absolute delta with the top-1 token
-preserved, against a 25.8 peak logit. That delta is the Q8_1 activation grid
-(~4e-3 per value) instead of FP16 staging (~5e-4), compounded across 32 layers,
-and it is the regime llama.cpp's K-quant MMQ prefill runs in. It also raises the
-floor for comparisons between two non-identical routes: the tiled-versus-
-matrixized prefill attention gate measures 0.184 where the FP16 routes measured
-0.0132, and is gated at 0.3 with top-1 still required to match. The native MMQ
-tests check the Q8_1 quantizer digit for digit against a host reimplementation
-and the GEMM against a CPU dot product over the same dequantized activations
-(maximum absolute difference 6.7e-5), which is tighter than the 2e-2 per-GEMM
-bound because int32 accumulation is exact.
-
-Changed resources: prefill scratch drops the largest dequantized weight matrix
-(47 MiB for `2560 -> 9216` in FP16) and gains `xQ8` (one byte per activation) and
-`xDS` (8 bytes per 32 activations); the `YUUKA_PREFILL_F16_CACHE_MIB` FFN cache
-and the `PrefillDequantBLAS` route are gone.
-
-Reproduce:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure -R hip_prefill_correctness
-./build/yuuka_prefill_sweep
-MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
-go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
-LD_LIBRARY_PATH="$PWD/build:/opt/rocm/lib" /tmp/yuuka-hip bench --model "$MODEL" \
-  --backend hip --prompt-tokens 512 --decode-tokens 1 --warmup 2 --reps 5 \
-  --chunk-size 512 --kv-type f32
+ctest --test-dir build --output-on-failure
 YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
   -run 'TestGPUChunkedPrefillLongContext|TestGPUMatchesCPU' -count=1 -v
-```
 
-## 2026-11-17 gfx1151: MMQ prefill GEMM throughput variants
+./build/yuuka_prefill_sweep
+./build/yuuka_gemv_sweep
+./build/yuuka_moe_sweep
+scripts/kernel_resources.sh
 
-Goal: raise `gemm_mmq_kernel<DType>` above its recorded 13.5 TFLOP/s (13.9 in
-the sweep for this section) at Q4_K `2560 -> 9216`, M=512, the prefill matmul
-bottleneck. A same-machine per-operation trace run for this work attributes
-309.8 ms of the 385 ms 512-token chunk to the int8 MMQ family, against the
-177.9 ms llama.cpp matmul time recorded in the 2026-11-16 attribution. Three
-kernel variants were built, measured, and rejected; the committed kernel was
-restored unmodified.
-
-Environment: gfx1151 (Ryzen AI Max+ 395 / Radeon 8060S), ROCm/HIP 7.16, 40 CUs,
-Release build, model `Qwen3.5-4B-Q4_K_M.gguf`. Protocol: `yuuka_prefill_sweep`,
-two warmups and five timed repetitions per cell (median reported), every timed
-submission waited on, so the `mmq` cell includes the Q8_1 activation pass.
-
-Variants, all cumulative on the same file (`kernels/hip/gemm/mmq_gemm.hip`):
-
-| Variant | Change |
-| --- | --- |
-| V1 | Both scale tiles re-laid out so a lane reads its eight weight scales and four activation scales as `float4` runs instead of 16 scalar and 4 strided loads |
-| V2 | Per-lane scale, activation-column, and epilogue index bases hoisted out of the K loop; dtype scale test made compile-time |
-| V3 | Fully unrolled ping-pong: two accumulator slots, next block's MMAs issued before the previous block's scales are applied, factored into `mma_block` / `scale_block` |
-
-Each variant passed `hip_prefill_correctness` unchanged: maximum absolute
-difference against the CPU reference 6.7e-5 for Q4_K and 1.5e-4 for Q5_K, the
-same values the committed kernel reports, with the Q8_1 digits identical.
-Resources:
-
-| Variant | VGPR Q4_K / Q5_K / Q6_K | Spill slots | Dynamic LDS |
-| --- | --- | --- | ---: |
-| Committed | 176 / 177 / 162 | 0 / 0 / 0 | 64512 |
-| V1 | 180 / 192 / 184 | 0 / 6 / 0 | 64512 |
-| V2 | 180 / 181 / 161 | 0 / 0 / 0 | 64512 |
-| V3 | 192 / 192 / 192 | 11 / 12 / 7 | 64512 |
-
-Measurement design: eight full sweeps in palindrome order
-(`baseline, V1, V2, V3, V3, V2, V1, baseline`) so clock drift cancels across the
-sequence; each table entry is the mean of that variant's two rounds. Single-run
-sweeps of the same library varied by up to 4% between positions in the sequence,
-which is why the interleaved design is required for any claim below 5%.
-
-### Isolated GEMM, median over two rounds
-
-`mmq` includes the Q8_1 pass. Ratio is baseline time over variant time, so above
-1.0 means the variant is faster.
-
-| Dtype | Shape | M | baseline ms (TF/s) | V1 | V2 | V3 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_K | 2560 -> 9216 | 128 | 0.472 (12.8) | 0.481 (12.6), 0.982x | 0.468 (12.9), 1.011x | 0.502 (12.0), 0.941x |
-| Q4_K | 2560 -> 9216 | 512 | 1.740 (13.9) | 1.796 (13.4), 0.969x | 1.748 (13.8), 0.995x | 1.915 (12.6), 0.908x |
-| Q4_K | 9216 -> 2560 | 128 | 0.411 (14.7) | 0.420 (14.4), 0.979x | 0.425 (14.2), 0.968x | 0.449 (13.4), 0.918x |
-| Q4_K | 9216 -> 2560 | 512 | 1.765 (13.7) | 1.773 (13.6), 0.995x | 1.749 (13.8), 1.009x | 1.860 (12.9), 0.949x |
-| Q4_K | 2560 -> 8192 | 128 | 0.467 (11.6) | 0.475 (11.3), 0.982x | 0.455 (11.9), 1.026x | 0.497 (10.8), 0.938x |
-| Q4_K | 2560 -> 8192 | 512 | 1.535 (14.0) | 1.550 (13.9), 0.991x | 1.522 (14.1), 1.009x | 1.633 (13.1), 0.940x |
-| Q5_K | 2560 -> 9216 | 128 | 0.503 (12.1) | 0.514 (11.8), 0.980x | 0.482 (12.5), 1.044x | 0.536 (11.2), 0.939x |
-| Q5_K | 2560 -> 9216 | 512 | 1.893 (12.8) | 1.946 (12.4), 0.973x | 1.929 (12.6), 0.981x | 2.014 (12.0), 0.939x |
-| Q5_K | 9216 -> 2560 | 128 | 0.444 (13.6) | 0.446 (13.6), 0.994x | 0.442 (13.7), 1.005x | 0.489 (12.3), 0.906x |
-| Q5_K | 9216 -> 2560 | 512 | 1.891 (12.8) | 1.917 (12.6), 0.987x | 1.907 (12.7), 0.991x | 2.030 (11.9), 0.931x |
-| Q5_K | 2560 -> 8192 | 128 | 0.487 (11.1) | 0.506 (10.6), 0.963x | 0.479 (11.2), 1.017x | 0.530 (10.1), 0.920x |
-| Q5_K | 2560 -> 8192 | 512 | 1.614 (13.4) | 1.680 (12.8), 0.961x | 1.590 (13.6), 1.015x | 1.735 (12.4), 0.930x |
-| Q6_K | 2560 -> 9216 | 128 | 0.536 (11.2) | 0.559 (10.9), 0.958x | 0.546 (11.1), 0.980x | 0.574 (10.5), 0.933x |
-| Q6_K | 2560 -> 9216 | 512 | 2.112 (11.4) | 2.066 (11.7), 1.023x | 2.183 (11.1), 0.967x | 2.236 (10.8), 0.945x |
-| Q6_K | 9216 -> 2560 | 128 | 0.474 (12.8) | 0.490 (12.3), 0.965x | 0.475 (12.7), 0.997x | 0.507 (11.9), 0.934x |
-| Q6_K | 9216 -> 2560 | 512 | 2.197 (11.0) | 2.125 (11.4), 1.033x | 2.157 (11.2), 1.018x | 2.319 (10.4), 0.947x |
-| Q6_K | 2560 -> 8192 | 128 | 0.526 (10.2) | 0.542 (9.9), 0.971x | 0.522 (10.3), 1.010x | 0.562 (9.6), 0.936x |
-| Q6_K | 2560 -> 8192 | 512 | 1.889 (11.4) | 1.854 (11.6), 1.019x | 1.854 (11.6), 1.019x | 1.981 (10.9), 0.954x |
-
-Geometric mean of the time ratio over all 18 cells: V1 0.984x, V2 1.003x, V3
-0.934x. Split by row count: V1 0.975x / 0.994x, V2 1.006x / 1.000x, V3 0.929x /
-0.938x at M=128 / M=512. No cell reaches the 19 TFLOP/s floor on Q4_K
-`2560 -> 9216` at M=512 (baseline 13.9, best variant V2 13.8).
-
-Decision: all three variants fall below the adoption band set for this work
-(1.05x for V1, 1.10x for V2, and 1.10x with at most 4 spill slots for V3). The
-findings are that the scale-tile load count and the index arithmetic are not the
-limit, and that the double-accumulator pipeline does not pay for itself at this
-tile geometry: it needs 96 accumulator registers per lane, and the extra 32 push
-the kernel into 11 spill slots, which costs more than the overlap gains. The
-committed kernel was restored bit-identically (library MD5
-`0ea6d9e45d16c4a298c5c6942dca719d`).
-
-### Profile and end-to-end confirmation on the restored kernel
-
-`rocprofv3 --pmc SQ_INSTS_ALL SQ_INSTS_VALU SQ_INSTS_LDS SQ_WAVE_CYCLES` over 20
-Q4_K `2560 -> 9216` M=512 GEMM launches (Q8_1 pass excluded from the kernel
-window), 2,949,120 WMMAs per launch:
-
-| Counter | Per WMMA |
-| --- | ---: |
-| `SQ_INSTS_ALL` | 41.04 |
-| `SQ_INSTS_VALU` | 24.77 |
-| `SQ_INSTS_LDS` | 4.89 |
-| `SQ_WAVE_CYCLES` | 512.53 |
-
-Kernel-only time is 1.709 ms median for the cell (14.1 TFLOP/s), against 1.74 ms
-for the sweep's `mmq` cell that includes the activation quantization pass. The
-counters reproduce the figures the committed kernel was designed against, so
-none of the variants changed the instruction mix that matters.
-
-End-to-end on the restored kernel, `yuuka bench --backend hip
---prompt-tokens 512 --decode-tokens 1 --chunk-size 512 --kv-type f32`, three
-rounds: TTFT p50 0.387 / 0.388 / 0.387 s, i.e. the recorded 0.385 s baseline.
-`TestGPUChunkedPrefillLongContext` preserves top-1 `33075` with chunk 512/1024
-logit difference 0 against the chunk-128 reference, and `TestGPUMatchesCPU`
-passes.
-
-### Reproduction
-
-```bash
-# Variants live in one file; measure them with saved libraries, with
-# LD_LIBRARY_PATH overriding the build RUNPATH.
-cmake --build build -j"$(nproc)"
-for lib in /tmp/yuuka-opt-baseline /tmp/yuuka-opt-v1 /tmp/yuuka-opt-v2 /tmp/yuuka-opt-v3; do
-  LD_LIBRARY_PATH=$lib ./build/yuuka_prefill_sweep | grep -E "M= (128|512)"
+for p in 128 512 1024 2048 4096 8192; do
+  /tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \
+    --prompt-tokens "$p" --decode-tokens 1 --warmup 2 --reps 5 --kv-type f32
 done
+/tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \
+  --prompt-tokens 8192 --decode-tokens 1 --warmup 2 --reps 5 --kv-type f16
+for d in 128 256; do
+  /tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \
+    --prompt-tokens 128 --decode-tokens "$d" --warmup 2 --reps 3 --kv-type f32
+done
+/tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \
+  --prompt-tokens 512 --decode-tokens 128 --warmup 2 --reps 3 --kv-type f32
+/tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \
+  --prompt-tokens 512 --decode-tokens 128 --warmup 2 --reps 3 --kv-type f32 --speculative
+
+/tmp/yuuka-serving-bench --model "$MODEL" --backend hip --ctx 256 --block-size 16 \
+  --kv-blocks 16 --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 1 --graph
+/tmp/yuuka-serving-bench --model "$MODEL" --backend hip --ctx 256 --block-size 16 \
+  --kv-blocks 64 --concurrency 4 --requests 8 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 1 --graph
+/tmp/yuuka-serving-bench --model "$MODEL" --backend hip --ctx 256 --block-size 16 \
+  --kv-blocks 16 --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 0 --graph --prefix-cache
+
+# llama.cpp reference, same model and device.
+llama-bench -m "$MODEL" -ngl 99 -b 512 -ub 512 \
+  -p 128,512,2048,8192 -n 0 -r 3 -o md
+llama-bench -m "$MODEL" -ngl 99 -b 512 -ub 512 -p 128 -n 128 -r 3 -o md
 ```
 
-The variant libraries are not committed; each is reproduced by the variant
-description above against the committed kernel. The counter run above uses an ad
-hoc harness that quantizes Q4_K `2560 -> 9216`, M=512 activations once through
-`yuuka_quantize_q8_1` and then submits `yuuka_gemm_mmq` 20 times, profiled with
-`--kernel-include-regex gemm_mmq_kernel` so only the GEMM contributes counters.
+Server-mode comparison: start `yuuka-server --model "$MODEL" --backend hip
+--ctx 4096 --kv-type f32 --prefill-chunk 512 --max-concurrency 1
+--prefix-cache=false` and `llama-server -m "$MODEL" -ngl 99 -c 4096 -ctk f16
+-ctv f16 -b 512 -ub 512 -np 1 --jinja`, then post greedy streaming requests to
+`/v1/chat/completions` with `cache_prompt: false` on the llama.cpp side. One
+client thread per request, requests alternating between servers, three
+repetitions per cell.

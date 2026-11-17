@@ -173,7 +173,7 @@ comparison between two non-identical routes therefore sits on that noise floor:
 dispatch in both arms, measures 0.184 instead of 0.0132 and is gated at 0.3 with
 the top-1 token still required to match. This is the accuracy regime that
 llama.cpp's default K-quant prefill path runs in. See
-[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-int8-mmq-prefill-gemm).
+[benchmarks.md](benchmarks.md#isolated-kernels).
 
 Paged KV and graph replay have dedicated native coverage in
 `tests/hip/paged_test.cpp`:

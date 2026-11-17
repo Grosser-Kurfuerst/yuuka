@@ -289,7 +289,7 @@ destination forces that reduction through FP16 (1.1-1.5e-3 measured against
 was also measured: it halves the weight-tile reloads but needs a two-half
 epilogue for the 24 KiB staging alias, and it loses on tall-`K` shapes where the
 extra CTA count matters more. All of these are recorded in
-[benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
+[benchmarks.md](benchmarks.md#decisions-and-rejected-routes).
 
 The 64x64/K32 variant is selected for `rows >= 64` when `K <= N`; the 32x64
 variant remains selected for tall-K projections and smaller batches. Tall-K was
@@ -308,13 +308,15 @@ VGPRs, 28-48 SGPRs, no spills, no scratch, and 16 waves/SIMD. The 32x64 variant
 reports 42-43 VGPRs, 25-46 SGPRs, 14 KiB static LDS, no spills, and 16
 waves/SIMD. Measured on 2026-11-16 with the same binary pair, `M = 512` shapes
 improve 48-50% for Q4_K, 49-54% for Q5_K, 32-49% for Q8_0, 3-23% for Q6_K, and
-14-27% for F16, and the 512-token prefill moves from 544 to 881 tok/s. See
-[benchmarks.md](benchmarks.md#prefill-gemm-span-decode-2026-11-16). The 500 ms
-chunk GEMM gate is still not met. The wide Q4_K shape now runs at 8.5 TFLOP/s,
-which is 2.4x below what hipBLAS reaches on the same shape with fp16 compute
-(33.6 TFLOP/s) and 2.9x below llama.cpp's 24.9 TFLOP/s prefill matmul rate; the
-gap attribution is in
-[benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
+14-27% for F16, and the 512-token prefill moved from 544 to 881 tok/s at the
+time of that change. See [benchmarks.md](benchmarks.md#isolated-kernels).
+
+The int8 MMQ route (6.3) now carries K-quants from 128 rows up, so the current
+numbers for the wide shapes come from it: 13.7 TFLOP/s on Q4_K
+`2560 -> 9216` at `M = 512` against 8.5 for this WMMA tile, and a 512-token
+prefill of 1324 tok/s end to end against llama.cpp's 2346 tok/s on the same
+device. The gap record is in
+[benchmarks.md](benchmarks.md#llamacpp-comparison).
 
 A CTA-order experiment that mapped consecutive blocks to M tiles was measured
 and rejected: it reduced the tall-K time but raised the wide-projection time,
@@ -442,14 +444,13 @@ makes a 512-row chunk read every weight tile 16 times, and the 64-row tile
 halves that, but halving it again with the measured 128-row tile only bought
 6-26% on wide shapes and lost 0.5-15% elsewhere. The kernel is instruction-issue
 bound: 114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS.
-The 2026-11-15 measurements put a 512-token prompt at 516 tok/s; the
-2026-11-16 span-decoding build measures 881 tok/s on the same GGUF and device,
-and the Q6_K span loader plus the parallel convolution measure 1209 tok/s on a
-512-token prompt, against llama.cpp HIP at 2175 tok/s for the 512-token row of
-the current reference build. The 2026-11-16 split is matmul 293 ms, the gated
-delta-net chunk 50 ms, and prefill attention 19 ms at position 0 and 562 ms at
-position 7680. Attention dominates at long positions and was reduced from
-2030 ms to 643 ms at position 7680. The ordered optimization plan and its
+The 2026-11-15 measurements put a 512-token prompt at 516 tok/s, the
+2026-11-16 span-decoding build at 881 tok/s, and the int8 MMQ route now
+measures 1324 tok/s on the same GGUF and device, against llama.cpp HIP at
+2346 tok/s for the same 512-token prompt in the current reference build. The
+2026-11-16 split was matmul 293 ms, the gated delta-net chunk 50 ms, and
+prefill attention 19 ms at position 0 and 562 ms at position 7680; attention at
+position 7680 dropped from 2030 ms to 643 ms. The ordered optimization plan and
 per-workstream status are in [roadmap2.md](roadmap2.md).
 
 ## 7. Attention
@@ -545,7 +546,7 @@ the budget allows. Two keys are scored before either softmax update, which
 overlaps the two shuffle chains. `tests/hip/paged_test.cpp` covers both variants
 (`head_dim` 4 FP32, `head_dim` 64 packed) against the same reference attention
 sweep at 2e-4. Measured effect and the rejected row-phase restructure are in
-[benchmarks.md](benchmarks.md#long-context-attention-packed-k-tile-2026-11-16).
+[benchmarks.md](benchmarks.md#decisions-and-rejected-routes).
 
 ### 7.3 KV cache formats
 
@@ -597,7 +598,7 @@ The native test at position 2048 validates against the float reference within
 of 0.0132079 after a 2048-token prompt and 0.00757194 after an 8192-token
 prompt against the tiled path, with the same top-1 token and below the 0.05
 chunk gate. Performance and reproduction steps are in
-[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-matrixized-attention-default-for-f16-kv).
+[benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 Current limits:
 

@@ -127,9 +127,9 @@ Implemented and tested:
   and a rocBLAS matrixized paged prefill attention path that is the default for
   F16 KV at 2048 or more positions.
 - A split-register gated delta-net chunk kernel that keeps the recurrent state
-  resident for the whole chunk. With the span-decoding prefill GEMM the
-  512-token prefill rate is 881 tok/s, up from 313 tok/s before the delta-net
-  and GEMM work, and position-7680 attention dropped from 2030 ms to 643 ms; the
+  resident for the whole chunk. With the int8 MMQ prefill GEMM the 512-token
+  prefill rate is 1324 tok/s, up from 313 tok/s before the delta-net and GEMM
+  work, and position-7680 attention dropped from 2030 ms to 643 ms; the
   measured status is in [roadmap2.md](roadmap2.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
