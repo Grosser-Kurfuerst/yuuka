@@ -591,6 +591,19 @@ instructions per `(query row, key)` with a five-step shuffle reduction and two
 `expf` in a dependent chain, which measures about 6.5% of peak issue. Reaching
 450 ms needs the arithmetic restructured, not the tile.
 
+### 5.9 Status (2026-11-17): matrixized F16 prefill attention
+
+A rocBLAS matrixized paged prefill path is now the default for F16 KV at 2048
+or more positions. It gathers the causal K/V prefix through the block table,
+runs QK and PV as FP16 GEMMs with FP32 accumulation, and applies the gate
+during unpack. The 8192-token F16 prefill moves from 15.443 s to 8.235 s (530
+to 995 tok/s) under the same 512-token chunk, and the full-model difference
+from the tiled path is 0.0132079 after 2048 tokens and 0.00757194 after 8192
+tokens, with the same top-1 token. F32/Q8_0 and F16 contexts below 2048 tokens
+retain the tiled kernels, and pools whose scratch would exceed 4096 MiB fall
+back to the tiled path. See
+[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-matrixized-attention-default-for-f16-kv).
+
 ## 6. Workstream D: dispatch and planning
 
 These changes are small and must follow, not lead, the kernel work:

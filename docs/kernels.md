@@ -31,10 +31,12 @@ resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
 token and position from device memory, and a C ABI (version 4) for
 device-to-device block copies and HIP Graph capture/replay. KV pools support
-F32 (default), F16, and Q8_0; see section 7.3. Attention remains scalar per lane
-rather than WMMA-based, and continuous batching is scheduler-level interleaving
-of per-request plans; mixed-shape prefill/decode kernel batches and split-KV
-decode are not implemented.
+F32 (default), F16, and Q8_0; see section 7.3. Attention uses scalar per-lane
+kernels for F32/Q8_0 and for F16 contexts below 2048 tokens; F16 contexts at or
+above 2048 tokens use a matrixized rocBLAS path by default (section 7.5).
+Continuous batching is scheduler-level interleaving of per-request plans;
+mixed-shape prefill/decode kernel batches and split-KV decode are not
+implemented.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same
@@ -121,6 +123,7 @@ hard-coded from another GPU.
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
 | `gemm_q6_k_wmma` | Quantized prefill | Scale handling, tile reuse |
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
+| `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
 | `paged_attention` | Decode | Block table, shared KV heads, long-context split |
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
@@ -490,14 +493,42 @@ output gate in the second head-sized half. The plan carries a dense flag in
 retains that variant, but no supported model selects it. The `qwen35` path uses
 the gated layout exclusively.
 
+### 7.5 Matrixized paged prefill attention
+
+`attention_prefill_paged_blas_f16` is selected by default when the KV pool is
+F16 and `position + rows >= 2048`; F32, Q8_0, shorter F16 contexts, and models
+opened with `DisableBlasAttention` keep the tiled paged prefill kernels. Decode
+attention is unaffected.
+
+The kernel packs the query values to FP16, gathers the K/V prefix through the
+block table into reusable contiguous FP16 buffers, runs QK^T and PV as rocBLAS
+GEMMs with FP32 accumulation, applies the causal mask and softmax in a
+256-thread workgroup per `(query row, head)` with an FP32 reduction, writes
+probabilities as FP16, and applies the Qwen3.5 attention gate during unpack.
+The FP16 score and probability matrices trade accuracy for the ability to use
+rocBLAS; the recorded logit difference stays below the chunk gate.
+
+Q, K, V, scores, probabilities, and results share one scratch allocation sized
+`6*q + 4*kv + 6*score` elements, where `q = heads*rows*head_dim`,
+`kv = kv_heads*capacity*head_dim`, and `score = heads*rows*capacity`. The model
+keeps the tiled kernel when that allocation would exceed 4096 MiB, so large KV
+pools remain openable without an opt-in switch.
+
+The native test at position 2048 validates against the float reference within
+2e-4. A full-model F16-KV differential test records maximum logit differences
+of 0.0132079 after a 2048-token prompt and 0.00757194 after an 8192-token
+prompt against the tiled path, with the same top-1 token and below the 0.05
+chunk gate. Performance and reproduction steps are in
+[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-matrixized-attention-default-for-f16-kv).
+
 Current limits:
 
 - Q8_0 KV is supported but not faster than F32 at short context; its benefit is
   cache memory.
-- One workgroup per head, or per group of four query heads above 2048
-  positions; split-KV and WMMA attention are not implemented. Attention is
+- The tiled kernels run one workgroup per head, or per group of four query
+  heads above 2048 positions; split-KV is not implemented. The tiled path is
   6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic at long context,
-  which is the remaining long-context gap.
+  which is the remaining long-context gap for F32/Q8_0 and short F16 contexts.
 - No mixed prefill/decode batch. Each step belongs to one request plan.
 - Block-table entries are immutable for a request; all blocks are allocated at
   admission, so replay and kernels never observe a changing table.

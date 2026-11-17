@@ -1693,15 +1693,17 @@ substituting a conditional online-softmax update in the GQA attention kernel
 also regressed the 8192-token p50 from 15.610 to 15.964 s. Both changes were
 rejected and are not part of the branch.
 
-## 2026-11-17 gfx1151: matrixized attention (opt-in)
+## 2026-11-17 gfx1151: matrixized attention (default for F16 KV)
 
-Experimental `YUUKA_ATTENTION_BLAS=1` enables a distinct paged-GQA prefill
-kernel when **F16 KV cache** is selected and the current attention context
-reaches 2048 tokens. It packs queries, gathers logical K/V pages, uses rocBLAS
-QK and PV GEMMs, performs a causal FP32 softmax, then applies Qwen3.5 attention
-gating. It uses a reusable bounded scratch buffer (maximum 4096 MiB) shared by
-all attention layers; the F32 path and earlier contexts retain the existing
-kernel. The regular decode backend is unchanged. The default is **off**.
+The distinct paged-GQA prefill kernel is the default when the **F16 KV cache**
+is selected and the current attention context reaches 2048 tokens. It packs
+queries, gathers logical K/V pages, uses rocBLAS QK and PV GEMMs, performs a
+causal FP32 softmax, then applies Qwen3.5 attention gating. It uses a reusable
+bounded scratch buffer (maximum 4096 MiB) shared by all attention layers; F32,
+Q8_0, and earlier F16 contexts retain the existing tiled kernel. When the
+scratch would exceed the 4096 MiB budget, the model keeps the tiled kernel
+rather than failing to open. The regular decode backend is unchanged. The
+default is **on for F16 KV**.
 
 The benchmark used the same verified Unsloth `Qwen3.5-4B-Q4_K_M.gguf`
 (`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`),
@@ -1729,15 +1731,17 @@ from Yuuka's original tiled path of **0.0132079** after a 2048-token prompt
 and **0.00757194** after an 8192-token prompt. Both preserve top-1, below the
 existing 0.05 tolerance. The paged native test also validates against CPU
 reference (head_dim=64, position 2048) within 2e-4. No speedup is assumed for
-short prompts; this path is off by default. The optimized attention scratch
-is ephemeral to the model and can be expensive at high context capacities.
+short prompts; contexts below 2048 tokens keep the tiled kernel. The optimized
+attention scratch is ephemeral to the model and can be expensive at high
+context capacities; the 4096 MiB bound makes such pools fall back to the tiled
+kernel.
 
 Reproduce:
 
 ```bash
 export LD_LIBRARY_PATH=/opt/rocm/lib:/root/yuuka-blas-attn/build
 MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
-YUUKA_ATTENTION_BLAS=1 ./bin/yuuka-hip bench \
+./bin/yuuka-hip bench \
   --model "$MODEL" --backend hip --kv-type f16 --chunk-size 512 \
   --prompt-tokens 8192 --decode-tokens 1 --warmup 1 --reps 3
 YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \

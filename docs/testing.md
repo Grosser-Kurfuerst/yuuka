@@ -166,6 +166,11 @@ Paged KV and graph replay have dedicated native coverage in
 - the group-of-four prefill attention kernel runs at `head_dim` 4 (FP32 tile)
   and `head_dim` 64 (packed FP16 K tile with half2 dots) against the same
   reference, covering both staged-tile variants at 2e-4;
+- the matrixized F16 prefill path runs at `head_dim` 64 and position 2048
+  against the same reference, also at 2e-4. The full-model differential test
+  `TestGPUBlasAttentionMatchesTiled` compares the default F16 dispatch against
+  the tiled path selected by `DisableBlasAttention` and enforces the 0.05 logit
+  gate;
 - device-to-device block copies used for private prefix blocks;
 - graph capture and replay with device-resident token/position updates across
   several positions;

@@ -80,9 +80,19 @@ type Options struct {
 	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
 	// Q8_0 are opt-in Phase 5 formats.
 	KVType tensor.DType
+	// DisableBlasAttention keeps the tiled paged prefill attention kernel when
+	// the KV pool is F16. F16 KV otherwise selects the matrixized rocBLAS path
+	// by default. This is an A/B and diagnostic control.
+	DisableBlasAttention bool
 }
 
-const maxPrefillChunk = 4096
+const (
+	maxPrefillChunk = 4096
+	// maxAttentionBlasScratch bounds the reusable per-model scratch allocated
+	// for matrixized prefill attention. Pools whose requirement exceeds the
+	// budget keep the tiled kernel instead of failing model open.
+	maxAttentionBlasScratch = 4096 << 20
+)
 
 // Model owns device weights, shared decode/prefill activations, the KV block
 // pools, and the block allocator. Sessions bind request block tables to the
@@ -107,6 +117,7 @@ type Model struct {
 	kvType    tensor.DType
 	kvRow     uint64
 
+	attentionBlasCapable bool
 	attentionBlasEnabled bool
 	prefillRows          int
 	prefillGen           int64
@@ -153,8 +164,9 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		_ = device.Close()
 		return nil, err
 	}
-	useBlasAttention := os.Getenv("YUUKA_ATTENTION_BLAS") == "1" && opts.KVType == tensor.F16
+	useBlasAttention := opts.KVType == tensor.F16 && !opts.DisableBlasAttention
 	m := &Model{
+		attentionBlasCapable: useBlasAttention,
 		attentionBlasEnabled: useBlasAttention,
 		device:               device,
 		stream:               stream,
@@ -471,22 +483,24 @@ func (m *Model) configurePrefill(rows int) error {
 		{&p.yF16, uint64(rows) * uint64(maxOutWidth) * 2},
 		{&p.tokens, uint64(rows) * 4},
 	}
+	p.attentionBlas = nil
+	m.attentionBlasEnabled = m.attentionBlasCapable
 	if m.attentionBlasEnabled {
 		// Per-chunk reusable FP16 Q/K/V, attention-score, and PV matrices.
-		// Total scratch is limited to 4096 MiB to bound the opt-in cost.
+		// The bound keeps the default path from reserving an unbounded amount
+		// of device memory for large KV pools.
 		qElems := uint64(cfg.HeadCount) * uint64(rows) * uint64(cfg.HeadDim)
 		kvElems := uint64(cfg.KVHeadCount) * uint64(m.capacity) * uint64(cfg.HeadDim)
 		scoreElems := uint64(cfg.HeadCount) * uint64(rows) * uint64(m.capacity)
 		bytes := 6*qElems + 4*kvElems + 6*scoreElems
-		if bytes > 4096<<20 {
-			return fmt.Errorf("gpu: BLAS prefill attention needs %d MiB scratch, exceeds 4096 MiB budget", (bytes+(1<<20)-1)>>20)
+		if bytes > maxAttentionBlasScratch {
+			m.attentionBlasEnabled = false
+		} else {
+			entries = append(entries, struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.attentionBlas, bytes})
 		}
-		entries = append(entries, struct {
-			dst   **hip.Buffer
-			bytes uint64
-		}{&p.attentionBlas, bytes})
-	} else {
-		p.attentionBlas = nil
 	}
 	if maxWeightElems > 0 {
 		entries = append(entries, struct {

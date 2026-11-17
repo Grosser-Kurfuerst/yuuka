@@ -15,7 +15,8 @@ import (
 )
 
 // TestGPUBlasAttentionMatchesTiled compares identical full-model prompts using
-// F16 KV, changing only the experimental attention implementation.
+// F16 KV, changing only the prefill attention dispatch: the tiled kernel
+// against the default matrixized kernel.
 func TestGPUBlasAttentionMatchesTiled(t *testing.T) {
 	path := os.Getenv("YUUKA_TEST_MODEL")
 	if path == "" {
@@ -49,16 +50,12 @@ func TestGPUBlasAttentionMatchesTiled(t *testing.T) {
 	}
 	ids = ids[:n]
 	capacity := n + 64
-	original := os.Getenv("YUUKA_ATTENTION_BLAS")
-	defer os.Setenv("YUUKA_ATTENTION_BLAS", original)
 	var baseline []float32
-	for _, blas := range []bool{false, true} {
-		if blas {
-			os.Setenv("YUUKA_ATTENTION_BLAS", "1")
-		} else {
-			os.Unsetenv("YUUKA_ATTENTION_BLAS")
-		}
-		rt, err := NewWithKVType(reader, model, capacity, tensor.F16)
+	for _, disable := range []bool{true, false} {
+		rt, err := newRuntime(reader, model, capacity, Options{
+			KVType:               tensor.F16,
+			DisableBlasAttention: disable,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,12 +63,16 @@ func TestGPUBlasAttentionMatchesTiled(t *testing.T) {
 			rt.Close()
 			t.Fatal(err)
 		}
+		if got, want := rt.model.attentionBlasEnabled, !disable; got != want {
+			rt.Close()
+			t.Fatalf("BLAS attention enabled=%v, want %v", got, want)
+		}
 		got, err := rt.Forward(ids)
 		rt.Close()
 		if err != nil {
-			t.Fatalf("BLAS=%v: %v", blas, err)
+			t.Fatalf("BLAS=%v: %v", !disable, err)
 		}
-		if !blas {
+		if disable {
 			baseline = append([]float32(nil), got...)
 			continue
 		}

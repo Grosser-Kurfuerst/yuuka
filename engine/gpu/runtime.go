@@ -36,6 +36,12 @@ func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, erro
 
 // NewWithKVType is New with an explicit KV pool storage type.
 func NewWithKVType(reader *gguf.Reader, model *qwen35.Model, capacity int, kvType tensor.DType) (*Runtime, error) {
+	return newRuntime(reader, model, capacity, Options{KVType: kvType})
+}
+
+// newRuntime is NewWithKVType with dispatch overrides for tests and A/B
+// measurement. Pool geometry is derived from capacity.
+func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Options) (*Runtime, error) {
 	if model == nil {
 		return nil, fmt.Errorf("gpu: model is required")
 	}
@@ -52,12 +58,13 @@ func NewWithKVType(reader *gguf.Reader, model *qwen35.Model, capacity int, kvTyp
 		chunk = capacity
 	}
 	m, err := Open(reader, model, Options{
-		Blocks:        blocks,
-		BlockSize:     blockSize,
-		PrefillChunk:  chunk,
-		EnableGraph:   false,
-		GraphMinSteps: 1,
-		KVType:        kvType,
+		Blocks:               blocks,
+		BlockSize:            blockSize,
+		PrefillChunk:         chunk,
+		EnableGraph:          false,
+		GraphMinSteps:        1,
+		KVType:               opts.KVType,
+		DisableBlasAttention: opts.DisableBlasAttention,
 	})
 	if err != nil {
 		return nil, err
