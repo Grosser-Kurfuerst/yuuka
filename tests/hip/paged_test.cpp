@@ -155,7 +155,7 @@ int expect_graph_rejected(context & ctx, yuuka_plan * plan, yuuka_buffer * dynam
 // arrays is a direct comparison. head_dim 4 uses one 32-bit value per lane and
 // head_dim 64 uses the packed FP16 K tile with half2 dots.
 int test_gqa_attention_group4(context & ctx, int head_dim, int position, int rows,
-                              int block_size, int capacity) {
+                              int block_size, int capacity, bool blas = false) {
     const int heads = 4, kv_heads = 1, kv_dim = kv_heads * head_dim;
     const int blocks = capacity / block_size;
     std::vector<int32_t> table(static_cast<size_t>(blocks));
@@ -172,18 +172,22 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
     }
     yuuka_buffer * k_src = upload(ctx, host_k.data(), host_k.size() * sizeof(float));
     yuuka_buffer * v_src = upload(ctx, host_v.data(), host_v.size() * sizeof(float));
-    yuuka_buffer * k_pool = upload(ctx, nullptr, host_k.size() * sizeof(float));
-    yuuka_buffer * v_pool = upload(ctx, nullptr, host_v.size() * sizeof(float));
+    yuuka_buffer * k_pool = upload(ctx, nullptr, host_k.size() * (blas ? 2 : 4));
+    yuuka_buffer * v_pool = upload(ctx, nullptr, host_v.size() * (blas ? 2 : 4));
     yuuka_buffer * table_buf = upload(ctx, table.data(), table.size() * sizeof(int32_t));
     yuuka_buffer * q_buf = upload(ctx, q.data(), q.size() * sizeof(float));
     yuuka_buffer * out = upload(ctx, nullptr, size_t(rows) * heads * head_dim * sizeof(float));
     CHECK(k_src && v_src && k_pool && v_pool && table_buf && q_buf && out);
+    yuuka_buffer * scratch = blas ? upload(ctx, nullptr,
+        (6ULL*heads*rows*head_dim + 4ULL*kv_heads*capacity*head_dim +
+         6ULL*heads*rows*capacity)) : nullptr;
+    CHECK(!blas || scratch);
     // The pool is filled at position 0 and the attention runs at position 2048,
     // so the two ops live in separate plans: the execute position applies to
     // every position-dependent op in the plan.
     yuuka_plan * fill = nullptr;
     CHECK_STATUS(yuuka_plan_create(ctx.device, &fill));
-    {
+    if (!blas) {
         yuuka_op op{};
         op.code = YUUKA_OP_KV_WRITE_BATCH_PAGED;
         op.buf[0] = k_src;
@@ -197,8 +201,14 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
         op.u[1] = capacity;
         CHECK_STATUS(yuuka_plan_add(fill, &op));
     }
-    CHECK_STATUS(yuuka_plan_execute(fill, ctx.stream, 0, 0, 1, ctx.event));
-    CHECK_STATUS(yuuka_event_wait(ctx.event));
+    if (blas) {
+        CHECK_STATUS(yuuka_cast_f32_to_f16(ctx.stream, k_pool, k_src, host_k.size(), ctx.event));
+        CHECK_STATUS(yuuka_cast_f32_to_f16(ctx.stream, v_pool, v_src, host_v.size(), ctx.event));
+        CHECK_STATUS(yuuka_event_wait(ctx.event));
+    } else {
+        CHECK_STATUS(yuuka_plan_execute(fill, ctx.stream, 0, 0, 1, ctx.event));
+        CHECK_STATUS(yuuka_event_wait(ctx.event));
+    }
     yuuka_plan * plan = nullptr;
     CHECK_STATUS(yuuka_plan_create(ctx.device, &plan));
     {
@@ -209,6 +219,8 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
         op.buf[2] = v_pool;
         op.buf[3] = out;
         op.buf[4] = table_buf;
+        op.buf[5] = scratch;
+        op.flags = blas ? YUUKA_OP_FLAG_PREFILL_BLAS : 0u;
         op.n[0] = kv_heads;
         op.n[1] = heads;
         op.n[2] = head_dim;
@@ -216,6 +228,7 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
         op.n[4] = rows;
         op.u[0] = block_size;
         op.u[1] = capacity;
+        op.u[2] = blas ? YUUKA_DTYPE_F16 : YUUKA_DTYPE_F32;
         op.f[0] = 1.0f / std::sqrt(float(head_dim));
         CHECK_STATUS(yuuka_plan_add(plan, &op));
     }
@@ -244,8 +257,9 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
     yuuka_buffer_free(table_buf);
     yuuka_buffer_free(q_buf);
     yuuka_buffer_free(out);
-    std::printf("gqa attention group4 head_dim=%d position=%d: ok (max diff %.3g)\n",
-                head_dim, position, diff);
+    if (scratch) yuuka_buffer_free(scratch);
+    std::printf("gqa attention group4 head_dim=%d position=%d blas=%d: ok (max diff %.3g)\n",
+                head_dim, position, blas ? 1 : 0, diff);
     return 0;
 }
 
@@ -525,6 +539,10 @@ int main() {
         return 1;
     }
     if (test_gqa_attention_group4(ctx, 64, 2048, 16, 16, 2048 + 16) != 0) {
+        teardown(ctx);
+        return 1;
+    }
+    if (test_gqa_attention_group4(ctx, 64, 2048, 16, 16, 2048 + 16, true) != 0) {
         teardown(ctx);
         return 1;
     }

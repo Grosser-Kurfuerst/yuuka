@@ -48,25 +48,26 @@ type activations struct {
 }
 
 type prefillActivations struct {
-	x       *hip.Buffer
-	norm    *hip.Buffer
-	q       *hip.Buffer
-	k       *hip.Buffer
-	v       *hip.Buffer
-	attn    *hip.Buffer
-	tmp     *hip.Buffer
-	qkv     *hip.Buffer
-	z       *hip.Buffer
-	beta    *hip.Buffer
-	alpha   *hip.Buffer
-	conv    *hip.Buffer
-	gdnNorm *hip.Buffer
-	ffnGate *hip.Buffer
-	ffnUp   *hip.Buffer
-	xF16    *hip.Buffer
-	yF16    *hip.Buffer
-	wF16    *hip.Buffer
-	tokens  *hip.Buffer
+	attentionBlas *hip.Buffer
+	x             *hip.Buffer
+	norm          *hip.Buffer
+	q             *hip.Buffer
+	k             *hip.Buffer
+	v             *hip.Buffer
+	attn          *hip.Buffer
+	tmp           *hip.Buffer
+	qkv           *hip.Buffer
+	z             *hip.Buffer
+	beta          *hip.Buffer
+	alpha         *hip.Buffer
+	conv          *hip.Buffer
+	gdnNorm       *hip.Buffer
+	ffnGate       *hip.Buffer
+	ffnUp         *hip.Buffer
+	xF16          *hip.Buffer
+	yF16          *hip.Buffer
+	wF16          *hip.Buffer
+	tokens        *hip.Buffer
 }
 
 // Options configures a shared GPU model and its KV pool.
@@ -106,9 +107,10 @@ type Model struct {
 	kvType    tensor.DType
 	kvRow     uint64
 
-	prefillRows int
-	prefillGen  int64
-	prefillAll  []*hip.Buffer
+	attentionBlasEnabled bool
+	prefillRows          int
+	prefillGen           int64
+	prefillAll           []*hip.Buffer
 
 	specLogits *hip.Buffer
 
@@ -151,20 +153,22 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		_ = device.Close()
 		return nil, err
 	}
+	useBlasAttention := os.Getenv("YUUKA_ATTENTION_BLAS") == "1" && opts.KVType == tensor.F16
 	m := &Model{
-		device:    device,
-		stream:    stream,
-		event:     event,
-		config:    model.Config,
-		alloc:     alloc,
-		weights:   make(map[string]weight, len(reader.Tensors())),
-		blockSize: opts.BlockSize,
-		blocks:    opts.Blocks,
-		capacity:  opts.Blocks * opts.BlockSize,
-		kvType:    opts.KVType,
-		kvRow:     kvRow,
-		poolK:     make([]*hip.Buffer, model.Config.BlockCount),
-		poolV:     make([]*hip.Buffer, model.Config.BlockCount),
+		attentionBlasEnabled: useBlasAttention,
+		device:               device,
+		stream:               stream,
+		event:                event,
+		config:               model.Config,
+		alloc:                alloc,
+		weights:              make(map[string]weight, len(reader.Tensors())),
+		blockSize:            opts.BlockSize,
+		blocks:               opts.Blocks,
+		capacity:             opts.Blocks * opts.BlockSize,
+		kvType:               opts.KVType,
+		kvRow:                kvRow,
+		poolK:                make([]*hip.Buffer, model.Config.BlockCount),
+		poolV:                make([]*hip.Buffer, model.Config.BlockCount),
 	}
 	if err := m.setup(reader, model); err != nil {
 		_ = m.Close()
@@ -466,6 +470,23 @@ func (m *Model) configurePrefill(rows int) error {
 		{&p.xF16, uint64(rows) * uint64(maxWidth) * 2},
 		{&p.yF16, uint64(rows) * uint64(maxOutWidth) * 2},
 		{&p.tokens, uint64(rows) * 4},
+	}
+	if m.attentionBlasEnabled {
+		// Per-chunk reusable FP16 Q/K/V, attention-score, and PV matrices.
+		// Total scratch is limited to 4096 MiB to bound the opt-in cost.
+		qElems := uint64(cfg.HeadCount) * uint64(rows) * uint64(cfg.HeadDim)
+		kvElems := uint64(cfg.KVHeadCount) * uint64(m.capacity) * uint64(cfg.HeadDim)
+		scoreElems := uint64(cfg.HeadCount) * uint64(rows) * uint64(m.capacity)
+		bytes := 6*qElems + 4*kvElems + 6*scoreElems
+		if bytes > 4096<<20 {
+			return fmt.Errorf("gpu: BLAS prefill attention needs %d MiB scratch, exceeds 4096 MiB budget", (bytes+(1<<20)-1)>>20)
+		}
+		entries = append(entries, struct {
+			dst   **hip.Buffer
+			bytes uint64
+		}{&p.attentionBlas, bytes})
+	} else {
+		p.attentionBlas = nil
 	}
 	if maxWeightElems > 0 {
 		entries = append(entries, struct {

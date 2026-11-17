@@ -844,6 +844,28 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
         !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small");
     }
+    if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0) {
+        if (dtype != YUUKA_DTYPE_F16 || op.u[3] != 0 || (op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_BLAS)) != 0) {
+            return fail(YUUKA_ERR_UNSUPPORTED, "BLAS attention requires gated F16 KV");
+        }
+        uint64_t qElems = 0, kvElems = 0, scoreElems = 0, total = 0, scratchBytes = 0;
+        if (__builtin_mul_overflow(heads, rows, &qElems) ||
+            __builtin_mul_overflow(qElems, head_dim, &qElems) ||
+            __builtin_mul_overflow(kv_heads, capacity, &kvElems) ||
+            __builtin_mul_overflow(kvElems, head_dim, &kvElems) ||
+            __builtin_mul_overflow(heads, rows, &scoreElems) ||
+            __builtin_mul_overflow(scoreElems, capacity, &scoreElems) ||
+            __builtin_mul_overflow(qElems, uint64_t(6), &total) ||
+            __builtin_mul_overflow(kvElems, uint64_t(4), &kvElems) ||
+            __builtin_mul_overflow(scoreElems, uint64_t(6), &scoreElems) ||
+            __builtin_add_overflow(total, kvElems, &total) ||
+            __builtin_add_overflow(total, scoreElems, &scratchBytes) ||
+            !buffer_range_ok(op.buf[5], 0, scratchBytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "BLAS attention scratch too small");
+        }
+    } else if ((op.flags & ~YUUKA_OP_FLAG_TAIL) != 0u) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged attention flags");
+    }
     return YUUKA_OK;
 }
 
@@ -1743,12 +1765,22 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                             position, static_cast<unsigned long long>(rows),
                             static_cast<unsigned long long>(capacity));
             }
-            yuuka::launch_attention_prefill_paged_f32(
-                op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
-                op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
-                op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
-                int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
-                int(position), op.f[0], op.u[2], int(op.u[3]), stream);
+            if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0 && uint64_t(position) + rows >= 2048) {
+                const int rc = yuuka::launch_attention_prefill_paged_blas_f16(
+                    op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                    op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
+                    op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
+                    int(op.n[1]), int(op.n[2]), int(rows), int(position),
+                    op.f[0], op_ptr<void>(op, 5), stream);
+                if (rc != 0) return fail(YUUKA_ERR_DEVICE, "BLAS attention failed: %d", rc);
+            } else {
+                yuuka::launch_attention_prefill_paged_f32(
+                    op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                    op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
+                    op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
+                    int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
+                    int(position), op.f[0], op.u[2], int(op.u[3]), stream);
+            }
             break;
         }
         case YUUKA_OP_MOE_ROUTE: {

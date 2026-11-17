@@ -140,6 +140,7 @@ typedef enum yuuka_op_code {
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
+#define YUUKA_OP_FLAG_PREFILL_BLAS 0x2u
 
 /* GEMM implementation selection carried in yuuka_op.u[1]. AUTO uses the
  * compiled default for the dtype. BLAS is the rocBLAS route and requires FP16
@@ -312,7 +313,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                           u[3]=1 selects the dense query layout (no output
  *                           gate), u[3]=0 selects the gated Qwen3.5 layout
  *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
- *                           buf4 block table;
+ *                           buf4 block table; flags bit 1 enables experimental
+ *                           BLAS F16 KV path with buf5 FP16 scratch;
  *                           n={kv_heads,heads,head_dim,kv_dim,rows};
  *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype;
  *                           u[3]=1 selects the dense query layout (no output

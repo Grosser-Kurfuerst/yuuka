@@ -184,6 +184,13 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
                                         hipStream_t stream);
+// Experimental GEMM-based attention with gathered FP16 KV, batched QK/PV
+// matrix multiplication, causal softmax, and gated final FP32 output.
+int launch_attention_prefill_paged_blas_f16(
+    float * out, const float * q, const void * k_pool, const void * v_pool,
+    const int32_t * table, int block_size, int kvheads, int heads, int head_dim,
+    int rows, int position, float scale, void * workspace, hipStream_t stream);
+
 /* MoE routing and grouped expert kernels. ids/weights are [rows, used], counts
  * and assignment buckets are [experts], and each bucket holds up to rows*used
  * assignments. */

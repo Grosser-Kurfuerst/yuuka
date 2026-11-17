@@ -472,7 +472,14 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		return err
 	}
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	if err := plan.AddAttentionPrefillPagedFormatAt(p.q, 0, m.poolK[layerIndex],
+	if m.attentionBlasEnabled {
+		if err := plan.AddAttentionPrefillPagedBlasFormatAt(p.q, 0, m.poolK[layerIndex],
+			m.poolV[layerIndex], p.attn, 0, s.tableBuf, p.attentionBlas,
+			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
+			s.capacity, m.blockSize, scale); err != nil {
+			return err
+		}
+	} else if err := plan.AddAttentionPrefillPagedFormatAt(p.q, 0, m.poolK[layerIndex],
 		m.poolV[layerIndex], p.attn, 0, s.tableBuf,
 		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
 		s.capacity, m.blockSize, scale, m.kvType); err != nil {

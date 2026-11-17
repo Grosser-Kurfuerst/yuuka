@@ -41,6 +41,7 @@ if(YUUKA_ENABLE_HIP)
         kernels/hip/ops/norm.hip
         kernels/hip/ops/rope.hip
         kernels/hip/prefill/prefill.hip
+        kernels/hip/prefill/attention_blas.hip
         kernels/hip/ssm/ssm.hip
     )
     target_include_directories(yuuka_hip PUBLIC
