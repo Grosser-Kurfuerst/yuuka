@@ -383,6 +383,21 @@ TFLOP/s. Software-pipelining the scale application behind the next block's MMAs
 was measured and rejected: it pushed the kernel to 192 VGPRs with 11 spills and
 lost 3-6%.
 
+Three throughput variants were then measured against this schedule, and none
+was adopted (`benchmarks.md`, 2026-11-17 MMQ throughput variants): vectorizing
+both scale tiles so a lane reads each scale run with `float4` instead of scalar
+loads (0.98x geometric mean over 18 M=128/M=512 K-quant cells, and it pushed
+Q5_K to six spills), hoisting every per-lane scale and epilogue index base with a
+compile-time dtype test (1.00x, no spills), and a fully unrolled ping-pong that
+issues the next block's MMAs before applying the previous block's scales (0.93x,
+192 VGPRs and 11 spills). The committed kernel still profiles at 41.0
+instructions per WMMA (24.8 VALU, 4.9 LDS) and 513 wave cycles per WMMA on Q4_K
+`2560 -> 9216` at M=512, against 2,949,120 WMMAs per launch: the loop is
+latency-bound on the int32-accumulator dependency, and neither LDS traffic nor
+index arithmetic is the limiter. Raising throughput requires shortening that
+dependency or changing the accumulator-tile geometry, not reducing instruction
+count.
+
 Tails are masked: rows outside the batch stage zeros (their scales and sums are
 zero) and output rows and channels outside `n_out` are not written. `n_in` must
 be a multiple of 256, which every K-quant row layout already requires. The

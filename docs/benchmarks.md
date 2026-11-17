@@ -1854,3 +1854,126 @@ LD_LIBRARY_PATH="$PWD/build:/opt/rocm/lib" /tmp/yuuka-hip bench --model "$MODEL"
 YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
   -run 'TestGPUChunkedPrefillLongContext|TestGPUMatchesCPU' -count=1 -v
 ```
+
+## 2026-11-17 gfx1151: MMQ prefill GEMM throughput variants
+
+Goal: raise `gemm_mmq_kernel<DType>` above its recorded 13.5 TFLOP/s (13.9 in
+the sweep for this section) at Q4_K `2560 -> 9216`, M=512, the prefill matmul
+bottleneck. A same-machine per-operation trace run for this work attributes
+309.8 ms of the 385 ms 512-token chunk to the int8 MMQ family, against the
+177.9 ms llama.cpp matmul time recorded in the 2026-11-16 attribution. Three
+kernel variants were built, measured, and rejected; the committed kernel was
+restored unmodified.
+
+Environment: gfx1151 (Ryzen AI Max+ 395 / Radeon 8060S), ROCm/HIP 7.16, 40 CUs,
+Release build, model `Qwen3.5-4B-Q4_K_M.gguf`. Protocol: `yuuka_prefill_sweep`,
+two warmups and five timed repetitions per cell (median reported), every timed
+submission waited on, so the `mmq` cell includes the Q8_1 activation pass.
+
+Variants, all cumulative on the same file (`kernels/hip/gemm/mmq_gemm.hip`):
+
+| Variant | Change |
+| --- | --- |
+| V1 | Both scale tiles re-laid out so a lane reads its eight weight scales and four activation scales as `float4` runs instead of 16 scalar and 4 strided loads |
+| V2 | Per-lane scale, activation-column, and epilogue index bases hoisted out of the K loop; dtype scale test made compile-time |
+| V3 | Fully unrolled ping-pong: two accumulator slots, next block's MMAs issued before the previous block's scales are applied, factored into `mma_block` / `scale_block` |
+
+Each variant passed `hip_prefill_correctness` unchanged: maximum absolute
+difference against the CPU reference 6.7e-5 for Q4_K and 1.5e-4 for Q5_K, the
+same values the committed kernel reports, with the Q8_1 digits identical.
+Resources:
+
+| Variant | VGPR Q4_K / Q5_K / Q6_K | Spill slots | Dynamic LDS |
+| --- | --- | --- | ---: |
+| Committed | 176 / 177 / 162 | 0 / 0 / 0 | 64512 |
+| V1 | 180 / 192 / 184 | 0 / 6 / 0 | 64512 |
+| V2 | 180 / 181 / 161 | 0 / 0 / 0 | 64512 |
+| V3 | 192 / 192 / 192 | 11 / 12 / 7 | 64512 |
+
+Measurement design: eight full sweeps in palindrome order
+(`baseline, V1, V2, V3, V3, V2, V1, baseline`) so clock drift cancels across the
+sequence; each table entry is the mean of that variant's two rounds. Single-run
+sweeps of the same library varied by up to 4% between positions in the sequence,
+which is why the interleaved design is required for any claim below 5%.
+
+### Isolated GEMM, median over two rounds
+
+`mmq` includes the Q8_1 pass. Ratio is baseline time over variant time, so above
+1.0 means the variant is faster.
+
+| Dtype | Shape | M | baseline ms (TF/s) | V1 | V2 | V3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K | 2560 -> 9216 | 128 | 0.472 (12.8) | 0.481 (12.6), 0.982x | 0.468 (12.9), 1.011x | 0.502 (12.0), 0.941x |
+| Q4_K | 2560 -> 9216 | 512 | 1.740 (13.9) | 1.796 (13.4), 0.969x | 1.748 (13.8), 0.995x | 1.915 (12.6), 0.908x |
+| Q4_K | 9216 -> 2560 | 128 | 0.411 (14.7) | 0.420 (14.4), 0.979x | 0.425 (14.2), 0.968x | 0.449 (13.4), 0.918x |
+| Q4_K | 9216 -> 2560 | 512 | 1.765 (13.7) | 1.773 (13.6), 0.995x | 1.749 (13.8), 1.009x | 1.860 (12.9), 0.949x |
+| Q4_K | 2560 -> 8192 | 128 | 0.467 (11.6) | 0.475 (11.3), 0.982x | 0.455 (11.9), 1.026x | 0.497 (10.8), 0.938x |
+| Q4_K | 2560 -> 8192 | 512 | 1.535 (14.0) | 1.550 (13.9), 0.991x | 1.522 (14.1), 1.009x | 1.633 (13.1), 0.940x |
+| Q5_K | 2560 -> 9216 | 128 | 0.503 (12.1) | 0.514 (11.8), 0.980x | 0.482 (12.5), 1.044x | 0.536 (11.2), 0.939x |
+| Q5_K | 2560 -> 9216 | 512 | 1.893 (12.8) | 1.946 (12.4), 0.973x | 1.929 (12.6), 0.981x | 2.014 (12.0), 0.939x |
+| Q5_K | 9216 -> 2560 | 128 | 0.444 (13.6) | 0.446 (13.6), 0.994x | 0.442 (13.7), 1.005x | 0.489 (12.3), 0.906x |
+| Q5_K | 9216 -> 2560 | 512 | 1.891 (12.8) | 1.917 (12.6), 0.987x | 1.907 (12.7), 0.991x | 2.030 (11.9), 0.931x |
+| Q5_K | 2560 -> 8192 | 128 | 0.487 (11.1) | 0.506 (10.6), 0.963x | 0.479 (11.2), 1.017x | 0.530 (10.1), 0.920x |
+| Q5_K | 2560 -> 8192 | 512 | 1.614 (13.4) | 1.680 (12.8), 0.961x | 1.590 (13.6), 1.015x | 1.735 (12.4), 0.930x |
+| Q6_K | 2560 -> 9216 | 128 | 0.536 (11.2) | 0.559 (10.9), 0.958x | 0.546 (11.1), 0.980x | 0.574 (10.5), 0.933x |
+| Q6_K | 2560 -> 9216 | 512 | 2.112 (11.4) | 2.066 (11.7), 1.023x | 2.183 (11.1), 0.967x | 2.236 (10.8), 0.945x |
+| Q6_K | 9216 -> 2560 | 128 | 0.474 (12.8) | 0.490 (12.3), 0.965x | 0.475 (12.7), 0.997x | 0.507 (11.9), 0.934x |
+| Q6_K | 9216 -> 2560 | 512 | 2.197 (11.0) | 2.125 (11.4), 1.033x | 2.157 (11.2), 1.018x | 2.319 (10.4), 0.947x |
+| Q6_K | 2560 -> 8192 | 128 | 0.526 (10.2) | 0.542 (9.9), 0.971x | 0.522 (10.3), 1.010x | 0.562 (9.6), 0.936x |
+| Q6_K | 2560 -> 8192 | 512 | 1.889 (11.4) | 1.854 (11.6), 1.019x | 1.854 (11.6), 1.019x | 1.981 (10.9), 0.954x |
+
+Geometric mean of the time ratio over all 18 cells: V1 0.984x, V2 1.003x, V3
+0.934x. Split by row count: V1 0.975x / 0.994x, V2 1.006x / 1.000x, V3 0.929x /
+0.938x at M=128 / M=512. No cell reaches the 19 TFLOP/s floor on Q4_K
+`2560 -> 9216` at M=512 (baseline 13.9, best variant V2 13.8).
+
+Decision: all three variants fall below the adoption band set for this work
+(1.05x for V1, 1.10x for V2, and 1.10x with at most 4 spill slots for V3). The
+findings are that the scale-tile load count and the index arithmetic are not the
+limit, and that the double-accumulator pipeline does not pay for itself at this
+tile geometry: it needs 96 accumulator registers per lane, and the extra 32 push
+the kernel into 11 spill slots, which costs more than the overlap gains. The
+committed kernel was restored bit-identically (library MD5
+`0ea6d9e45d16c4a298c5c6942dca719d`).
+
+### Profile and end-to-end confirmation on the restored kernel
+
+`rocprofv3 --pmc SQ_INSTS_ALL SQ_INSTS_VALU SQ_INSTS_LDS SQ_WAVE_CYCLES` over 20
+Q4_K `2560 -> 9216` M=512 GEMM launches (Q8_1 pass excluded from the kernel
+window), 2,949,120 WMMAs per launch:
+
+| Counter | Per WMMA |
+| --- | ---: |
+| `SQ_INSTS_ALL` | 41.04 |
+| `SQ_INSTS_VALU` | 24.77 |
+| `SQ_INSTS_LDS` | 4.89 |
+| `SQ_WAVE_CYCLES` | 512.53 |
+
+Kernel-only time is 1.709 ms median for the cell (14.1 TFLOP/s), against 1.74 ms
+for the sweep's `mmq` cell that includes the activation quantization pass. The
+counters reproduce the figures the committed kernel was designed against, so
+none of the variants changed the instruction mix that matters.
+
+End-to-end on the restored kernel, `yuuka bench --backend hip
+--prompt-tokens 512 --decode-tokens 1 --chunk-size 512 --kv-type f32`, three
+rounds: TTFT p50 0.387 / 0.388 / 0.387 s, i.e. the recorded 0.385 s baseline.
+`TestGPUChunkedPrefillLongContext` preserves top-1 `33075` with chunk 512/1024
+logit difference 0 against the chunk-128 reference, and `TestGPUMatchesCPU`
+passes.
+
+### Reproduction
+
+```bash
+# Variants live in one file; measure them with saved libraries, with
+# LD_LIBRARY_PATH overriding the build RUNPATH.
+cmake --build build -j"$(nproc)"
+for lib in /tmp/yuuka-opt-baseline /tmp/yuuka-opt-v1 /tmp/yuuka-opt-v2 /tmp/yuuka-opt-v3; do
+  LD_LIBRARY_PATH=$lib ./build/yuuka_prefill_sweep | grep -E "M= (128|512)"
+done
+```
+
+The variant libraries are not committed; each is reproduced by the variant
+description above against the committed kernel. The counter run above uses an ad
+hoc harness that quantizes Q4_K `2560 -> 9216`, M=512 activations once through
+`yuuka_quantize_q8_1` and then submits `yuuka_gemm_mmq` 20 times, profiled with
+`--kernel-include-regex gemm_mmq_kernel` so only the GEMM contributes counters.
