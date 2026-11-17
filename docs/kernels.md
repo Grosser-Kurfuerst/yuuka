@@ -211,8 +211,11 @@ Prefill uses a separate operator family from decode. The runtime selects one of:
   accepts FP32 activations and every supported weight dtype.
 - **rocBLAS FP16**: the external baseline in `kernels/hip/gemm/gemm_blas.hip`.
   It requires an FP16 activation buffer; the planner inserts an explicit cast.
+- **Int8 MMQ**: `kernels/hip/gemm/mmq_gemm.hip` keeps Q4_K/Q5_K/Q6_K weights
+  quantized, quantizes the activations to Q8_1, and accumulates exact int32
+  products in 16x16x16 int8 WMMA. See 6.3.
 
-All three are validated against a float reference built from the exact packed
+All four are validated against a float reference built from the exact packed
 weights. The rocBLAS baseline is a comparison point and a dispatch choice for
 the measured F16 shape classes, not a fallback for unsupported quantization.
 
@@ -332,7 +335,65 @@ Larger tiles, an int8 tensor-core path, and the remaining projection fusions
 remain candidates under [roadmap2.md](roadmap2.md); they are not implemented and
 are not claimed in the benchmark results.
 
-### 6.3 Dispatch
+### 6.3 Int8 MMQ GEMM
+
+`mmq_gemm.hip` follows llama.cpp's MMQ design at the algorithm level (MIT,
+commit `b1b770d90`); staging, tile shape, scale layout, and epilogue are an
+independent implementation validated against the CPU reference in
+`tests/hip/prefill_test.cpp`.
+
+Activation quantization (`quantize_q8_1_kernel`, public ABI
+`yuuka_quantize_q8_1`, plan op `YUUKA_OP_QUANT_Q8_1`): one wave handles 128
+contiguous values, four per lane. Each 32-value block keeps `d = amax/127` and
+`d * sum(q)`, so a Q4_K/Q5_K weight minimum becomes a dot product with the
+activation block sum. Ties round to even (`rintf`). The width must be a multiple
+of 128, so a wave never crosses a row.
+
+`gemm_mmq_kernel<DType>` computes a 64 output-channel by 128 token tile with
+eight waves, a 256-wide K step, and 64512 bytes of dynamic shared memory:
+
+| Slice | Layout | Bytes |
+| --- | --- | ---: |
+| A, decoded weights | `[64][272]` int8 | 17408 |
+| B, Q8_1 activations | `[128][272]` int8 | 34816 |
+| A scales | `[16][64]` float, scale-slot major | 4096 |
+| B scales | `[8][128]` float2, block major | 8192 |
+
+Each wave owns one 16-row weight fragment at `row_base = (warp % 4) * 16` and
+four 16-column activation fragments at `col_base = (warp / 4) * 64`. The int32
+accumulator mapping is fixed by the builtin and was measured against the CPU
+product on this device: lane `l`, element `e` holds output row
+`2*e + l/16` of column `l%16`, so a lane applies one activation scale (its
+column) and eight weight scales (its rows) per block.
+
+Both tiles use a 272-byte row stride, not 256. At 256 every row of a tile starts
+on the same shared-memory bank and the 16x16 int8 fragment loads conflict 16
+ways: the identical compute loop measures 12.5 TFLOP/s at 256 bytes against
+48.1 TFLOP/s at 272 bytes. The padding costs 1 KiB per tile.
+
+The Q4_K/Q5_K scale (one per 32 values) is applied after each pair of 16-wide
+slices, which is exact because the int32 partial sum is exact and the scale is
+constant across the block; the minimum term adds `-(d_m * m) * d_a * sum(q)`.
+Q6_K has one scale per 16 values and no minimum, so it applies the scale per
+slice. The weight scales load once per block and are reused by all four
+accumulator tiles. `MMA -> accumulate -> scale` dependencies are what limit this
+kernel: the MMA-only ceiling for the same geometry is 52 TFLOP/s (no fragment
+loads) and 48 TFLOP/s with loads, while the full kernel measures 10.4-14.8
+TFLOP/s. Software-pipelining the scale application behind the next block's MMAs
+was measured and rejected: it pushed the kernel to 192 VGPRs with 11 spills and
+lost 3-6%.
+
+Tails are masked: rows outside the batch stage zeros (their scales and sums are
+zero) and output rows and channels outside `n_out` are not written. `n_in` must
+be a multiple of 256, which every K-quant row layout already requires. The
+epilogue reuses the operand staging area as a `[128][65]` float tile, then all
+256 threads write coalesced over the output channel.
+
+Measured resources on gfx1151: 163-178 VGPRs, 48-52 SGPRs, no spills, no
+scratch, 8 waves/SIMD, dynamic LDS 64512. The quantizer reports 20 VGPRs and 16
+waves/SIMD.
+
+### 6.4 Dispatch
 
 Dispatch is based on `M`, `N`, `K`, quantization type, and the measured row
 class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
@@ -342,7 +403,7 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 | --- | --- |
 | `M < 4` | Batched GEMV |
 | Quantized, `M < 8`, and `K > N` | Batched GEMV |
-| K-quant, `K <= N`, `M >= 128` | Dequantize to FP16 + rocBLAS (FP32 compute) |
+| K-quant, `N >= 64`, `M >= 128` | Int8 MMQ (Q8_1 activations, int32 WMMA) |
 | Quantized, other `M >= 4` | Custom rocWMMA |
 | F16, `4 <= M <= 64`, `K > N` | rocBLAS + cast |
 | F16, `M < 8`, `K <= N` | Batched GEMV |
@@ -351,11 +412,13 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 
 The custom kernel is selected only where the sweep showed it faster than the
 compared baseline, and a library route only where it is both faster and inside
-the numeric gates. The K-quant rocBLAS row is bounded twice: from below by the
-dequantization cost (0.31-0.64x below 128 rows) and on tall-`K` shapes by the
-FP16 split reduction (see 6.2), so `K > N` keeps the custom kernel even though
-the library measures up to 1.8x faster there. F16 baselines include the cast
-cost. A dispatch table entry
+the numeric gates. The K-quant MMQ row is bounded from below by the Q8_1 pass
+and the 128-token tile (it loses to WMMA below 128 rows) and requires
+`N >= 64` because narrower output tiles waste more than half the tile. It
+replaces the dequantize-plus-rocBLAS route for K-quants entirely: that route was
+2-17% faster on wide shapes at 512 rows but is numerically rejected on tall
+shapes (see 6.2), and it needed an FP16 copy of the weight matrix per call. F16
+baselines include the cast cost. A dispatch table entry
 is valid only for the recorded gfx1151 environment; the kernel is not selected
 from assumptions about other RDNA parts.
 

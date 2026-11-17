@@ -115,14 +115,16 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
 
     const bool kquant = dtype == YUUKA_DTYPE_Q4_K || dtype == YUUKA_DTYPE_Q5_K ||
                         dtype == YUUKA_DTYPE_Q6_K;
-    Buffer wb, xb, ob, x16, o16, w16, rowbuf;
+    Buffer wb, xb, ob, x16, o16, w16, rowbuf, qsb, dsb;
     bool ok = alloc(device, wb, weights.size()) &&
               alloc(device, xb, x.size() * 4) && alloc(device, ob, size_t(n_out * rows) * 4) &&
               alloc(device, x16, x.size() * 2) &&
               alloc(device, o16, size_t(n_out * rows) * 2) &&
               alloc(device, rowbuf, size_t(n_in) * 4);
     if (ok && kquant) {
-        ok = alloc(device, w16, size_t(n_in * n_out) * 2);
+        ok = alloc(device, w16, size_t(n_in * n_out) * 2) &&
+             alloc(device, qsb, uint64_t(n_in) * uint64_t(rows)) &&
+             alloc(device, dsb, uint64_t(rows) * uint64_t(n_in / 32) * 8);
     }
     if (ok) {
         ok = check(yuuka_memcpy_h2d(wb.buf, weights.data(), weights.size()), "h2d w") &&
@@ -188,6 +190,16 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
                                   rows, event);
         }, wait_event));
     }
+    // The MMQ route quantizes the activations on every call, so the Q8_1 pass is
+    // part of the measured time.
+    if (ok && kquant) {
+        results.push_back(bench_rows(device, stream, event, plan, "mmq", 5, [&]() {
+            (void)yuuka_quantize_q8_1(stream, qsb.buf, dsb.buf, xb.buf, n_in, rows,
+                                      event);
+            (void)yuuka_gemm_mmq(stream, ob.buf, qsb.buf, dsb.buf, wb.buf, n_in, n_out,
+                                 rows, dtype, event);
+        }, wait_event));
+    }
     if (ok) {
         const double weight_gb = double(weights.size()) / 1e9;
         const double flops = 2.0 * double(n_in) * double(n_out) * double(rows);
@@ -207,6 +219,8 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     }
     if (plan != nullptr) yuuka_plan_destroy(plan);
     release(rowbuf);
+    release(dsb);
+    release(qsb);
     release(w16);
     release(o16);
     release(x16);

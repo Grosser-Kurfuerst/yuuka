@@ -136,7 +136,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_DOWN = 32,
     YUUKA_OP_MOE_REDUCE_ADD = 33,
     YUUKA_OP_GEMM_SWIGLU = 34,
-    YUUKA_OP_DEQUANT_F16 = 35
+    YUUKA_OP_DEQUANT_F16 = 35,
+    YUUKA_OP_QUANT_Q8_1 = 36
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -146,10 +147,14 @@ typedef enum yuuka_op_code {
  * compiled default for the dtype. BLAS is the rocBLAS route and requires FP16
  * weights, an FP16 x, and an FP16 scratch buffer that receives the FP32-accumulated
  * product before it is cast to the FP32 result. WMMA is the custom rocWMMA
- * kernel, which accepts FP32 x and every supported weight dtype. */
+ * kernel, which accepts FP32 x and every supported weight dtype. MMQ is the
+ * int8 route: Q4_K/Q5_K/Q6_K weights, Q8_1 activations produced by
+ * YUUKA_OP_QUANT_Q8_1 in buf[1], their float2 block scales in buf[3], and FP32
+ * output. */
 #define YUUKA_GEMM_PATH_AUTO 0u
 #define YUUKA_GEMM_PATH_BLAS 1u
 #define YUUKA_GEMM_PATH_WMMA 2u
+#define YUUKA_GEMM_PATH_MMQ 3u
 
 typedef struct yuuka_op {
     uint32_t code;
@@ -207,6 +212,26 @@ YUUKA_API yuuka_status yuuka_gemm_wmma(yuuka_stream * stream, yuuka_buffer * out
                         uint64_t n_in, uint64_t n_out, uint64_t batch,
                         uint32_t dtype, yuuka_event * completion);
 
+/* Int8 MMQ prefill route:
+ *
+ * out[batch, n_out] = W[n_out, n_in] * x[batch, n_in]
+ *
+ * The two calls are the split form of one GEMM. yuuka_quantize_q8_1 converts
+ * FP32 activations into Q8_1: qs holds batch*n int8 values and ds holds
+ * batch*(n/32) float2 entries {scale, scale * integer block sum}; n must be a
+ * multiple of 128. yuuka_gemm_mmq multiplies those activations by packed
+ * Q4_K/Q5_K/Q6_K weights, decoding the weights to int8 and accumulating exact
+ * int32 products before the FP32 weight scale is applied. n_in must be a
+ * multiple of 256. Both calls submit on stream and record completion without a
+ * host synchronization. */
+YUUKA_API yuuka_status yuuka_quantize_q8_1(yuuka_stream * stream, yuuka_buffer * qs,
+                        yuuka_buffer * ds, const yuuka_buffer * x,
+                        uint64_t n, uint64_t batch, yuuka_event * completion);
+YUUKA_API yuuka_status yuuka_gemm_mmq(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * qs, const yuuka_buffer * ds,
+                        const yuuka_buffer * w, uint64_t n_in, uint64_t n_out,
+                        uint64_t batch, uint32_t dtype, yuuka_event * completion);
+
 /* rocBLAS prefill route:
  *
  * out[batch, n_out] = W[n_out, n_in] * x[batch, n_in]
@@ -257,8 +282,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
  * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
- * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16, and
- * DEQUANT_F16. Unsupported
+ * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
+ * DEQUANT_F16, and QUANT_Q8_1. Unsupported
  * dtypes and widths that violate the quantization block layout fail with
  * YUUKA_ERR_UNSUPPORTED; invalid dimensions, batch sizes, and undersized
  * buffers fail with YUUKA_ERR_INVALID_ARGUMENT. A rejected operation is not
@@ -291,6 +316,12 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   CAST_F16:            buf0 FP32 src, buf1 FP16 dst; n[0]=elements
  *   DEQUANT_F16:         buf0 packed weights, buf1 FP16 dst;
  *                        n[0]=n_in, n[1]=n_out, u[0]=dtype
+ *   QUANT_Q8_1:          buf0 FP32 src, buf1 int8 dst, buf2 float2 block
+ *                        scales; n={n, batch}; n must be a multiple of 128
+ *   GEMM with path MMQ:  buf0 packed weights, buf1 Q8_1 int8 activations,
+ *                        buf2 FP32 out, buf3 float2 block scales;
+ *                        n={n_in,n_out,rows}; u[0]=Q4_K/Q5_K/Q6_K;
+ *                        n_in must be a multiple of 256
  *   GEMM_SWIGLU:         buf0 gate weights, buf1 up weights, buf2 FP32 x,
  *                        buf3 out; n={n_in,n_out,rows}; u[0]=dtype. Both
  *                        weights share dtype and shape; out holds

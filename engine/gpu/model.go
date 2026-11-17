@@ -4,8 +4,6 @@ package gpu
 
 import (
 	"fmt"
-	"os"
-	"strconv"
 	"sync"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
@@ -16,14 +14,8 @@ import (
 )
 
 type weight struct {
-	buf *hip.Buffer
-	// prefill16 is an optional, bounded cache for BLAS prefill only. Decode
-	// continues to use the original quantized buffer.
-	prefill16 *hip.Buffer
-	// elements is the unpacked element count from the GGUF directory. Prefill
-	// scratch sizing uses it to cover the largest quantized matrix.
-	elements uint64
-	dtype    tensor.DType
+	buf   *hip.Buffer
+	dtype tensor.DType
 }
 
 type activations struct {
@@ -66,7 +58,8 @@ type prefillActivations struct {
 	ffnUp         *hip.Buffer
 	xF16          *hip.Buffer
 	yF16          *hip.Buffer
-	wF16          *hip.Buffer
+	xQ8           *hip.Buffer
+	xDS           *hip.Buffer
 	tokens        *hip.Buffer
 }
 
@@ -196,81 +189,11 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 	if chunk > m.capacity {
 		chunk = m.capacity
 	}
-	if err := m.cacheFFNPrefillWeights(); err != nil {
-		_ = m.Close()
-		return nil, err
-	}
 	if err := m.configurePrefill(chunk); err != nil {
 		_ = m.Close()
 		return nil, err
 	}
 	return m, nil
-}
-
-// cacheFFNPrefillWeights optionally keeps only FFN gate/up projections in
-// FP16 for repeated prefill chunks. The quantized model remains authoritative
-// and is still used by decode. The byte budget is explicit and defaults to zero;
-// the wider projection cache can cost several GiB on an APU.
-func (m *Model) cacheFFNPrefillWeights() error {
-	value := os.Getenv("YUUKA_PREFILL_F16_CACHE_MIB")
-	if value == "" || value == "0" {
-		return nil
-	}
-	mib, err := strconv.ParseUint(value, 10, 64)
-	if err != nil || mib > 16384 {
-		return fmt.Errorf("gpu: YUUKA_PREFILL_F16_CACHE_MIB must be between 0 and 16384")
-	}
-	budget := mib << 20
-	width := int64(m.config.HiddenSize)
-	ffn := int64(m.config.FFNSize)
-	var plan *hip.Plan
-	defer func() {
-		if plan != nil {
-			_ = plan.Close()
-		}
-	}()
-	used := uint64(0)
-	for layer := 0; layer < m.config.BlockCount; layer++ {
-		for _, kind := range []string{"ffn_gate", "ffn_up"} {
-			name := fmt.Sprintf("blk.%d.%s.weight", layer, kind)
-			w, ok := m.weights[name]
-			if !ok || w.elements != uint64(width)*uint64(ffn) {
-				continue
-			}
-			switch w.dtype {
-			case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
-			default:
-				continue
-			}
-			bytes := w.elements * 2
-			if bytes > budget-used {
-				continue
-			}
-			if plan == nil {
-				plan, err = m.device.NewPlan()
-				if err != nil {
-					return err
-				}
-			}
-			buf, err := m.allocDevice(bytes)
-			if err != nil {
-				return fmt.Errorf("gpu: cache prefill %s: %w", name, err)
-			}
-			if err := plan.AddDequantF16At(w.buf, 0, buf, width, ffn, w.dtype); err != nil {
-				return fmt.Errorf("gpu: prefill cache dequant %s: %w", name, err)
-			}
-			w.prefill16 = buf
-			m.weights[name] = w
-			used += bytes
-		}
-	}
-	if plan == nil {
-		return nil
-	}
-	if err := plan.Execute(m.stream, 0, 0, true, m.event); err != nil {
-		return fmt.Errorf("gpu: fill prefill cache: %w", err)
-	}
-	return m.event.Wait()
 }
 
 const (
@@ -291,7 +214,7 @@ func (m *Model) setup(reader *gguf.Reader, model *qwen35.Model) error {
 		if err := m.device.Upload(buf, data); err != nil {
 			return fmt.Errorf("upload %s: %w", info.Name, err)
 		}
-		m.weights[info.Name] = weight{buf: buf, elements: info.Elements(), dtype: info.DType}
+		m.weights[info.Name] = weight{buf: buf, dtype: info.DType}
 	}
 	if err := m.allocActivations(); err != nil {
 		return err
@@ -435,29 +358,16 @@ func (m *Model) configurePrefill(rows int) error {
 			maxWidth = width
 		}
 	}
-	// The rocBLAS route writes n_out*batch FP16 results per matmul, and its
+	// The rocBLAS routes write n_out*batch FP16 results per matmul, and their
 	// widest n_out is either a projection width or the gated-delta-net QKV
-	// width. The weight scratch covers the largest quantized matrix the prefill
-	// matmuls read; token_embd and output are excluded because the first is only
-	// gathered by the embedding op and the second only feeds the single-row LM
-	// head, and their FP16 form would add gigabytes.
+	// width. The int8 route stages one Q8_1 activation tile pair for the widest
+	// K-quant projection; token_embd and output are excluded because the first
+	// is only gathered by the embedding op and the second only feeds the
+	// single-row LM head, and their Q8_1 form would reserve memory no prefill
+	// matmul reads.
 	maxOutWidth := maxWidth
 	if convDim := 2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize; convDim > maxOutWidth {
 		maxOutWidth = convDim
-	}
-	var maxWeightElems uint64
-	for name, w := range m.weights {
-		switch w.dtype {
-		case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
-		default:
-			continue
-		}
-		if name == "token_embd.weight" || name == "output.weight" {
-			continue
-		}
-		if w.elements > maxWeightElems {
-			maxWeightElems = w.elements
-		}
 	}
 	rowElems := func(width int) uint64 { return uint64(rows) * uint64(width) * 4 }
 	entries := []struct {
@@ -502,12 +412,17 @@ func (m *Model) configurePrefill(rows int) error {
 			}{&p.attentionBlas, bytes})
 		}
 	}
-	if maxWeightElems > 0 {
-		entries = append(entries, struct {
+	// Q8_1 activations for the int8 prefill GEMM: one int8 value per element
+	// and one float2 block scale pair per 32 values.
+	entries = append(entries,
+		struct {
 			dst   **hip.Buffer
 			bytes uint64
-		}{&p.wF16, maxWeightElems * 2})
-	}
+		}{&p.xQ8, uint64(rows) * uint64(maxOutWidth)},
+		struct {
+			dst   **hip.Buffer
+			bytes uint64
+		}{&p.xDS, uint64(rows) * ((uint64(maxOutWidth) + 31) / 32) * 8})
 	for _, entry := range entries {
 		buf, err := m.allocTransient(entry.bytes)
 		if err != nil {

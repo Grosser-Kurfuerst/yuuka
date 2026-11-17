@@ -84,8 +84,17 @@ func TestGPUBlasAttentionMatchesTiled(t *testing.T) {
 			}
 		}
 		t.Logf("model BLAS attention vs tiled: top1=%d/%d max_diff=%.6g", top1(got), top1(baseline), maxDiff)
-		if top1(got) != top1(baseline) || maxDiff > 0.05 {
-			t.Fatalf("BLAS attention exceeds model-level 0.05 logit gate")
+		// Both arms share the prefill GEMM route, so this measures the
+		// attention dispatch only. The gate is 0.3 because the Q8_1 prefill
+		// route snaps every activation to an 8-bit grid: two runs whose hidden
+		// states differ by ~1e-3 land on different grid points, which puts the
+		// two-attention-route comparison on the route's own noise floor.
+		// Measured 2026-11-17 on the 2048-token prompt: 0.0132 with the
+		// removed FP16 routes, 0.184 with the int8 route, against a 0.264
+		// int8-route-versus-FP16-route delta and a 25.8 peak logit. Top-1 must
+		// still match. See docs/benchmarks.md.
+		if top1(got) != top1(baseline) || maxDiff > 0.3 {
+			t.Fatalf("BLAS attention exceeds model-level 0.3 logit gate")
 		}
 	}
 }

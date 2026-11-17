@@ -13,6 +13,7 @@ for source in \
     kernels/hip/gemv/gemv_quant.hip \
     kernels/hip/moe/moe.hip \
     kernels/hip/gemm/wmma_gemm.hip \
+    kernels/hip/gemm/mmq_gemm.hip \
     kernels/hip/prefill/prefill.hip; do
     echo "== ${source}"
     "${hipcc}" --offload-arch="${arch}" -O3 -std=c++17 \

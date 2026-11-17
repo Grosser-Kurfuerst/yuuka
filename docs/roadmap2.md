@@ -326,23 +326,30 @@ tile is then likely to stay in L2 while the M tiles that need it execute.
 This is a small, independently testable change. Accept it only if it improves
 the measured end-to-end chunk time; it must not change numerical results.
 
-### 4.5 B4: int8 tensor-core path
+### 4.5 B4: int8 tensor-core path — adopted 2026-11-17
 
-After B1-B3, evaluate true int8 WMMA:
+`kernels/hip/gemm/mmq_gemm.hip` keeps Q4_K/Q5_K/Q6_K payloads packed, decodes
+them to int8 in shared memory, quantizes activations to Q8_1 (one FP32 scale and
+one FP32 block sum per 32 values), accumulates exact int32 products with
+16x16x16 int8 WMMA, and applies `d_w * d_x` plus the Q4_K/Q5_K minimum in the
+FP32 epilogue. The dispatch rule sends every K-quant matmul with `N >= 64` and at
+least 128 rows to it and drops the dequantize-plus-rocBLAS route and its FP16
+weight scratch.
 
-- Unpack Q4_K/Q5_K/Q6_K payloads to int8 and use
-  `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32`; Q8_0 uses its int8 payload
-  directly.
-- Quantize activations per 32-value group to int8 with an FP32 scale.
-- Accumulate the integer dot product exactly in int32, then apply `d_w * d_x`
-  and the Q4_K/Q5_K min term in the FP32 epilogue.
-- Keep an FP16-WMMA fallback for shapes or dtypes where int8 does not win.
+Measured: 13.1-14.8 TFLOP/s on the model shapes at 128 rows, 11.0-14.0 TFLOP/s
+at 512 rows, against 6.3-9.7 TFLOP/s for the FP16 WMMA kernel, with token-level
+equality preserved (chunk 512 logit difference 0, `TestGPUMatchesCPU` 0.0031).
+End-to-end 512-token prefill improves 7.1% (1329 vs 1237 tok/s), 128-token
+prompts 17.4%, and 2048-token prompts 9.2%.
 
-The ROCm gfx1151 precision-ladder study measured true int8 at 1.13x to 2.51x
-over int8-to-FP16 compute, with the largest gains on K-heavy shapes. Those are
-reference ratios, not gfx1151 results for this codebase. This stage is
-accepted only with a token-level equality test and a documented tolerance
-change if the logits move.
+Two findings constrain further work. The shared-memory row stride of the operand
+tiles must not be a power-of-two multiple of the bank period: 256 bytes measured
+12.5 TFLOP/s against 48.1 TFLOP/s at 272 bytes for the same instruction stream.
+And the kernel's ceiling is the per-block FP32 scale application: the same
+geometry with the scale work removed measures 48 TFLOP/s, so the remaining 3.5x
+would need a formulation that scales fewer than 32 accumulator elements per
+32-value block. See
+[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-int8-mmq-prefill-gemm).
 
 ### 4.6 B5: small fusions
 
@@ -396,14 +403,13 @@ condition stays; a 64-wide K step for the 64x64 tile measured 15-30% slower than
 
 A same-machine attribution against llama.cpp (`pp512` 2216 tok/s) splits the
 remaining 2.5x gap into matmul 476 vs 186 ms, the gated delta-net chunk 67 vs
-13 ms, and attention at parity. The matmul kernel is decode and latency bound:
+13 ms, and attention at parity. The matmul kernel was decode and latency bound:
 114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS, at 2922
 wave cycles per WMMA and 39% issue occupancy, against about 22 instructions per
 WMMA in llama.cpp's int8 MMQ kernel (128-row x 128-token tile, Q8_1 shared
-staging, 256-wide K step). `launch_gemm_blas_f16` also requests fp32 compute
-with fp32 output, which selects Tensile kernels at 3.3-4.7 TFLOP/s; the same
-GEMM with fp16 compute and output reaches 20-33 TFLOP/s. Both the library
-datatype and the tile/int8 geometry are open items. See
+staging, 256-wide K step). The int8 geometry is now implemented (4.5);
+`launch_gemm_blas_f16` still requests fp32 compute with fp32 output, which
+selects Tensile kernels at 3.3-4.7 TFLOP/s. See
 [benchmarks.md](benchmarks.md#prefill-gap-attribution-vs-llamacpp-2026-11-16).
 
 A 2026-11-16 experiment adopted a library route for the wide K-quant class and

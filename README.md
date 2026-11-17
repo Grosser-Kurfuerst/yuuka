@@ -13,7 +13,8 @@ and a concurrent, paged serving path. It provides:
 - Qwen byte-level BPE and SentencePiece tokenizer support with Qwen chat rendering;
 - CPU reference decoders used as the correctness oracle and default backend;
 - a HIP decoder that executes the full Qwen3.5 model on the GPU;
-- a validated prefill family: rocWMMA FP16 and quantized GEMM, a rocBLAS FP16
+- a validated prefill family: rocWMMA FP16 and quantized GEMM, an int8 MMQ
+  GEMM for K-quant weights, a rocBLAS FP16
   baseline, Flash Attention, and chunked prefill;
 - a CLI (`inspect`, `run`, `bench`);
 - a continuous scheduler with paged KV, reference-counted prefix caching, and

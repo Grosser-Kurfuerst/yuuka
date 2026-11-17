@@ -145,6 +145,74 @@ bool buffer_range_ok(const yuuka_buffer * buf, uint64_t offset, uint64_t bytes) 
     return buf != nullptr && offset <= buf->bytes && bytes <= buf->bytes - offset;
 }
 
+// check_q8_1_layout checks the Q8_1 activation pair used by the MMQ route: the
+// int8 tile holds batch*n bytes and the scale tile holds batch*(n/32) float2
+// entries. The plain quantizer requires n to be a multiple of 128 because one
+// warp covers 128 contiguous values; the MMQ GEMM additionally requires n_in to
+// be a multiple of 256, which check_gemv_shapes already enforces for K-quants.
+yuuka_status check_q8_1_layout(uint64_t n, uint64_t batch, const yuuka_buffer * qs,
+                               uint64_t qs_offset, const yuuka_buffer * ds,
+                               uint64_t ds_offset) {
+    if (n == 0 || batch == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "q8_1 dimensions must be positive");
+    }
+    if (n % 128 != 0) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "q8_1 width %llu is not a multiple of 128",
+                    static_cast<unsigned long long>(n));
+    }
+    uint64_t elements = 0;
+    uint64_t quant_bytes = 0;
+    uint64_t scale_bytes = 0;
+    if (__builtin_mul_overflow(n, batch, &elements) ||
+        __builtin_mul_overflow(elements, uint64_t(1), &quant_bytes) ||
+        __builtin_mul_overflow((n / 32) * uint64_t(2 * sizeof(float)), batch,
+                               &scale_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "q8_1 dimensions overflow");
+    }
+    if (!buffer_range_ok(qs, qs_offset, quant_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "q8_1 quantized buffer is too small");
+    }
+    if (!buffer_range_ok(ds, ds_offset, scale_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "q8_1 scale buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_q8_1_quantize checks the quantizer call: the FP32 source must hold
+// batch*n elements on top of the Q8_1 pair.
+yuuka_status validate_q8_1_quantize(uint64_t n, uint64_t batch,
+                                    const yuuka_buffer * x, uint64_t x_offset,
+                                    const yuuka_buffer * qs, uint64_t qs_offset,
+                                    const yuuka_buffer * ds, uint64_t ds_offset) {
+    yuuka_status status = check_q8_1_layout(n, batch, qs, qs_offset, ds, ds_offset);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    uint64_t input_bytes = 0;
+    if (__builtin_mul_overflow(n * batch, uint64_t(sizeof(float)), &input_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "q8_1 dimensions overflow");
+    }
+    if (!buffer_range_ok(x, x_offset, input_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "q8_1 input buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_quantize_plan_op checks a Q8_1 activation quantization plan
+// operation: buf0 is the FP32 source, buf1 the int8 destination, buf2 the
+// float2 block scales, and n is {width, rows}.
+yuuka_status validate_quantize_plan_op(const yuuka_op & op) {
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "quantize q8_1 buffer %d is null", i);
+        }
+    }
+    return validate_q8_1_quantize(op.n[0], op.n[1], op.buf[0], op.off[0], op.buf[1],
+                                  op.off[1], op.buf[2], op.off[2]);
+}
+
 // validate_gemv_plan_op checks a GEMV or GEMV_BATCH operation before it enters
 // the plan. Unsupported dtypes and block-misaligned widths are capability
 // failures; invalid dimensions and undersized buffers are argument failures.
@@ -219,8 +287,20 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
                     dtype, static_cast<unsigned long long>(n_in));
     }
     if (path != YUUKA_GEMM_PATH_AUTO && path != YUUKA_GEMM_PATH_BLAS &&
-        path != YUUKA_GEMM_PATH_WMMA) {
+        path != YUUKA_GEMM_PATH_WMMA && path != YUUKA_GEMM_PATH_MMQ) {
         return fail(YUUKA_ERR_UNSUPPORTED, "unknown gemm path %u", path);
+    }
+    if (path == YUUKA_GEMM_PATH_MMQ) {
+        if (dtype != YUUKA_DTYPE_Q4_K && dtype != YUUKA_DTYPE_Q5_K &&
+            dtype != YUUKA_DTYPE_Q6_K) {
+            return fail(YUUKA_ERR_UNSUPPORTED,
+                        "mmq route requires Q4_K, Q5_K, or Q6_K weights, got %u",
+                        dtype);
+        }
+        if (op.buf[3] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "mmq route requires the Q8_1 scale buffer");
+        }
     }
     if (path == YUUKA_GEMM_PATH_BLAS) {
         if (dtype != YUUKA_DTYPE_F16) {
@@ -251,7 +331,9 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     uint64_t input_bytes = 0;
     uint64_t output_bytes = 0;
     const uint64_t input_element_bytes =
-        path == YUUKA_GEMM_PATH_BLAS ? uint64_t(2) : uint64_t(sizeof(float));
+        path == YUUKA_GEMM_PATH_BLAS   ? uint64_t(2)
+        : path == YUUKA_GEMM_PATH_MMQ  ? uint64_t(1)
+                                       : uint64_t(sizeof(float));
     if (__builtin_mul_overflow(input_elements, input_element_bytes, &input_bytes) ||
         __builtin_mul_overflow(output_elements, uint64_t(sizeof(float)), &output_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions overflow");
@@ -271,6 +353,13 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
             !buffer_range_ok(op.buf[3], op.off[3], scratch_bytes)) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT,
                         "rocBLAS FP16 scratch buffer is too small");
+        }
+    }
+    if (path == YUUKA_GEMM_PATH_MMQ) {
+        yuuka_status status = check_q8_1_layout(n_in, batch, op.buf[1], op.off[1],
+                                                op.buf[3], op.off[3]);
+        if (status != YUUKA_OK) {
+            return status;
         }
     }
     return YUUKA_OK;
@@ -1405,6 +1494,12 @@ yuuka_status launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
         }
         return YUUKA_OK;
     }
+    if (path == YUUKA_GEMM_PATH_MMQ) {
+        yuuka::launch_gemm_mmq_f32out(out, op_ptr<const void>(op, 1),
+                                      op_ptr<const void>(op, 3), w, n_in, n_out,
+                                      batch, dtype, stream);
+        return YUUKA_OK;
+    }
     if (path == YUUKA_GEMM_PATH_WMMA ||
         (path == YUUKA_GEMM_PATH_AUTO && dtype != YUUKA_DTYPE_F32)) {
         yuuka::launch_gemm_wmma_f32out(out, op_ptr<const float>(op, 1), w,
@@ -1577,6 +1672,12 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         case YUUKA_OP_DEQUANT_F16: {
             yuuka::launch_dequant_f16(op_ptr<void>(op, 1), op_ptr<const void>(op, 0),
                                       op.n[0], op.n[1], op.u[0], stream);
+            break;
+        }
+        case YUUKA_OP_QUANT_Q8_1: {
+            yuuka::launch_quantize_q8_1(op_ptr<void>(op, 1), op_ptr<void>(op, 2),
+                                        op_ptr<const float>(op, 0), op.n[0], op.n[1],
+                                        stream);
             break;
         }
         case YUUKA_OP_RMSNORM: {
@@ -2523,6 +2624,93 @@ YUUKA_API yuuka_status yuuka_gemm_wmma(yuuka_stream * stream, yuuka_buffer * out
     });
 }
 
+YUUKA_API yuuka_status yuuka_quantize_q8_1(yuuka_stream * stream, yuuka_buffer * qs,
+                        yuuka_buffer * ds, const yuuka_buffer * x, uint64_t n,
+                        uint64_t batch, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || qs == nullptr || ds == nullptr || x == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        yuuka_status status = validate_q8_1_quantize(n, batch, x, 0, qs, 0, ds, 0);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        yuuka::launch_quantize_q8_1(qs->ptr, ds->ptr, static_cast<const float *>(x->ptr),
+                                    n, batch, stream->stream);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "q8_1 quantize launch: %s",
+                        hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_gemm_mmq(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * qs, const yuuka_buffer * ds,
+                        const yuuka_buffer * w, uint64_t n_in, uint64_t n_out,
+                        uint64_t batch, uint32_t dtype, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || out == nullptr || qs == nullptr || ds == nullptr ||
+            w == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        if (dtype != YUUKA_DTYPE_Q4_K && dtype != YUUKA_DTYPE_Q5_K &&
+            dtype != YUUKA_DTYPE_Q6_K) {
+            return fail(YUUKA_ERR_UNSUPPORTED,
+                        "mmq gemm requires Q4_K, Q5_K, or Q6_K weights, got %u",
+                        dtype);
+        }
+        if (!check_gemv_shapes(n_in, dtype)) {
+            return fail(YUUKA_ERR_UNSUPPORTED,
+                        "mmq gemm input width %llu is not a multiple of 256",
+                        static_cast<unsigned long long>(n_in));
+        }
+        if (n_out == 0) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq gemm output width is zero");
+        }
+        yuuka_status status = check_q8_1_layout(n_in, batch, qs, 0, ds, 0);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        uint64_t weight_row_bytes = 0;
+        uint64_t weight_bytes = 0;
+        uint64_t output_bytes = 0;
+        if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+            __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+            __builtin_mul_overflow(n_out * batch, uint64_t(sizeof(float)),
+                                   &output_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq gemm dimensions overflow");
+        }
+        if (!buffer_range_ok(w, 0, weight_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq gemm weight buffer is too small");
+        }
+        if (!buffer_range_ok(out, 0, output_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "mmq gemm output buffer is too small");
+        }
+        yuuka::launch_gemm_mmq_f32out(static_cast<float *>(out->ptr), qs->ptr, ds->ptr,
+                                      w->ptr, n_in, n_out, batch, dtype,
+                                      stream->stream);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "mmq gemm launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
 YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out,
                         yuuka_buffer * out16, const yuuka_buffer * x16,
                         const yuuka_buffer * w, uint64_t n_in, uint64_t n_out,
@@ -2763,7 +2951,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_DEQUANT_F16) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_QUANT_Q8_1) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -2809,6 +2997,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_DEQUANT_F16:
                 status = validate_dequant_plan_op(*op);
+                break;
+            case YUUKA_OP_QUANT_Q8_1:
+                status = validate_quantize_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

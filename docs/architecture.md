@@ -302,14 +302,15 @@ on the assumption that zero-copy access is optimal.
 
 Prefill scratch is part of the activation pool and is sized from the model
 configuration when the chunk size changes. `xF16` holds the chunk activations
-cast to FP16, `yF16` holds the widest FP16 matmul result, and `wF16` holds the
-largest dequantized K-quant weight matrix the prefill matmuls read; the last two
-exist for the rocBLAS prefill route, which writes FP16 results and expands one
-weight tile per call. `token_embd` and `output` are excluded from the weight
-scratch size because the embedding op gathers the first and only the single-row
-LM head reads the second. Ownership stays with the model's prefill scratch, and
-`configurePrefill` reallocates all three together so a plan never outlives the
-buffer it references.
+cast to FP16 and `yF16` the widest FP16 matmul result, both for the rocBLAS F16
+route. `xQ8` and `xDS` hold the Q8_1 activations and their float2 block scales
+for the int8 K-quant route; `xQ8` is one byte per activation and `xDS` one
+`float2` per 32 values, so the pair is smaller than the FP16 weight scratch the
+removed dequantize route required. `token_embd` and `output` are excluded from
+the sizing because the embedding op gathers the first and only the single-row LM
+head reads the second. Ownership stays with the model's prefill scratch, and
+`configurePrefill` reallocates every buffer together so a plan never outlives
+the buffer it references.
 
 ### 7.3 KV cache summary
 

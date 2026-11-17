@@ -119,7 +119,9 @@ Implemented and tested:
   `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, and `Q6_K`; direct embedding tests
   cover `F32`, `Q4_0`, `Q5_0`, and `Q6_K`.
 - rocWMMA FP16 and quantized prefill GEMM with measured 64x64 and 32x64 tile
-  selection, a fused gate/up SwiGLU kernel, a rocBLAS FP16 baseline, causal GQA
+  selection, an int8 MMQ route for K-quant weights (Q8_1 activations, exact
+  int32 WMMA accumulation, FP32 scales), a fused gate/up SwiGLU kernel, a
+  rocBLAS FP16 baseline, causal GQA
   Flash Attention that stages K and V for a 16-query-row tile, chunked prefill
   with per-chunk KV writes, the measured `SelectPrefillPath` dispatch table,
   and a rocBLAS matrixized paged prefill attention path that is the default for

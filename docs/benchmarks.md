@@ -1650,6 +1650,11 @@ variation. **No large or consistent default-path improvement is established.**
 The source optimization nonetheless removes one redundant FP32-to-FP16 cast
 per FFN gate/up pair whenever both select the dequant+rocBLAS path.
 
+> **Removed 2026-11-17.** The dequantize-plus-rocBLAS prefill route and the
+> `YUUKA_PREFILL_F16_CACHE_MIB` FFN weight cache were removed when the int8 MMQ
+> route replaced them for K-quant weights; the environment variable is no longer
+> read. The measurements below are the record of the removed route.
+
 `YUUKA_PREFILL_F16_CACHE_MIB` explicitly reserves an upper limit of MiB for
 *only* FFN gate/up weights decoded into FP16 when opening a GPU model. It is
 disabled by default (`unset`, `0`). Supported values are 0-16384. The original
@@ -1757,3 +1762,95 @@ candidate and 64-row K32/K64 variants were benchmarked but did **not** give a
 repeatable combined win with matrixized attention; they remain outside this
 branch. Splitting the original GQA key traversal into four partitions yielded
 only a ~2.2% 8192-token gain and is also excluded.
+
+## 2026-11-17 gfx1151: int8 MMQ prefill GEMM
+
+Environment: gfx1151 (Ryzen AI Max+ 395 / Radeon 8060S), ROCm/HIP 7.16, 40 CUs,
+Release build, `cmake --build build -j32`, model
+`Qwen3.5-4B-Q4_K_M.gguf` (SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`).
+
+Protocol: `yuuka_prefill_sweep` with two warmups and five timed repetitions per
+cell, median reported; each timed submission includes a `yuuka_event_wait`, so
+the numbers include launch overhead. Activation inputs are a constant 0.25 and
+weights are a fixed-seed random payload with sane scale halfwords, so the
+quantization cost is representative of a steady-state chunk, not of a
+distribution-sensitive worst case. End-to-end runs use `yuuka bench` with
+`--backend hip --decode-tokens 1 --chunk-size 512 --kv-type f32`, two warmups
+and five repetitions, alternating the new binary and a baseline binary that was
+captured before the change; each round prints p50.
+
+### Isolated GEMM, TFLOP/s
+
+`wmma` is the custom rocWMMA kernel, `blasq` the removed dequantize-plus-rocBLAS
+route, `mmq` the new int8 kernel including the Q8_1 pass. Tall-`K` cells leave
+`blasq` empty because that route is numerically rejected there (0.047-0.079
+logits against the 0.045 gate).
+
+| Dtype | Shape | `M` | wmma | blasq | mmq |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Q4_K | 2560 -> 9216 | 128 | 8.5 | 8.2 | 13.1 |
+| Q4_K | 2560 -> 9216 | 512 | 8.4 | 13.8 | 13.5 |
+| Q4_K | 9216 -> 2560 | 128 | 9.7 | - | 14.8 |
+| Q4_K | 9216 -> 2560 | 512 | 8.1 | - | 13.6 |
+| Q4_K | 2560 -> 8192 | 512 | 8.5 | 14.9 | 14.0 |
+| Q5_K | 2560 -> 8192 | 512 | 7.9 | 15.9 | 13.2 |
+| Q6_K | 9216 -> 2560 | 512 | 6.3 | 13.0 | 11.0 |
+| Q6_K | 2560 -> 9216 | 128 | 7.3 | 5.8 | 11.3 |
+
+Full matrix and raw lines: the sweep covers Q4_K/Q5_K/Q6_K at `M` 1-512 and the
+three model shape classes. MMQ is 1.4-1.8x WMMA at every cell of 128 rows or
+more, 7-60% above the dequant route at 128-256 rows, and 2-17% below it on wide
+shapes at 512 rows. Envelope: the same tile with the scale application removed
+and with the fragment loads hoisted out of the loop measures 48 and 52 TFLOP/s,
+so the remaining gap to the int8 WMMA ceiling is the per-block FP32 scale
+application and its accumulator dependencies, not the integer MMA.
+
+### End-to-end 512-token chunk
+
+| Prompt tokens | Baseline p50 | New p50 | Change |
+| ---: | ---: | ---: | ---: |
+| 128 | 0.146 s (876 tok/s) | 0.121 s (1060 tok/s) | +17.4% |
+| 512 | 0.414 s (1237 tok/s) | 0.385 s (1329 tok/s) | +7.1% |
+| 2048 | 1.934 s (1059 tok/s) | 1.764 s (1161 tok/s) | +9.2% |
+
+Three interleaved rounds per size; the 512-token rounds measured 0.385/0.387 s
+against 0.413/0.416 s. The 512-token gain misses the 10% target that was set for
+this port, because the route it replaces was already the faster option on wide
+shapes at that row count: the win comes from the tall projections, where the
+dequant route is numerically rejected and WMMA runs at 6.3-8.1 TFLOP/s.
+
+Numerics: `TestGPUChunkedPrefillLongContext` passes with top-1 `33075` preserved
+and chunk 512/1024 logit difference 0 against the chunk-128 reference;
+`TestGPUMatchesCPU` measures 0.0031 maximum logit difference. Against the
+previous FP16 routes, a 2048-token prompt (chunk 512, F16 KV) measures 0.264
+maximum logit delta and 0.045 mean absolute delta with the top-1 token
+preserved, against a 25.8 peak logit. That delta is the Q8_1 activation grid
+(~4e-3 per value) instead of FP16 staging (~5e-4), compounded across 32 layers,
+and it is the regime llama.cpp's K-quant MMQ prefill runs in. It also raises the
+floor for comparisons between two non-identical routes: the tiled-versus-
+matrixized prefill attention gate measures 0.184 where the FP16 routes measured
+0.0132, and is gated at 0.3 with top-1 still required to match. The native MMQ
+tests check the Q8_1 quantizer digit for digit against a host reimplementation
+and the GEMM against a CPU dot product over the same dequantized activations
+(maximum absolute difference 6.7e-5), which is tighter than the 2e-2 per-GEMM
+bound because int32 accumulation is exact.
+
+Changed resources: prefill scratch drops the largest dequantized weight matrix
+(47 MiB for `2560 -> 9216` in FP16) and gains `xQ8` (one byte per activation) and
+`xDS` (8 bytes per 32 activations); the `YUUKA_PREFILL_F16_CACHE_MIB` FFN cache
+and the `PrefillDequantBLAS` route are gone.
+
+Reproduce:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
+ctest --test-dir build --output-on-failure -R hip_prefill_correctness
+./build/yuuka_prefill_sweep
+MODEL=/models/Qwen3.5-4B-Q4_K_M.gguf
+go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
+LD_LIBRARY_PATH="$PWD/build:/opt/rocm/lib" /tmp/yuuka-hip bench --model "$MODEL" \
+  --backend hip --prompt-tokens 512 --decode-tokens 1 --warmup 2 --reps 5 \
+  --chunk-size 512 --kv-type f32
+YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
+  -run 'TestGPUChunkedPrefillLongContext|TestGPUMatchesCPU' -count=1 -v
+```

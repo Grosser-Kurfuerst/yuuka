@@ -752,6 +752,10 @@ const (
 	GemmAuto GemmPath = 0
 	// GemmWMMA is the custom rocWMMA kernel with FP32 activations.
 	GemmWMMA GemmPath = 2
+	// GemmMMQ is the int8 route: Q4_K/Q5_K/Q6_K weights, Q8_1 activations, and
+	// exact int32 accumulation with FP32 weight scales. It needs the Q8_1
+	// activation and scale buffers, so it is only appended with AddGemmMmqAt.
+	GemmMMQ GemmPath = 3
 
 	// gemmPathBLAS is the rocBLAS route. It is not part of the public path
 	// selection: it needs an FP16 output scratch in addition to FP16 weights and
@@ -761,7 +765,9 @@ const (
 
 // AddGemmPathAt appends a GEMM with an explicit implementation path and byte
 // offsets. Only GemmAuto and GemmWMMA are accepted here; the rocBLAS route is
-// appended with AddGemmBlasAt because it needs an FP16 output scratch.
+// appended with AddGemmBlasAt because it needs an FP16 output scratch, and the
+// int8 route is appended with AddGemmMmqAt because it needs a Q8_1 activation
+// pair.
 func (p *Plan) AddGemmPathAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut, batch int64, dtype tensor.DType, path GemmPath) error {
 	if nIn <= 0 || nOut <= 0 || batch <= 0 {
 		return errors.New("hip: GEMM dimensions must be positive")
@@ -833,43 +839,92 @@ func (p *Plan) AddGemmBlasAt(w *Buffer, wOff uint64, x16, out16, out *Buffer, ou
 	return p.add(op)
 }
 
-// AddDequantF16At appends a dequantization of one packed K-quant weight matrix
-// into dst. dst must hold nIn*nOut FP16 elements; the decoded values match the
-// tiles the WMMA path stages, so only the accumulation differs downstream.
-func (p *Plan) AddDequantF16At(src *Buffer, srcOff uint64, dst *Buffer, nIn, nOut int64, dtype tensor.DType) error {
-	if nIn <= 0 || nOut <= 0 {
-		return errors.New("hip: dequant dimensions must be positive")
+// AddQuantizeQ8_1At appends the Q8_1 activation quantization that feeds the
+// int8 prefill GEMM. x holds batch*nIn FP32 values, qs receives batch*nIn int8
+// values, and ds receives batch*(nIn/32) float2 block scale and block sum
+// entries. nIn must be a multiple of 128.
+func (p *Plan) AddQuantizeQ8_1At(x *Buffer, xOff uint64, qs, ds *Buffer, nIn, batch int64) error {
+	if nIn <= 0 || batch <= 0 {
+		return errors.New("hip: Q8_1 dimensions must be positive")
+	}
+	if nIn%128 != 0 {
+		return fmt.Errorf("hip: Q8_1 width %d is not a multiple of 128", nIn)
+	}
+	if err := p.check(x, qs, ds); err != nil {
+		return err
+	}
+	if xOff > x.bytes || uint64(nIn*batch)*4 > x.bytes-xOff {
+		return fmt.Errorf("hip: Q8_1 source holds %d bytes, want %d",
+			x.bytes-xOff, nIn*batch*4)
+	}
+	if nIn*batch > int64(qs.bytes) {
+		return fmt.Errorf("hip: Q8_1 destination holds %d bytes, want %d",
+			qs.bytes, nIn*batch)
+	}
+	if batch*(nIn/32)*8 > int64(ds.bytes) {
+		return fmt.Errorf("hip: Q8_1 scale buffer holds %d bytes, want %d",
+			ds.bytes, batch*(nIn/32)*8)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_QUANT_Q8_1}
+	op.off[0] = C.uint64_t(xOff)
+	op.buf[0] = x.ptr
+	op.buf[1] = qs.ptr
+	op.buf[2] = ds.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(batch)
+	return p.add(op)
+}
+
+// AddGemmMmqAt appends the int8 prefill GEMM: out = W * x with packed
+// Q4_K/Q5_K/Q6_K weights, Q8_1 activations in qs, their float2 block scales in
+// ds, and an FP32 result. nIn must be a multiple of 256.
+func (p *Plan) AddGemmMmqAt(w *Buffer, wOff uint64, qs, ds *Buffer, out *Buffer, outOff uint64, nIn, nOut, batch int64, dtype tensor.DType) error {
+	if nIn <= 0 || nOut <= 0 || batch <= 0 {
+		return errors.New("hip: GEMM dimensions must be positive")
 	}
 	switch dtype {
 	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
 	default:
-		return fmt.Errorf("hip: dequant supports K-quants only, got %s", dtype)
+		return fmt.Errorf("hip: int8 GEMM supports K-quants only, got %s", dtype)
 	}
 	if nIn%256 != 0 {
-		return fmt.Errorf("hip: dequant input width %d is not a multiple of 256", nIn)
+		return fmt.Errorf("hip: int8 GEMM input width %d is not a multiple of 256", nIn)
 	}
-	if err := p.check(src, dst); err != nil {
+	if err := p.check(w, qs, ds, out); err != nil {
 		return err
 	}
 	rowBytes, err := dtype.RowBytes(nIn)
 	if err != nil {
-		return fmt.Errorf("hip: dequant shape: %w", err)
+		return fmt.Errorf("hip: int8 GEMM shape: %w", err)
 	}
-	if srcOff > src.bytes || int64(rowBytes)*nOut > int64(src.bytes-srcOff) {
-		return fmt.Errorf("hip: dequant source holds %d bytes, want %d",
-			src.bytes-srcOff, int64(rowBytes)*nOut)
+	if wOff > w.bytes || int64(rowBytes)*nOut > int64(w.bytes-wOff) {
+		return fmt.Errorf("hip: int8 GEMM weight buffer holds %d bytes, want %d",
+			w.bytes-wOff, int64(rowBytes)*nOut)
 	}
-	if nIn*nOut*2 > int64(dst.bytes) {
-		return fmt.Errorf("hip: dequant destination holds %d bytes, want %d",
-			dst.bytes, nIn*nOut*2)
+	if batch*nIn > int64(qs.bytes) {
+		return fmt.Errorf("hip: int8 GEMM activation buffer holds %d bytes, want %d",
+			qs.bytes, batch*nIn)
 	}
-	op := C.yuuka_op{code: C.YUUKA_OP_DEQUANT_F16}
-	op.off[0] = C.uint64_t(srcOff)
-	op.buf[0] = src.ptr
-	op.buf[1] = dst.ptr
+	if batch*(nIn/32)*8 > int64(ds.bytes) {
+		return fmt.Errorf("hip: int8 GEMM scale buffer holds %d bytes, want %d",
+			ds.bytes, batch*(nIn/32)*8)
+	}
+	if outOff > out.bytes || batch*nOut*4 > int64(out.bytes-outOff) {
+		return fmt.Errorf("hip: int8 GEMM output buffer holds %d bytes, want %d",
+			out.bytes-outOff, batch*nOut*4)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMM}
+	op.off[0] = C.uint64_t(wOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.buf[0] = w.ptr
+	op.buf[1] = qs.ptr
+	op.buf[2] = out.ptr
+	op.buf[3] = ds.ptr
 	op.n[0] = C.uint64_t(nIn)
 	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(batch)
 	op.u[0] = C.uint32_t(dtype)
+	op.u[1] = C.uint32_t(GemmMMQ)
 	return p.add(op)
 }
 

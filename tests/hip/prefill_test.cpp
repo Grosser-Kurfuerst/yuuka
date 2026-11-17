@@ -419,6 +419,38 @@ std::vector<uint8_t> pack_weights(yuuka_dtype dtype, std::mt19937 & rng, int64_t
     return packed;
 }
 
+// compare_gemm checks a GEMM result against the CPU dot-product reference at
+// the documented tolerance.
+bool compare_gemm(const char * name, const std::vector<uint8_t> & packed,
+                  const std::vector<float> & x, const std::vector<float> & got,
+                  yuuka_dtype dtype, int64_t n_in, int64_t n_out, int64_t rows) {
+    const DotFn dot = dot_for(dtype);
+    if (dot == nullptr) {
+        return true;
+    }
+    const uint64_t rb = row_bytes(dtype, n_in);
+    double max_abs = 0.0;
+    bool ok = true;
+    for (int64_t row = 0; row < rows && ok; ++row) {
+        for (int64_t col = 0; col < n_out; ++col) {
+            const uint8_t * wrow = packed.data() + col * rb;
+            const float expected = dot(wrow, x.data() + row * n_in, n_in);
+            const float value = got[size_t(row * n_out + col)];
+            const double diff = std::fabs(double(value) - double(expected));
+            max_abs = std::max(max_abs, diff);
+            if (diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
+                std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
+                             name, static_cast<long long>(row),
+                             static_cast<long long>(col), value, expected);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s: %s (max abs %.3g)\n", name, ok ? "ok" : "FAILED", max_abs);
+    return ok;
+}
+
 bool test_gemm(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
                yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
                int64_t rows, std::mt19937 & rng) {
@@ -437,29 +469,115 @@ bool test_gemm(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     }
     std::vector<float> got(size_t(n_out * rows));
     ok = ok && download_vec(ob, got);
-    const DotFn dot = dot_for(dtype);
-    if (ok && dot != nullptr) {
-        const uint64_t rb = row_bytes(dtype, n_in);
-        double max_abs = 0.0;
-        for (int64_t row = 0; row < rows && ok; ++row) {
-            for (int64_t col = 0; col < n_out; ++col) {
-                const uint8_t * wrow = packed.data() + col * rb;
-                const float expected = dot(wrow, x.data() + row * n_in, n_in);
-                const float value = got[size_t(row * n_out + col)];
-                const double diff = std::fabs(double(value) - double(expected));
-                max_abs = std::max(max_abs, diff);
-                if (diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
-                    std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
-                                 name, static_cast<long long>(row),
-                                 static_cast<long long>(col), value, expected);
-                    ok = false;
-                    break;
+    if (ok) {
+        ok = compare_gemm(name, packed, x, got, dtype, n_in, n_out, rows);
+    }
+    release(ob);
+    release(xb);
+    release(wb);
+    return ok;
+}
+
+// check_q8_1 re-derives the Q8_1 quantization on the host and compares it with
+// the device output. Q8_1 activations are lossy by design, so the GEMM below is
+// checked against the dequantized activations rather than the FP32 source; this
+// function is what pins the quantization rule itself, digit for digit.
+bool check_q8_1(const char * name, const std::vector<float> & x,
+                const std::vector<int8_t> & qs, const std::vector<float> & ds,
+                int64_t n_in, int64_t rows) {
+    bool ok = true;
+    int64_t mismatched = 0;
+    double max_scale_diff = 0.0;
+    double max_sum_diff = 0.0;
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t block = 0; block < n_in / 32; ++block) {
+            const float * src = x.data() + row * n_in + block * 32;
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(src[i]));
+            const float d = amax / 127.0f;
+            const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+            int sum = 0;
+            for (int i = 0; i < 32; ++i) {
+                // nearbyint matches the device rintf rounding mode: ties to even.
+                const int q = int(std::max(-127.0f,
+                                           std::min(127.0f, std::nearbyint(src[i] * inv))));
+                sum += q;
+                const int8_t got = qs[size_t(row * n_in + block * 32 + i)];
+                if (got != int8_t(q)) {
+                    ++mismatched;
+                }
+            }
+            const float ds_block = ds[size_t((row * (n_in / 32) + block) * 2)];
+            const float ds_sum = ds[size_t((row * (n_in / 32) + block) * 2 + 1)];
+            max_scale_diff = std::max(max_scale_diff, double(std::fabs(ds_block - d)));
+            max_sum_diff =
+                std::max(max_sum_diff, double(std::fabs(ds_sum - d * float(sum))));
+        }
+    }
+    if (mismatched != 0) {
+        std::fprintf(stderr, "%s: %lld quantized values differ from the host rule\n",
+                     name, static_cast<long long>(mismatched));
+        ok = false;
+    }
+    if (max_scale_diff > 1e-7 || max_sum_diff > 1e-4) {
+        std::fprintf(stderr, "%s: q8_1 scale diff %.3g sum diff %.3g\n", name,
+                     max_scale_diff, max_sum_diff);
+        ok = false;
+    }
+    return ok;
+}
+
+// test_gemm_mmq runs the int8 MMQ route: Q8_1 activation quantization followed
+// by the int8 WMMA GEMM. The quantizer is checked exactly, then the GEMM is
+// checked against the CPU dot product over the dequantized Q8_1 activations at
+// the documented GEMM tolerance.
+bool test_gemm_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+                   yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
+                   int64_t rows, std::mt19937 & rng) {
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> x(size_t(n_in * rows));
+    for (float & v : x) v = dist(rng);
+    std::vector<uint8_t> packed = pack_weights(dtype, rng, n_in, n_out);
+    const uint64_t quant_bytes = uint64_t(n_in) * uint64_t(rows);
+    const uint64_t scale_bytes = uint64_t(rows) * uint64_t(n_in / 32) * 8;
+    Buffer wb, xb, qsb, dsb, ob;
+    bool ok = alloc(device, wb, packed.size()) && alloc(device, xb, x.size() * 4) &&
+              alloc(device, qsb, quant_bytes) && alloc(device, dsb, scale_bytes) &&
+              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              upload(wb, packed.data(), packed.size()) && upload_vec(xb, x);
+    if (ok) {
+        ok = check(yuuka_quantize_q8_1(stream, qsb.buf, dsb.buf, xb.buf, n_in, rows,
+                                       event), "q8_1 quantize") &&
+             check(yuuka_event_wait(event), "quantize wait") &&
+             check(yuuka_gemm_mmq(stream, ob.buf, qsb.buf, dsb.buf, wb.buf, n_in,
+                                  n_out, rows, dtype, event), "gemm mmq") &&
+             check(yuuka_event_wait(event), "mmq wait");
+    }
+    std::vector<float> got(size_t(n_out * rows));
+    std::vector<int8_t> qs(static_cast<size_t>(quant_bytes));
+    std::vector<float> ds(static_cast<size_t>(scale_bytes / 4));
+    ok = ok && download_vec(ob, got) && download_vec(qsb, qs) &&
+         download_vec(dsb, ds);
+    if (ok) {
+        ok = check_q8_1(name, x, qs, ds, n_in, rows);
+    }
+    if (ok) {
+        // Dequantize the activations exactly as the kernel reads them.
+        std::vector<float> xq(x.size());
+        for (int64_t row = 0; row < rows; ++row) {
+            for (int64_t block = 0; block < n_in / 32; ++block) {
+                const float d = ds[size_t((row * (n_in / 32) + block) * 2)];
+                for (int i = 0; i < 32; ++i) {
+                    const int64_t index = row * n_in + block * 32 + i;
+                    xq[size_t(index)] = d * float(qs[size_t(index)]);
                 }
             }
         }
-        std::printf("%s: %s (max abs %.3g)\n", name, ok ? "ok" : "FAILED", max_abs);
+        ok = compare_gemm(name, packed, xq, got, dtype, n_in, n_out, rows);
     }
     release(ob);
+    release(dsb);
+    release(qsb);
     release(xb);
     release(wb);
     return ok;
@@ -1333,6 +1451,30 @@ int main() {
         for (int64_t rows : {33, 70}) {
             ok = test_gemm_swiglu(device, stream, event, c.dtype, c.name, 256, 96,
                                   rows, rng) && ok;
+        }
+    }
+    const struct {
+        yuuka_dtype dtype;
+        const char * name;
+    } mmq_cases[] = {
+        {YUUKA_DTYPE_Q4_K, "mmq Q4_K"},
+        {YUUKA_DTYPE_Q5_K, "mmq Q5_K"},
+        {YUUKA_DTYPE_Q6_K, "mmq Q6_K"},
+    };
+    const struct {
+        int64_t n_in;
+        int64_t n_out;
+        int64_t rows;
+    } mmq_shapes[] = {
+        {512, 64, 128},
+        {512, 128, 130},
+        {768, 70, 129},
+        {2560, 128, 128},
+    };
+    for (const auto & c : mmq_cases) {
+        for (const auto & s : mmq_shapes) {
+            ok = test_gemm_mmq(device, stream, event, c.dtype, c.name, s.n_in,
+                               s.n_out, s.rows, rng) && ok;
         }
     }
     ok = test_blas(device, stream, event, rng) && ok;

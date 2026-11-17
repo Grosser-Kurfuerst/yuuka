@@ -82,6 +82,23 @@ void launch_cast_f32_to_f16(void * dst, const float * src, uint64_t n,
 void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,
                             hipStream_t stream);
 
+/* Int8 MMQ prefill family.
+ *
+ * launch_quantize_q8_1 converts FP32 activations into Q8_1: qs holds batch*n
+ * int8 values in [batch][n] row-major order, ds holds batch*(n/32) float2
+ * entries where x is the 32-value block scale and y is the scale times the
+ * integer block sum. n must be a multiple of 128.
+ *
+ * launch_gemm_mmq_f32out computes out[batch, n_out] = W[n_out, n_in] * x with
+ * the Q8_1 activations above, int8-decoded Q4_K/Q5_K/Q6_K weights, exact int32
+ * WMMA accumulation, and FP32 scale application. n_in must be a multiple of
+ * 256, which every K-quant row layout already requires. */
+void launch_quantize_q8_1(void * qs, void * ds, const float * x, uint64_t n,
+                          uint64_t batch, hipStream_t stream);
+void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
+                            const void * w, uint64_t n_in, uint64_t n_out,
+                            uint64_t batch, uint32_t dtype, hipStream_t stream);
+
 /* Dequantizes a packed K-quant weight matrix into FP16.
  *
  * dst holds n_in*n_out FP16 elements. src holds the packed [n_out, n_in] matrix

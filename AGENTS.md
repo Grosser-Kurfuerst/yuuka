@@ -44,7 +44,8 @@ The repository contains an end-to-end single-node implementation:
 - HIP C ABI, plan executor, and kernels for the full `qwen35` decode and chunked
   prefill graphs. Native grouped MoE kernels remain tested, but no supported
   model runtime executes them.
-- rocWMMA/rocBLAS prefill GEMM, causal GQA Flash Attention, and chunked prefill.
+- rocWMMA/rocBLAS prefill GEMM, an int8 MMQ prefill GEMM for K-quant weights,
+  causal GQA Flash Attention, and chunked prefill.
 - Paged KV, iteration-level continuous scheduling, prefix caching, and opt-in
   HIP Graph replay.
 - `yuuka` CLI and OpenAI-compatible `yuuka-server`.

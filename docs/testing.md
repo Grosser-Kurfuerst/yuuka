@@ -130,6 +130,14 @@ Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
 
 - WMMA GEMM for `F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, and
   `Q6_K` at `M` values 1, 7, 16, and 33 and non-tile-aligned `N`;
+- the int8 MMQ route for `Q4_K`, `Q5_K`, and `Q6_K` at `(K, N, M)` 512/64/128,
+  512/128/130, 768/70/129, and 2560/128/128. The Q8_1 quantizer is checked digit
+  for digit against a host reimplementation of the same rule, including the
+  block scale and block sum, and the GEMM is then compared with a CPU dot
+  product over those dequantized activations at the 2e-2 per-GEMM bound. Q8_1
+  activations are lossy by construction, so the FP32 dot product is not the
+  reference for this path: the measured difference reaches 0.04-0.14 on these
+  shapes, which is quantization noise, not kernel error;
 - the rocBLAS FP16 baseline against a float reference;
 - row-batched and head-batched RMSNorm, batched RoPE, batch embedding, and
   batch KV writes;
@@ -151,11 +159,21 @@ met the 2e-2 per-GEMM bound while accumulating in FP16 moved the 512-token
 logits by 0.305 against a bitwise-identical baseline, six times the 0.05 chunk
 gate, because a 2-5e-3 error in one 9216-wide dot compounds across 32 layers.
 A route change must therefore clear the chunk gate in
-`TestGPUChunkedPrefillLongContext`, not only the per-operator bound. That gate is
-tight enough to be the binding constraint: the adopted rocBLAS route rounds each
-result once to FP16, measures one unit roundoff (4.0-4.9e-4) per GEMM, and still
-lands at 0.042 against the 0.05 bound. See
-[benchmarks.md](benchmarks.md#prefill-matmul-route-experiments-2026-11-16).
+`TestGPUChunkedPrefillLongContext`, not only the per-operator bound. That chunk
+gate measures one route against itself and the int8 MMQ route holds it at 0,
+because int32 accumulation is exact and the chunked plan reads the same
+quantized weights.
+
+The int8 route does move the model output against the FP16 routes it replaced.
+On the 2048-token prompt the maximum logit delta is 0.264 (mean 0.045) with the
+top-1 token preserved; the cause is the Q8_1 activation grid (~4e-3 relative per
+value) against FP16 staging (~5e-4), which compounds across 32 layers. Any
+comparison between two non-identical routes therefore sits on that noise floor:
+`TestGPUBlasAttentionMatchesTiled`, which changes only the prefill attention
+dispatch in both arms, measures 0.184 instead of 0.0132 and is gated at 0.3 with
+the top-1 token still required to match. This is the accuracy regime that
+llama.cpp's default K-quant prefill path runs in. See
+[benchmarks.md](benchmarks.md#2026-11-17-gfx1151-int8-mmq-prefill-gemm).
 
 Paged KV and graph replay have dedicated native coverage in
 `tests/hip/paged_test.cpp`:
