@@ -6,6 +6,7 @@
 *.log
 *.gguf
 /bench/results/
+/.rocprofv3/
 /yuuka
 /yuuka-server
 /bin/
