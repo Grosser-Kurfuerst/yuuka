@@ -12,14 +12,7 @@ import (
 
 func newHIPRuntime(l *loadedModel, capacity int, format qwen35.KVFormat) (engine.Runtime, error) {
 	if l.qwen == nil {
-		if l.dense == nil || !l.dense.Config.IsMoE() {
-			return nil, fmt.Errorf("HIP backend does not implement %q yet; use --backend cpu", l.arch)
-		}
-		runtime, err := gpu.NewMoERuntime(l.reader, l.dense, capacity, format.DType())
-		if err != nil {
-			return nil, fmt.Errorf("HIP MoE runtime: %w", err)
-		}
-		return runtime, nil
+		return nil, fmt.Errorf("HIP backend does not implement %q yet; use --backend cpu", l.arch)
 	}
 	if l.qwen.Config.IsMoE() {
 		return nil, fmt.Errorf("HIP backend does not implement %q yet; use --backend cpu", l.arch)

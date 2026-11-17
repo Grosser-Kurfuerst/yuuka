@@ -397,8 +397,8 @@ with 512 threads.
 - The Qwen3.5 attention gate (the second half of each query vector) is applied
   as `sigmoid(gate)` before the output write. The contiguous op implements only
   this gated layout; `ATTENTION_PREFILL` rejects `u[3] != 0` with an unsupported
-  capability error. The dense flag applies to the paged variants in section
-  7.4.
+  capability error. The dense query-layout flag is retained by the paged
+  variants described in section 7.4.
 
 Dynamic shared memory is `2 * 16 * 32 * (vec + 1) * 4` bytes, or 36 KiB at
 `head_dim = 256`. The kernels report 49-53 VGPRs, 48-63 SGPRs, no spills, and
@@ -482,13 +482,13 @@ size changes:
 K and V through the same row format. Prefix-cache keys include the format so
 cached blocks are never reused across formats.
 
-### 7.4 Dense attention variant
+### 7.4 Attention query layout
 
-The original paged attention kernels assume the Qwen3.5 query layout with a
-sigmoid output gate in the second head-sized half. Qwen3 MoE uses a dense query
-row without that gate. The plan carries a dense flag in `u[3]`; the dense kernel
-skips the gate and uses `heads * head_dim` query stride. The Qwen3.5 path keeps
-the gated variant.
+The paged attention kernels assume the Qwen3.5 query layout with a sigmoid
+output gate in the second head-sized half. The plan carries a dense flag in
+`u[3]` that skips the gate and uses `heads * head_dim` query stride; the ABI
+retains that variant, but no supported model selects it. The `qwen35` path uses
+the gated layout exclusively.
 
 Current limits:
 
@@ -531,9 +531,10 @@ expert's assignment list:
 
 The routing and assignment buffers are sized `experts * rows * used`, which is
 safe because one row contributes exactly `used` assignments. A malformed plan
-that would exceed a bucket is rejected at plan construction. The pipeline is
-validated with F32 and Q4_K synthetic fixtures; the Q4_K fixture covers chunked
-prefill and prefill-plus-decode against the CPU reference.
+that would exceed a bucket is rejected at plan construction. The grouped kernels
+remain covered by native F32 and Q4_K kernel tests, but no supported model
+runtime executes them: `qwen35moe` is CPU-only and the removed Qwen3 MoE adapter
+is not reachable.
 
 ### 8.2 Speculative verification
 

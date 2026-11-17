@@ -1,4 +1,4 @@
-// Measures the grouped MoE routing and expert pipeline at Qwen3-30B-A3B-like
+// Measures the grouped MoE routing and expert pipeline at production-like
 // shapes. The weights are packed Q4_K and are never dequantized on the host.
 
 #include "yuuka_hip.h"

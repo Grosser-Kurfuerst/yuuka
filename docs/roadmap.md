@@ -31,13 +31,12 @@ tested; CPU and HIP greedy tokens match.
 Phase 0 exit criteria are met: the hardware report records the toolchain,
 firmware, power-management profile, short sustained-load telemetry, and a clean
 checkout is verified by `scripts/check_clean_build.sh` plus CI. Phase 1 exit criteria are met for the validated
-models: CPU reference paths exist for `qwen35`, dense Llama, and dense Qwen3,
-the Qwen and Llama tokenizers match reference token IDs, CPU/GPU logits and
-layer traces agree, and a validated F32/F16 GEMM ABI baseline is checked in.
+models: CPU reference paths exist for `qwen35` and `qwen35moe`, the Qwen and
+SentencePiece tokenizers match reference token IDs, CPU/GPU logits and layer
+traces agree, and a validated F32/F16 GEMM ABI baseline is checked in.
 The decode path's first-step maximum absolute logit difference is `4.58e-5`; the
 chunked prefill path reports `3.65e-3` on the same prompt with the same top-1
 token, and chunk-size equivalence at 1024 tokens is exact.
-HIP execution for the dense models is not implemented.
 
 Phase 2 exit criteria are met: quantized GEMV is correct across randomized
 shapes, GEMV accounts for about 90.5% of profiled decode time, and
@@ -74,13 +73,13 @@ every block. This is not fused multi-request batching: aggregate decode
 throughput does not scale with concurrency because mixed-shape batched kernels
 are not implemented; requests are interleaved on one stream.
 
-Phase 5 executable features are implemented and opt-in: `qwen3moe` expert
-routing with grouped HIP expert kernels, F16 and Q8_0 KV cache formats, exact
-greedy prompt-lookup speculative decoding, and Q4_0/Q5_0 tensor support. Each
-executable feature is covered by CPU reference tests and a measured result in
-[benchmarks.md](benchmarks.md). Q4_K expert execution is covered by a synthetic
-quantized fixture as well as the F32 fixture. NPU support is a future task, not
-part of Phase 5 or the first release. The existing `backend/npu` probe and
+Phase 5 executable features are implemented and opt-in: the `qwen35moe` CPU
+reference, F16 and Q8_0 KV cache formats, exact greedy prompt-lookup speculative
+decoding, and Q4_0/Q5_0 tensor support. Each executable model feature is covered
+by CPU reference tests and a measured result in [benchmarks.md](benchmarks.md).
+The native grouped-MoE HIP kernels remain covered by direct kernel tests, but no
+supported model runtime executes them. NPU support is a future task, not part of
+Phase 5 or the first release. The existing `backend/npu` probe and
 `--npu` flag are diagnostic only: they report device, driver, and runtime
 availability and fall back to the selected backend, but they do not execute
 model operations. See [npu.md](npu.md) and the future-task section below. All
@@ -93,7 +92,7 @@ decode-length matrix at 128 and 256 tokens recorded in
 | Phase | Objective | Key deliverables | Exit gate |
 | --- | --- | --- | --- |
 | **0. Bootstrap** | Prove the toolchain and characterize the device | Hardware report, repository scaffold, C ABI, GGUF fixtures, CPU reference skeleton | HIP/rocBLAS/WMMA smoke tests and allocation/bandwidth measurements recorded |
-| **1. Minimal loop** | Correct single-request generation | GGUF reader, tokenizer, Qwen3/Llama dense, CPU reference ops, HIP FP16 baseline, CLI | Fixed-prompt token IDs match or logits are within documented tolerance; generation stops correctly |
+| **1. Minimal loop** | Correct single-request generation | GGUF reader, tokenizer, `qwen35` CPU reference, HIP FP16 baseline, CLI | Fixed-prompt token IDs match or logits are within documented tolerance; generation stops correctly |
 | **2. Quantized decode** | Native low-bit decode | Q4_K/Q6_K/Q8_0 GEMV, fused unpack/scale, dispatch thresholds, profiling | Qwen3.5-4B Q4_K_M runs correctly; decode bottleneck is attributable to a kernel and memory behavior |
 | **3. High-performance prefill** | Fast prompt processing | WMMA quantized GEMM, Flash Attention, chunked prefill, key fusions, tuning tables | Performance curves at 128/512/2048/8192/32768 tokens and same-condition comparison with llama.cpp |
 | **4. Multi-request serving** | Concurrent, cache-aware service | Paged KV, iteration-level continuous scheduling, prefix cache, HIP Graph, SSE/OpenAI API, metrics | Reproducible latency and throughput; cancellation and reclamation are leak-free |
@@ -116,7 +115,7 @@ kernel designs or performance assumptions.
   `hipMalloc`, host pinned memory, mapped memory, and any unified-memory path.
 - Repository scaffold: Go module, CMake HIP shared library, stable C ABI,
   CLI/server skeletons, test harness, and CI.
-- Small dense model fixture and a tokenizer/logits comparison harness.
+- Small `qwen35` fixture and a tokenizer/logits comparison harness.
 - CPU reference skeletons for the operations needed by Phase 1.
 - Recorded decisions for the open questions in
   [architecture.md](architecture.md#11-open-design-questions).
@@ -152,7 +151,7 @@ request, with a GPU path and a CPU reference path.
 - Pure Go GGUF reader with metadata, tensor directory, shard, alignment, and
   validation support.
 - Tokenizer and chat-template implementation with token-exact comparison tests.
-- Qwen3.5 hybrid, Qwen3 Dense, and Llama Dense model builders.
+- Qwen3.5 hybrid (`qwen35`) model builder.
 - CPU reference implementations for the required operators.
 - HIP baseline kernels: FP16 GEMM, RMSNorm, RoPE, basic attention, and sampling.
 - `ExecutionPlan` construction and a single-request executor.
@@ -353,7 +352,7 @@ destabilizing the core GPU path.
 
 ### Deliverables
 
-- MoE routing and grouped GEMM for Qwen3 MoE and similar models.
+- MoE routing and grouped GEMM kernels for future HIP MoE execution.
 - KV-cache quantization.
 - Speculative decoding experiments.
 - Additional GGUF architectures and quantization types driven by demand.
@@ -365,8 +364,8 @@ NPU support is a future task and is intentionally not part of Phase 5; see
 
 - [x] Each feature is behind a capability check or explicit flag.
       KV format is selected by `--kv-type`, speculative decoding by
-      `--speculative`, and MoE/quantization support by GGUF architecture and
-      dtype capability checks.
+      `--speculative`, and quantization support by GGUF dtype capability
+      checks.
 - [x] Each executable feature has correctness evidence against the CPU
       reference and a measured performance result. See the Phase 5 section of
       [benchmarks.md](benchmarks.md).
@@ -376,23 +375,18 @@ NPU support is a future task and is intentionally not part of Phase 5; see
 
 ### Implementation notes and limits
 
-- `qwen3moe` is a CPU reference and HIP decode/prefill architecture. Routing
-  selects the top-k experts deterministically, grouped HIP kernels bin
-  assignments by expert, and the expert weights stay packed. The HIP path is
-  validated on F32 and Q4_K synthetic GGUF fixtures because no standard
-  `qwen3moe` model is available on the target host. `TestTinyMoEQuantizedGPUMatchesCPU`
-  covers chunked prefill and prefill-plus-decode with Q4_K expert matrices;
-  real-model MoE validation remains open.
+- Grouped MoE HIP kernels remain in the native library and are covered by
+  direct kernel tests, but no supported model runtime executes them. The
+  unreachable Qwen3 MoE adapter has been removed; `qwen35moe` remains CPU-only.
 - KV formats are F32 (default), F16, and Q8_0. Q8_0 stores one FP16 scale per
   32-value group. Prefix-cache keys include the format. The `qwen35` CPU and HIP
-  runtimes and the `qwen3moe` HIP runtime implement all three; dense
-  `llama`/`qwen3` CPU runtimes implement F32 and reject other `--kv-type` values
-  explicitly. KV format does not change decode latency measurably at 128 prompt
-  / 32 decode tokens; its benefit is cache memory.
+  runtimes and the `qwen35moe` CPU runtime implement all three. KV format does
+  not change decode latency measurably at 128 prompt / 32 decode tokens; its
+  benefit is cache memory.
 - Speculative decoding is exact greedy prompt-lookup speculation. It is not
-  available for non-greedy sampling or the MoE HIP runtime, and it is exposed
-  only through the CLI/bench path. `TestSpeculativePartialAcceptanceMatchesGreedy`
-  covers the partial-accept rollback and replay path.
+  available for non-greedy sampling, and it is exposed only through the
+  CLI/bench path. `TestSpeculativePartialAcceptanceMatchesGreedy` covers the
+  partial-accept rollback and replay path.
 - Q4_0 and Q5_0 are supported by the GGUF reader, CPU reference, HIP GEMV,
   embedding, and WMMA GEMM. Q4_1/Q5_1/Q2_K/Q3_K/quantized K-cache remain
   unsupported.
@@ -415,7 +409,7 @@ NPU support is a future task and is intentionally not part of Phase 5; see
 | Milestone | Demonstrable artifact | Evidence |
 | --- | --- | --- |
 | **M0: Toolchain proven** | HIP, rocBLAS, and WMMA smoke tests; allocation report | Phase 0 checklist |
-| **M1: Correct generation** | Single-request Qwen3/Llama generation with CPU/GPU agreement | Token and logits comparison report |
+| **M1: Correct generation** | Single-request Qwen3.5 generation with CPU/GPU agreement | Token and logits comparison report |
 | **M2: Quantized decode** | Qwen3.5-4B Q4_K_M generation with native GEMV | Per-kernel correctness and decode baseline |
 | **M3: Prefill performance** | Prompt-length performance curves | Benchmark report vs llama.cpp |
 | **M4: Concurrent service** | Paged KV, iteration-level continuous scheduling, SSE API | Latency/throughput report and leak checks |

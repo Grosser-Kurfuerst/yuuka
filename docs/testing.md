@@ -80,13 +80,13 @@ Checked-in rejection tests use synthetic and real fixtures to cover:
 
 The loaders and config builders additionally enforce:
 
-- missing required tensors, and rejection of known dense bias tensors;
+- missing required tensors;
 - head/KV-head/head-dimension/context consistency and RoPE section consistency;
 - special-token ID range checks and non-Qwen chat-template rejection at render
   time.
 
-Self-contained validation has model-config unit tests; missing-tensor and dense
-bias rejection do not yet have a dedicated end-to-end fixture test. Every
+Self-contained validation has model-config unit tests; missing-tensor rejection
+does not yet have a dedicated end-to-end fixture test. Every
 checked-in rejection test asserts the error class and that the failed file is
 not left mapped.
 
@@ -233,18 +233,19 @@ model output. A text-only comparison is insufficient.
 
 | Dimension | Values |
 | --- | --- |
-| Model | Qwen3.5-4B hybrid (primary), Qwen3.6-35B-A3B MoE, Qwen3 MoE F32/Q4_K fixtures, Qwen3 Dense, Llama Dense, small fixtures |
+| Model | Qwen3.5-4B hybrid (primary), Qwen3.6-35B-A3B MoE CPU, tiny `qwen35` and `qwen35moe` fixtures |
 | Quantization | F16, Q8_0, Q6_K, Q5_K, Q4_K, Q5_0, Q4_0, IQ2_XXS, IQ2_S, IQ3_S |
 | KV format | F32, F16, Q8_0 |
 | Context | short, medium, maximum supported |
 | Prompt language | English, Chinese, mixed |
 | Batch | 1, small batch, continuous batch |
 | Concurrency | 1, 2, 4 |
-| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, grouped MoE experts, shared MoE experts |
+| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, shared MoE expert, native grouped-MoE kernel tests |
 | Backends | CPU reference, HIP GPU, library fallback |
 
 `qwen35moe` currently runs on the CPU reference only; the HIP planner rejects it
-explicitly. `qwen3moe` has a HIP path validated on synthetic fixtures.
+explicitly. Architectures other than `qwen35` and `qwen35moe` are rejected at
+load time and have no test matrix entry.
 
 NPU support is a future task and is not part of Phase 5 acceptance. The
 `npu-probe` command remains a diagnostic check only.
@@ -421,10 +422,10 @@ reference, layer-by-layer hidden-state comparison, the paged HIP executor, KV
 formats, and speculative decoding against the plain greedy path. The
 `qwen35moe` CPU reference is validated on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf by
 greedy token comparison with llama.cpp; IQ block dequantization has separate
-reference tests for `IQ2_XXS`, `IQ2_S`, and `IQ3_S`. Synthetic
-coverage includes F32 and Q4_K `qwen3moe` fixtures for chunked prefill and
-prefill-plus-decode, a tiny F32 `qwen35moe` fixture, and a scripted
-partial-accept speculative rollback test.
+reference tests for `IQ2_XXS`, `IQ2_S`, and `IQ3_S`. Synthetic coverage includes
+a tiny F32 `qwen35moe` fixture and a scripted partial-accept speculative
+rollback test. Native grouped-MoE kernels retain direct F32 and Q4_K tests, but
+no model runtime executes them.
 HTTP API contract tests use the deterministic tiny fixture so they cover
 streaming, errors, stops, and cancellation independently of the optional model
 environment. SentencePiece golden IDs additionally accept
@@ -489,8 +490,8 @@ Tests that require the real model skip when `YUUKA_TEST_MODEL` or
 `YUUKA_TEST_MOE_MODEL` is unset. A
 separate subset of tests runs without a model file by generating deterministic
 tiny GGUF fixtures from `tests/fixture`, including the tiny `qwen35` GPU/CPU
-comparison, the tiny `qwen35moe` CPU comparison, dense-model tests, and server
-request tests. Fixtures are generated
+comparison, the tiny `qwen35moe` CPU comparison, and server request tests.
+Fixtures are generated
 at test time and are not committed as model artifacts. Real-model coverage
 remains opt-in.
 

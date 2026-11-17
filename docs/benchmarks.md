@@ -1413,10 +1413,10 @@ Phase 5 measurements use the same model, device, ROCm/HIP version, greedy
 sampling, warmup, and repetition settings as the Phase 2/4 sections unless a
 row states otherwise. The KV-format runs use a 128-token prompt and 32 generated
 tokens. The speculative HIP rows use the same 128/32 protocol; the CPU rows in
-that table are a 16-prompt/8-decode negative control. The MoE sweep uses
-synthetic Q4_K weights at Qwen3-30B-A3B-like single-layer shapes because no
-standard `qwen3moe` GGUF is available on the target host. NPU support is a future
-task and is not part of the Phase 5 benchmark set.
+that table are a 16-prompt/8-decode negative control. The MoE sweep measures the
+native grouped-expert kernel pipeline on a synthetic single-layer Q4_K shape; no
+supported model runtime executes that pipeline. NPU support is a future task and
+is not part of the Phase 5 benchmark set.
 
 ### KV cache formats
 
@@ -1491,13 +1491,9 @@ total is the steady-state wall time including the plan submission.
 
 These are kernel-pipeline numbers, not end-to-end model throughput. Routing and
 reduction are negligible; gate/up and down are limited by packed-weight reads.
-The F32 synthetic fixture CPU reference and HIP pipeline agree within `3.9e-5`
-maximum logit difference, and the native F32 MoE test agrees within `8.7e-9` on
-its direct kernel comparison. The Q4_K synthetic fixture test
-`TestTinyMoEQuantizedGPUMatchesCPU` compares chunked prefill and
-prefill-plus-decode against the CPU decoder; the observed maximum logit
-difference is `1.19e-6`. No standard `qwen3moe` GGUF is available on the target
-host, so real-model MoE validation remains open.
+The native F32 grouped-MoE test agrees with a direct reference within `8.7e-9`.
+No supported model runtime executes the grouped HIP kernels, so there is no
+end-to-end MoE throughput number.
 
 ### Q4_0 and Q5_0 GEMV
 
@@ -1549,7 +1545,6 @@ go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
 ./build/yuuka_moe_sweep
 scripts/kernel_resources.sh
 go test ./engine -run TestSpeculativePartialAcceptanceMatchesGreedy -v
-go test -tags hip ./engine/gpu -run TestTinyMoEQuantizedGPUMatchesCPU -v
 YUUKA_TEST_MODEL="$YUUKA_TEST_MODEL" go test -tags hip ./engine/gpu/... \
   -run 'TestGPURealModelKVFormats|TestGPURealModelSpeculativeMatchesGreedy' -v
 ```

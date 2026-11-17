@@ -42,7 +42,8 @@ The repository contains an end-to-end single-node implementation:
   Qwen3.6-35B-A3B IQ2_XXS GGUF. CPU dequantization for `IQ2_XXS`, `IQ2_S`, and
   `IQ3_S` is included; HIP kernels for these types are not.
 - HIP C ABI, plan executor, and kernels for the full `qwen35` decode and chunked
-  prefill graphs, plus `qwen3moe` expert routing and grouped kernels.
+  prefill graphs. Native grouped MoE kernels remain tested, but no supported
+  model runtime executes them.
 - rocWMMA/rocBLAS prefill GEMM, causal GQA Flash Attention, and chunked prefill.
 - Paged KV, iteration-level continuous scheduling, prefix caching, and opt-in
   HIP Graph replay.
@@ -50,12 +51,11 @@ The repository contains an end-to-end single-node implementation:
 - Native CTest coverage for the ABI, quantized GEMV, operators, GEMM, prefill,
   paged KV/graph, embedding, and MoE kernels.
 
-Not yet implemented: HIP execution for dense Llama/Qwen3 models, HIP execution
-and IQ2/IQ3 kernels for `qwen35moe`, real-model `qwen3moe` validation (synthetic
-fixtures only), NPU execution (the probe is diagnostic), quantization presets
-outside the documented set, speculative decoding for non-greedy sampling or the
-MoE HIP runtime, and fused mixed-shape multi-request batching. See
-`docs/README.md` for the full status.
+Not yet implemented: HIP execution and IQ2/IQ3 kernels for `qwen35moe`, model
+architectures other than `qwen35` and `qwen35moe`, NPU execution (the probe is
+diagnostic), quantization presets outside the documented set, speculative
+decoding for non-greedy sampling, and fused mixed-shape multi-request batching.
+See `docs/README.md` for the full status.
 
 Therefore:
 
@@ -145,9 +145,8 @@ yuuka/
 │   └── yuuka-server/          # OpenAI-compatible server
 ├── gguf/                      # Pure Go GGUF reader
 ├── tokenizer/                 # BPE, SentencePiece, chat templates
-├── model/                     # Model interfaces and architecture builders
-│   ├── llama/
-│   └── qwen3/
+├── model/
+│   └── qwen35/                # qwen35 and qwen35moe model builders
 ├── tensor/                    # Tensor descriptors, dtypes, layouts
 ├── engine/                    # Planner, executor, sampling
 ├── scheduler/                 # Admission, batching, requests
@@ -180,8 +179,8 @@ declared complete before its exit criteria are met.
 | Phase | Focus | Do not claim complete without |
 | --- | --- | --- |
 | **0** | Toolchain, hardware characterization, scaffold, C ABI smoke test | HIP/rocBLAS/WMMA checks and allocation/bandwidth measurements |
-| **1** | GGUF, tokenizer, dense model, CPU reference, HIP FP16 baseline | Token-exact or documented logits match; correct stop behavior |
-| **2** | Native Q4_K/Q6_K/Q8_0 decode | Correct Qwen3 Q4_K generation; measured decode bottleneck |
+| **1** | GGUF, tokenizer, `qwen35` model, CPU reference, HIP FP16 baseline | Token-exact or documented logits match; correct stop behavior |
+| **2** | Native Q4_K/Q6_K/Q8_0 decode | Correct Qwen3.5 Q4_K generation; measured decode bottleneck |
 | **3** | WMMA quantized GEMM, Flash Attention, chunked prefill | Prompt-length performance curves and same-condition comparison |
 | **4** | Paged KV, continuous batching, prefix cache, HIP Graph, API | Reproducible latency/throughput; cancellation and leak checks |
 | **5** | MoE, KV quantization, speculative decoding, NPU experiments | Opt-in features with measured benefit and no regressions |

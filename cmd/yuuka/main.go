@@ -20,7 +20,6 @@ import (
 	"github.com/yuuka-ai/yuuka/backend/npu"
 	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/gguf"
-	"github.com/yuuka-ai/yuuka/model/dense"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
 	"github.com/yuuka-ai/yuuka/tensor"
 	"github.com/yuuka-ai/yuuka/tokenizer"
@@ -68,7 +67,6 @@ type loadedModel struct {
 	reader    *gguf.Reader
 	tokenizer *tokenizer.Tokenizer
 	qwen      *qwen35.Model
-	dense     *dense.Model
 	arch      string
 }
 
@@ -120,8 +118,6 @@ func load(path string) (*loadedModel, error) {
 	switch arch {
 	case qwen35.Architecture, qwen35.MoEArchitecture:
 		loaded.qwen, err = qwen35.Load(r)
-	case dense.Llama, dense.Qwen3, dense.Qwen3MoE:
-		loaded.dense, err = dense.Load(r)
 	default:
 		err = fmt.Errorf("model architecture %q is not supported", arch)
 	}
@@ -135,37 +131,15 @@ func load(path string) (*loadedModel, error) {
 func (l *loadedModel) Close() error { return l.reader.Close() }
 
 func (l *loadedModel) contextLength() int {
-	if l.qwen != nil {
-		return l.qwen.Config.ContextLength
-	}
-	return l.dense.Config.Context
+	return l.qwen.Config.ContextLength
 }
 
 func (l *loadedModel) vocabSize() int {
-	if l.qwen != nil {
-		return l.qwen.Config.VocabSize
-	}
-	return l.dense.Config.VocabSize
+	return l.qwen.Config.VocabSize
 }
 
 func (l *loadedModel) cpuEngine(capacity int, sampler *engine.Sampler, format qwen35.KVFormat) (*engine.Engine, error) {
-	if l.qwen != nil {
-		return engine.NewWithKVFormat(l.qwen, l.tokenizer, capacity, sampler, format)
-	}
-	if format != qwen35.KVF32 {
-		return nil, fmt.Errorf("--kv-type %s is not supported for architecture %q on the CPU backend; only f32 is implemented",
-			format, l.arch)
-	}
-	runtime, err := dense.NewRuntime(l.dense, capacity)
-	if err != nil {
-		return nil, err
-	}
-	runner, err := engine.NewWithRuntime(runtime, l.tokenizer, sampler)
-	if err != nil {
-		_ = runtime.Close()
-		return nil, err
-	}
-	return runner, nil
+	return engine.NewWithKVFormat(l.qwen, l.tokenizer, capacity, sampler, format)
 }
 
 func runInspect(args []string) error {
@@ -186,37 +160,23 @@ func runInspect(args []string) error {
 	fmt.Printf("alignment: %d\n", l.reader.Alignment())
 	fmt.Printf("architecture: %s\n", l.arch)
 	fmt.Printf("tensors: %d\n", len(l.reader.Tensors()))
-	if l.qwen != nil {
-		cfg := l.qwen.Config
-		fmt.Printf("layers: %d (full_attention=%d, recurrent=%d)\n",
-			cfg.BlockCount, len(cfg.FullAttentionLayers()), cfg.BlockCount-len(cfg.FullAttentionLayers()))
-		if cfg.IsMoE() {
-			fmt.Printf("hidden: %d  vocab: %d\n", cfg.HiddenSize, cfg.VocabSize)
-		} else {
-			fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
-		}
-		fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d\n",
-			cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim)
-		fmt.Printf("ssm: conv=%d state=%d groups=%d time_step_rank=%d inner=%d\n",
-			cfg.SSMConvKernel, cfg.SSMStateSize, cfg.SSMGroupCount, cfg.SSMTimeStepRank, cfg.SSMInnerSize)
-		fmt.Printf("context: %d  rms_eps: %g  rope_base: %g\n",
-			cfg.ContextLength, cfg.RMSNormEps, cfg.RoPEFreqBase)
-		if cfg.IsMoE() {
-			fmt.Printf("moe: experts=%d used=%d expert_ffn=%d shared_ffn=%d\n",
-				cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNSize, cfg.SharedFFNSize)
-		}
+	cfg := l.qwen.Config
+	fmt.Printf("layers: %d (full_attention=%d, recurrent=%d)\n",
+		cfg.BlockCount, len(cfg.FullAttentionLayers()), cfg.BlockCount-len(cfg.FullAttentionLayers()))
+	if cfg.IsMoE() {
+		fmt.Printf("hidden: %d  vocab: %d\n", cfg.HiddenSize, cfg.VocabSize)
 	} else {
-		cfg := l.dense.Config
-		fmt.Printf("layers: %d (dense full attention)\n", cfg.BlockCount)
 		fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
-		fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d qk_norm=%t\n",
-			cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim, cfg.HasQKNorm)
-		fmt.Printf("context: %d  rms_eps: %g  rope_base: %g tied_output=%t\n",
-			cfg.Context, cfg.RMSNormEps, cfg.RoPEFreqBase, l.dense.OutputTied())
-		if cfg.IsMoE() {
-			fmt.Printf("moe: experts=%d used=%d expert_ffn=%d\n",
-				cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNSize)
-		}
+	}
+	fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d\n",
+		cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim)
+	fmt.Printf("ssm: conv=%d state=%d groups=%d time_step_rank=%d inner=%d\n",
+		cfg.SSMConvKernel, cfg.SSMStateSize, cfg.SSMGroupCount, cfg.SSMTimeStepRank, cfg.SSMInnerSize)
+	fmt.Printf("context: %d  rms_eps: %g  rope_base: %g\n",
+		cfg.ContextLength, cfg.RMSNormEps, cfg.RoPEFreqBase)
+	if cfg.IsMoE() {
+		fmt.Printf("moe: experts=%d used=%d expert_ffn=%d shared_ffn=%d\n",
+			cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNSize, cfg.SharedFFNSize)
 	}
 	fmt.Printf("tokenizer: model=%s pre=%s vocab=%d eos=%d\n",
 		l.tokenizerModel(), l.tokenizerPre(), l.tokenizer.VocabSize(), l.tokenizer.EOSToken())
@@ -287,7 +247,7 @@ func runGenerate(args []string) error {
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
 	topP := fs.Float64("top-p", 0.95, "nucleus sampling cutoff")
 	seed := fs.Int64("seed", 0, "sampling seed")
-	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 CPU/HIP, qwen35moe CPU, and qwen3moe HIP: f32, f16, or q8_0")
+	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 CPU/HIP and qwen35moe CPU: f32, f16, or q8_0")
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
@@ -391,7 +351,7 @@ func runBench(args []string) error {
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
-	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 CPU/HIP, qwen35moe CPU, and qwen3moe HIP: f32, f16, or q8_0")
+	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 CPU/HIP and qwen35moe CPU: f32, f16, or q8_0")
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")

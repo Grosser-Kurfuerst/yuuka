@@ -13,9 +13,9 @@ treated as format and correctness references only.
 > Attention, chunked prefill, a continuous scheduler, a reference-counted
 > paged KV and prefix cache, opt-in HIP Graph replay with fallback, a CLI, and
 > an OpenAI-compatible SSE server with health, metrics, and pprof endpoints.
-> Phase 5 adds `qwen3moe` grouped expert execution, F16/Q8_0 KV formats, greedy
-> prompt-lookup speculative decoding, Q4_0/Q5_0 tensors, and a CPU reference
-> path for `qwen35moe` with IQ2_XXS/IQ2_S/IQ3_S tensor support. NPU support is a
+> Phase 5 adds F16/Q8_0 KV formats, greedy prompt-lookup speculative decoding,
+> Q4_0/Q5_0 tensors, and a CPU reference path for `qwen35moe` with
+> IQ2_XXS/IQ2_S/IQ3_S tensor support. NPU support is a
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
 > and does not execute model operations. All first-release success criteria in
 > [roadmap.md](roadmap.md) are met, including the 128/256-token decode matrix in
@@ -41,7 +41,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 
 ## Goals
 
-1. Load mainstream GGUF models, starting with dense decoder Transformers.
+1. Load mainstream GGUF models, starting with the Qwen3.5 hybrid decoder.
 2. Execute the full Transformer on the GPU: quantized weight matrix
    multiplication, attention, normalization, activations, and sampling.
 3. Design separate prefill and decode kernel families, dispatched by shape,
@@ -98,10 +98,10 @@ Implemented and tested:
 
 - Pure Go GGUF reader with header, metadata, tensor directory, split shards,
   alignment, overlap, and byte-range validation.
-- Qwen3.5 byte-level BPE and Llama SentencePiece tokenizers, with golden token
-  ID tests against llama.cpp for English, Chinese, whitespace, punctuation,
-  emoji, special tokens, and chat-template fragments; multi-turn chat rendering
-  is checked at the text level.
+- Qwen3.5 byte-level BPE and SentencePiece tokenizers, with golden token ID
+  tests against llama.cpp for English, Chinese, whitespace, punctuation, emoji,
+  special tokens, and chat-template fragments; multi-turn chat rendering is
+  checked at the text level.
 - CPU reference decoder for the `qwen35` hybrid architecture: full GQA
   attention, gated delta-net linear attention, convolution state, RMSNorm,
   RoPE, SwiGLU, tied LM head, and KV/recurrent caches.
@@ -109,9 +109,6 @@ Implemented and tested:
   recurrent state with top-k routed experts plus a sigmoid-gated shared expert.
   The adapter validates routed and shared expert widths and loads the packed
   rank-3 expert tensors without expanding them.
-- CPU reference decoders for dense Llama, dense Qwen3, and sparse `qwen3moe`
-  layouts, including optional Q/K norm, tied or untied output heads, top-k
-  expert routing, and generated tiny fixtures.
 - Deterministic greedy, top-k, and nucleus sampling.
 - `yuuka inspect`, `yuuka run`, and `yuuka bench`.
 - `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
@@ -161,12 +158,7 @@ Implemented and tested:
   collision-safe prefix cache, opt-in HIP Graph replay, and an
   OpenAI-compatible server.
 - Opt-in F16 and Q8_0 KV formats with CPU and HIP write/attention kernels for
-  `qwen35`, plus HIP write/attention kernels for `qwen3moe`. Dense CPU runtimes
-  implement F32 only and reject other `--kv-type` values.
-- `qwen3moe` HIP execution with top-k routing, per-expert assignment buckets,
-  and grouped expert kernels that keep expert weights packed. The F32 and Q4_K
-  synthetic fixtures cover chunked prefill and prefill-plus-decode against the
-  CPU reference.
+  `qwen35`, and CPU support for `qwen35moe`.
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
 - A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports
@@ -175,18 +167,16 @@ Implemented and tested:
 
 Not yet implemented:
 
-- HIP execution for dense Llama/Qwen3 (non-MoE) models.
 - HIP execution and HIP IQ2_XXS/IQ2_S/IQ3_S kernels for `qwen35moe`; the
   current `qwen35moe` path is the CPU reference.
-- Real-model `qwen3moe` validation; the HIP path is covered by F32 and Q4_K
-  synthetic fixtures because no standard `qwen3moe` GGUF is available on the
-  target host.
+- Model architectures other than `qwen35` and `qwen35moe`, including Llama,
+  dense Qwen3, and Qwen3 MoE.
 - NPU execution kernels, graph compilation, and subgraph partitioning. NPU
   support is a future task; the reference host also lacks an XRT userspace
   runtime.
 - Quantization presets and architectures outside the tested set, including
   Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, and the remaining IQ families.
-- Speculative decoding for non-greedy sampling or the MoE HIP runtime.
+- Speculative decoding for non-greedy sampling.
 
 Verification gaps: real-model tests are opt-in through `YUUKA_TEST_MODEL` and
 `YUUKA_TEST_MOE_MODEL`; GPU
@@ -195,9 +185,9 @@ use the deterministic tiny GGUF generated by `tests/fixture`, so no model
 weights are committed.
 
 The CPU reference path is the default. The HIP path requires the native shared
-library and a `-tags hip` Go build. `general.architecture = qwen35` is the primary model family; `qwen35moe` has a
-validated CPU reference path, `qwen3moe` has HIP support, and dense
-`llama`/`qwen3` remain CPU reference paths.
+library and a `-tags hip` Go build. `general.architecture = qwen35` is the only
+architecture with a HIP path; `qwen35moe` has a validated CPU reference path.
+Other architectures are rejected at load time.
 
 ## Reading paths
 

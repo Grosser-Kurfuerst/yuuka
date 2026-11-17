@@ -1,9 +1,9 @@
 //go:build hip && linux
 
-// Package gpu executes the Qwen3.5 hybrid decoder and Qwen3 MoE on the HIP
-// backend. A shared model owns weights and KV pools; each request owns a block
-// table and optional recurrent state. Runtime and MoERuntime are the
-// single-request compatibility wrappers used by the CLI.
+// Package gpu executes the Qwen3.5 hybrid decoder on the HIP backend. A shared
+// model owns weights and KV pools; each request owns a block table and optional
+// recurrent state. Runtime is the single-request compatibility wrapper used by
+// the CLI.
 package gpu
 
 import (
