@@ -130,15 +130,23 @@ F32 KV, median of three repetitions:
 
 | Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 320 | 0.123 s | 0.123 s | 13.218 s | 9.61 |
-| 256 | 448 | 0.123 s | 0.123 s | 26.830 s | 9.50 |
+| 128 | 320 | 0.087 s | 0.087 s | 12.079 s | 10.51 |
+| 256 | 448 | 0.088 s | 0.088 s | 24.531 s | 10.39 |
 
 Decode is weight-bandwidth bound and essentially flat in output length: the two
 rows differ by about 1%. Effective weight-read bandwidth is
-$2.74\\,\\mathrm{GB} \\times 9.6\\,\\mathrm{s^{-1}} \\approx 26\\,\\mathrm{GB/s}$,
+$2.726\\,\\mathrm{GB} \\times 10.5\\,\\mathrm{s^{-1}} \\approx 28.6\\,\\mathrm{GB/s}$,
 roughly one sixth of what the same weights stream at in llama.cpp
 ([llama.cpp comparison](#llamacpp-comparison)). The single-request GEMV path is
 the limiter, not attention ([isolated kernels](#isolated-kernels)).
+
+The table was re-measured when the decode output projection moved to the
+streaming LM head kernel ([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)).
+The same rows before that change, same flags in the same session, were 13.241 s
+and 9.59 tokens/s, and the
+per-operation attribution dropped from 97.6 ms to 89.0 ms per step with the tail
+going from 11.23 ms at 46 GB/s to 2.81 ms at 186 GB/s. Prefill is unaffected:
+0.087 s and 0.088 s against 0.085 s and 0.088 s before the change.
 
 ## Speculative decoding
 
@@ -396,6 +404,24 @@ Findings:
   cell and within 0.3% on the profiled decode step, so the table is stable
   enough to judge a kernel change against.
 
+`build/yuuka_gemv_decode_sweep --threshold` measures the rows = 1 crossover that
+`lmHeadMinOutputs` encodes, at the decode width with five warmups and
+twenty-five timed submissions per cell. "From" is the smallest output count at
+which the streaming kernel wins and keeps winning:
+
+| dtype | GEMV at 256 | GEMV at 1024 | streaming at 1024 | streaming wins from |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K | 20.2 GB/s | 24.8 GB/s | 65 GB/s | 512 outputs |
+| Q5_K | 23.2 GB/s | 27.9 GB/s | 72 GB/s | 512 outputs |
+| Q6_K | 34.4 GB/s | 39.7 GB/s | 99 GB/s | 512 outputs |
+| Q8_0 | 58.1 GB/s | 116.8 GB/s | 115 GB/s | 1536 outputs |
+| F16 | 30.5 GB/s | 233.6 GB/s | 150 GB/s | 1536 outputs |
+
+The threshold stays at 1024: it is the smallest single width that does not
+regress Q8_0 or F16, where the vectorized GEMV is still ahead at that width, and
+no output projection sits between 512 and 1536 outputs. See
+[kernels.md](kernels.md#65-streaming-lm-head) for the rule these cells encode.
+
 The hot-matrix sweep and the real decode step do not measure the same thing,
 because a single resident matrix can stay in the 32 MB MALL cache while a token
 rotates through 2.7 GB of weights. Per-layer comparison, same run, sweep value
@@ -556,13 +582,16 @@ extra work; see the attribution in roadmap3.
 | pp512 | 2346.17 ± 80.87 | 1634.8 (F16 KV) | 0.70 |
 | pp2048 | 2409.70 ± 5.39 | 1641.5 (F16 KV) | 0.68 |
 | pp8192 | 2170.79 ± 4.19 | 1438.2 (F16 KV) | 0.66 |
-| tg128 (prompt 128) | 62.29 ± 0.19 | 9.61 (F32 KV) | 0.15 |
+| tg128 (prompt 128) | 62.29 ± 0.19 | 10.51 (F32 KV) | 0.17 |
 
 The remaining gaps, in order of size:
 
-1. Decode, 6.5x: llama.cpp streams the 2.74 GB of quantized weights at about
+1. Decode, 5.9x: llama.cpp streams the 2.726 GB of quantized weights at about
    170 GB/s, near the practical memory roofline; yuuka's single-request GEMV
-   path reaches roughly 26 GB/s, and its decode step is dominated by that pass.
+   path reaches roughly 28.6 GB/s, and its decode step is dominated by that
+   pass. The output projection no longer contributes: it moved to the streaming
+   kernel at 187 GB/s ([decode matvec](#decode-matvec)), which is what took the
+   ratio from 0.15 to 0.17.
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
    runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see

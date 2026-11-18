@@ -82,6 +82,11 @@ type Options struct {
 	// the FP16 MMA kernel would be selected. It exists so a differential test
 	// can compare the two kernels on identical plan inputs.
 	ForceTiledAttention bool
+	// ForceGemvTail keeps the per-row GEMV for the decode output projection
+	// where SelectLMHeadPath selects the streaming LM head kernel. It exists
+	// so a differential test can compare the two tails on identical plan
+	// inputs; production sessions leave it false.
+	ForceGemvTail bool
 }
 
 const (
@@ -118,6 +123,7 @@ type Model struct {
 	attentionBlasCapable bool
 	attentionBlasEnabled bool
 	forceTiledAttention  bool
+	forceGemvTail        bool
 	prefillRows          int
 	prefillGen           int64
 	prefillAll           []*hip.Buffer
@@ -168,6 +174,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		attentionBlasCapable: useBlasAttention,
 		attentionBlasEnabled: useBlasAttention,
 		forceTiledAttention:  opts.ForceTiledAttention,
+		forceGemvTail:        opts.ForceGemvTail,
 		device:               device,
 		stream:               stream,
 		event:                event,

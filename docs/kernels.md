@@ -494,8 +494,8 @@ per-workstream status are in [roadmap2.md](roadmap2.md).
 
 ### 6.5 Streaming LM head
 
-`lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the prefill tail
-projection:
+`lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
+projection of both graphs: the prefill tail and the decode tail:
 
 ```text
 out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16
@@ -551,6 +551,11 @@ kernel ([roadmap3.md](roadmap3.md#7-stage-s4-prefill-lm-head)). The kernel is
 bandwidth bound: the same 521 MB Q6_K matrix streams at 244 GB/s in a pure read
 loop on this device, so 2.90 ms is about 85% of that ceiling.
 
+The decode tail runs the same single-row instantiation. In the profiled decode
+step of `TestGPUProfileDecode` it costs 2.79 ms at 187 GB/s against 11.23 ms at
+46 GB/s for the per-row GEMV, which is 8.4 ms of a 97.4 ms step
+([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)).
+
 Numerics. The per-element products are the same FP32 products the decode GEMV
 forms, including the K-quant scale-then-minimum order; only the summation order
 differs, because a lane accumulates four neighbours and the last five additions
@@ -562,9 +567,26 @@ model-level gates are unchanged (`TestGPUMatchesCPU` 0.00309944,
 `TestGPUChunkedPrefillLongContext` top-1 `33075` with zero difference).
 
 A shape the kernel does not cover keeps the per-row GEMV tail; nothing silently
-changes numerically. The measured crossover is `N = 1024` at `n_in = 2560`,
-where Q8_0 is level with the GEMV and every other dtype is ahead; below that the
-staging of the activation tile costs more than it saves.
+changes numerically. `backend/hip.SelectLMHeadPath` is the one rule both tails
+use: dtype in the GEMV family, `n_in` a multiple of 256, `n_out` at or above
+`lmHeadMinOutputs`, and 1-16 rows.
+
+The crossover was re-measured at the decode width (`n_in = 2560`, one row) with
+`build/yuuka_gemv_decode_sweep --threshold`, five warmups and twenty-five timed
+submissions per cell. The streaming kernel wins from 512 outputs upward for
+Q4_K, Q5_K, and Q6_K, and from 1536 upward for Q8_0 and F16, where the per-row
+GEMV's vectorized path is still ahead at 1024 (0.022 ms against 0.035 ms). The
+threshold stays at 1024 because one number covers every dtype without
+regressing Q8_0, which is level there, and because no model shape sits in the
+512-1536 range: an output projection is vocabulary sized. The table is in
+[benchmarks.md](benchmarks.md#decode-matvec).
+
+Numerics of the decode route. The per-row GEMV sums a strided set of K values
+per thread and reduces over the block; the streaming kernel sums four
+neighbours per lane and reduces across the wave. Both accumulate in FP32, and
+`TestGPUStreamingTailMatchesGemv` measures the difference on the real model:
+4.8e-06 maximum absolute logit difference over eight greedy decode steps, with
+identical tokens.
 
 ## 7. Attention
 
@@ -923,8 +945,9 @@ per plan, not per tensor per token.
 Dispatch is recorded in one explicit Go selector:
 `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
 rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
-Single-token decode submits one GEMV per matrix; there is no separate runtime
-GEMV batch selector.
+Single-token decode submits one GEMV per matrix, except the output projection,
+which `SelectLMHeadPath` sends to the streaming kernel for the same reason the
+prefill tail does; there is no separate runtime GEMV batch selector.
 
 Each plan addition validates the dtype, quantization row layout, shape
 constraints, and buffer ranges. Unsupported combinations fail during planning;

@@ -394,9 +394,12 @@ against the recorded attribution of
 [roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18): the plan must hold
 the recorded 579 operations, the profiled total must stay inside a wide band
 around the recorded 97.605 ms, and the GEMV share must stay within five points
-of 89.7%. The bands are wide because device clocks are not pinned; the operation
-count is exact because it is structural, and a change that moves the attribution
-has to re-record the document rather than pass silently. Event instrumentation
+of 89.7%. The bands are wide because device clocks are not pinned and because a
+landed stage moves the total by design: roadmap4 D1 took it from 97.4 ms to
+89.0 ms and the gate still holds. The operation count is exact because it is
+structural, so a plan change is always visible. A change that moves the
+attribution *outside* the bands has to re-record the document rather than pass
+silently. Event instrumentation
 adds a submission gap per operation, so the totals exceed a release run and are
 a diagnosis, not a benchmark result.
 

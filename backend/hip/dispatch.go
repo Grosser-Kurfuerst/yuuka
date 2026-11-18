@@ -97,12 +97,12 @@ func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 }
 
 // SelectLMHeadPath reports whether the streaming LM head kernel is selected for
-// a prefill output projection. The kernel serves 1..16 rows and streams every
-// packed weight row once, which is what makes the prefill tail bandwidth bound
+// an output projection. The kernel serves 1..16 rows and streams every packed
+// weight row once, which is what makes both output tails bandwidth bound
 // instead of latency bound; it is measured against the per-row GEMV in
-// docs/benchmarks.md. The rule is deliberately narrow: the decode path keeps
-// AddGemv, and a shape the kernel does not cover keeps the existing per-row
-// GEMV tail.
+// docs/benchmarks.md. The prefill tail and the decode tail both use this rule,
+// and any shape it does not cover keeps the per-row GEMV, which stays the
+// documented fallback rather than a silent substitution.
 func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 	if rows <= 0 || rows > MaxLMHeadRows {
 		return false
@@ -120,10 +120,12 @@ func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 }
 
 // lmHeadMinOutputs is the measured crossover below which the per-row GEMV is
-// still the better route. At 2560 input values the streaming kernel is level
-// with the GEMV at 1024 Q8_0 outputs and ahead at every larger width for every
-// dtype, so the rule starts there. The sweep behind it is the LMHEAD section of
-// build/yuuka_prefill_sweep; see docs/benchmarks.md.
+// still the better route. At 2560 input values the streaming kernel wins from
+// 512 outputs upward for Q4_K, Q5_K, and Q6_K and from 1536 upward for Q8_0 and
+// F16, where the vectorized GEMV is still ahead at 1024; 1024 is the smallest
+// width that covers every dtype without regressing one, and no output
+// projection sits between 512 and 1536. Sweeps: build/yuuka_prefill_sweep
+// (LMHEAD cells) and build/yuuka_gemv_decode_sweep --threshold.
 const lmHeadMinOutputs = 1024
 
 // PrefillAttentionMMA reports whether the FP16 MMA paged prefill attention

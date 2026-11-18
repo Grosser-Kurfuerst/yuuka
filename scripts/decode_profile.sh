@@ -8,11 +8,13 @@
 #    the per-shape GB/s table of docs/roadmap4.md section 2.4 with the per-weight
 #    instruction counts. The sweep keeps every matrix resident, so its numbers
 #    are the hot-matrix upper bound.
-# 2. run TestGPUProfileDecode, which attributes one real decode step per planned
+# 2. run the rows = 1 output-projection crossover sweep, the measurement behind
+#    lmHeadMinOutputs (roadmap4 section 4.2).
+# 3. run TestGPUProfileDecode, which attributes one real decode step per planned
 #    operation and per tensor (section 2.3).
 #
-# Both halves are diagnostics, not release measurements; see docs/testing.md
-# section 6.3.
+# Every step here is a diagnostic, not a release measurement; see
+# docs/testing.md section 6.3.
 #
 # Requirements: a built build/libyuuka_hip.so and build/yuuka_gemv_decode_sweep
 # (cmake --build build), plus rocminfo, rocprofv3, and python3 with sqlite3.
@@ -226,6 +228,12 @@ if ((waves_only == 1)); then
     reducer_args+=(--waves-only)
 fi
 python3 "$reducer" "${reducer_args[@]}" || die "reduction failed"
+
+echo
+echo "== output projection crossover, rows = 1 (lmHeadMinOutputs)"
+if ! "$sweep" --threshold; then
+    die "$sweep --threshold failed"
+fi
 
 echo
 if ((run_engine == 1)); then

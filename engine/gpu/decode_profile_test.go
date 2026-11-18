@@ -13,9 +13,11 @@ import (
 )
 
 // The recorded 2026-11-18 decode attribution of docs/roadmap4.md section 2.3,
-// measured on one gfx1151 device with Qwen3.5-4B-Q4_K_M. The gates below compare
-// against it, so a change that moves the attribution has to re-record the
-// document rather than pass silently.
+// measured on one gfx1151 device with Qwen3.5-4B-Q4_K_M before the decode
+// roadmap started. The gates below compare against it. A landed stage moves the
+// numbers by design (D1 took the step from 97.4 ms to 89.0 ms), so the band is
+// wide; the operation count is exact, and a change that moves the attribution
+// outside the band has to re-record the document rather than pass silently.
 const (
 	decodeBaselineOps     = 579
 	decodeBaselineTotalMS = 97.605

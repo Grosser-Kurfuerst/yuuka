@@ -49,16 +49,17 @@ document in the same change.
 | Stage | Status | Gate |
 | --- | --- | --- |
 | D0: reproducible decode attribution tooling | **Done** (2026-11-18) | One command reproduces 2.3 and 2.4 within noise |
-| D1: decode output projection on the streaming kernel | Not started | Decode p50 13.21 s -> 12.2 s or less; tokens unchanged |
+| D1: decode output projection on the streaming kernel | **Done** (2026-11-18) | Decode p50 13.21 s -> 12.2 s or less; tokens unchanged |
 | D2: channel-parallel decode GEMV | Not started | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
 | D3: Q8_1 activations with `dp4a` | Not started | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
 | D4: gated delta-net per-token kernel | Not started | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
 | D5: launch gaps and operator fusion | Not started | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
 
 D0 is implemented; its record is 3.4 and its measurements are in
-[benchmarks.md](benchmarks.md#decode-matvec). D1-D5 are not started. The
-measurements in section 2 describe the tree at commit `bfd36c0` and are the
-baseline each gate is compared against.
+[benchmarks.md](benchmarks.md#decode-matvec). D1 is implemented and meets its
+gate; its record is 4.5. D2-D5 are not started. The measurements in section 2
+describe the tree at commit `bfd36c0` and are the baseline each gate is compared
+against; each stage record states what that stage moved.
 
 ## 2. Baseline attribution (2026-11-18)
 
@@ -227,7 +228,9 @@ Two secondary routes:
    streaming kernel exists: `engine/gpu/plan.go:149` calls `AddGemv`, while the
    prefill tail uses `AddLMHeadAt` behind `hip.SelectLMHeadPath`
    (`backend/hip/dispatch.go:106`, threshold `lmHeadMinOutputs = 1024`). The
-   tied 248,320-row matrix is therefore 11.24 ms instead of 2.9 ms.
+   tied 248,320-row matrix is therefore 11.24 ms instead of 2.9 ms. D1 fixed
+   this; the baseline description stays because it is what the gain is measured
+   against (4.5).
 7. **`gdn_f32_kernel`** (`kernels/hip/ssm/ssm.hip:26-78`) launches one
    128-thread block per head and traverses the 128x128 FP32 recurrent state
    five times per token (decay, `S^T k`, update, `S^T q`, plus the write-back).
@@ -272,7 +275,9 @@ Per decode step on this model and device:
 
 A step at 13 ms of weight traffic plus 2 ms of state traffic plus 2.5 ms of
 overheads is about 19 ms, which is the reference's 16 ms plus its larger
-non-matvec work. Every stage below is aimed at one row of this table.
+non-matvec work. Every stage below is aimed at one row of this table. The
+"Current" column is the state at `bfd36c0`; D1 moved the output-projection row
+to 2.79 ms (4.5) and left the rest untouched.
 
 ## 3. Stage D0: reproducible decode attribution tooling
 
@@ -449,6 +454,65 @@ and after the change.
 - Prefill rows unchanged (the prefill tail already uses this kernel).
 - Isolated measurement of the matrix at 180 GB/s or more, recorded in
   [benchmarks.md](benchmarks.md).
+
+### 4.5 Implementation (2026-11-18)
+
+`buildDecodePlan` now applies the prefill tail's rule to the output projection:
+`hip.SelectLMHeadPath(output.dtype, 1, hidden, vocab)` selects `AddLMHeadAt` and
+anything else keeps `AddGemv`. The plan shape does not change, so the decode
+step still submits 579 operations; only the tail's kernel changes.
+`Options.ForceGemvTail` keeps the per-row route available so a differential test
+can compare the two on identical plan inputs, the same way
+`ForceTiledAttention` does for prefill attention.
+
+Threshold re-derivation. `build/yuuka_gemv_decode_sweep --threshold` measures
+the rows = 1 crossover at the decode width, and `scripts/decode_profile.sh` runs
+it as part of the decode attribution. Measured over two runs, the streaming
+kernel wins from 512 outputs upward for Q4_K, Q5_K, and Q6_K and from 1536
+upward for Q8_0 and F16, where the vectorized per-row GEMV is still ahead at
+1024 (116.8 GB/s against 115.2 GB/s for Q8_0, 233.6 against 149.6 for F16).
+`lmHeadMinOutputs` therefore stays at 1024: it is the smallest single width that
+does not regress a dtype, and no output projection sits between 512 and 1536
+outputs. The table is in [benchmarks.md](benchmarks.md#decode-matvec).
+
+Numerics. `TestGPUStreamingTailMatchesGemv` runs the real model twice, once per
+tail, and compares the logits of eight greedy decode steps:
+4.77e-06 maximum absolute difference with identical tokens, against a 0.02
+gate that is two orders of magnitude wider than the measured value. Its first
+assertion is that the two plans really do run different kernels (it reads the
+last operation of each decode plan through the D0 shadow), so the comparison
+cannot pass vacuously. The prefill tail is unchanged, and `TestGPUMatchesCPU`
+keeps its 0.00309944 first-step bound.
+
+Measured, same session, `yuuka bench --chunk-size 512 --prompt-tokens 128
+--decode-tokens 128 --warmup 2 --reps 3`:
+
+| Quantity | Before | After | Gate |
+| --- | ---: | ---: | ---: |
+| Decode p50, 128 tokens | 13.241 s | 12.079 s | 12.2 s or less |
+| Decode tokens/s | 9.59 | 10.51 | 10.5 or more |
+| Decode p50, 256 tokens | 26.854 s | 24.531 s | - |
+| Profiled step (579 ops) | 97.421 ms | 89.350 ms | - |
+| Output projection | 11.231 ms (46.4 GB/s) | 2.806 ms (185.9 GB/s) | 180 GB/s or more |
+| Matmul family | 87.599 ms (89.9%) | 79.197 ms (88.6%) | - |
+| Prefill p50, 128 tokens | 0.085 s | 0.087 s | unchanged |
+| Prefill p50, 256 tokens | 0.088 s | 0.088 s | unchanged |
+
+The gate is met. Both columns were measured with the same flags in the same
+session, the "before" one from a build of the three changed files reverted. The
+tail accounts for 8.43 ms of the 9.15 ms per-token gain measured end to end
+(9.11 ms at 256 tokens), and 10.51 tokens/s is +9.6% against 9.59. The remaining
+0.7 ms is not attributed by these runs: the instrumented step moved by 8.07 ms
+between the same two builds, so the two methods disagree on the residue by more
+than the residue itself.
+
+Two follow-ups this stage does not take, both deferred to D2:
+
+- The per-row GEMV is still the fastest route below 1024 outputs and for the
+  `ssm_beta`/`ssm_alpha` projections, which are 32 outputs wide; D2 folds those
+  narrow projections into one submission.
+- The 88.9% matmul share is unchanged, so the remaining gap in section 2.6 is
+  still the per-row GEMV family, not this tail. D2 addresses it.
 
 ## 5. Stage D2: channel-parallel decode GEMV
 
@@ -636,18 +700,21 @@ The stage gates are individually necessary; the plan is done when the whole
 matrix holds on the reference device, measured under
 [testing.md](testing.md)'s protocol with the metadata of 2.1:
 
-| Test | Current | After D1 | After D2 | After D3 | After D4 | After D5 | llama.cpp |
+| Test | Current | After D1 (measured) | After D2 | After D3 | After D4 | After D5 | llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128, 128 prompt | 9.61 | 10.5 | 28 | 31 | 37 | 45 | 62.39 |
-| Step time | 104.1 ms | 95.6 ms | 35 ms | 31 ms | 26 ms | 19 ms | 16.03 ms |
-| Matvec bandwidth | 31 GB/s | 34 | 150 | 185 | 185 | 190 | about 170 |
-| pp128 | 1359.9 | unchanged | unchanged | unchanged | unchanged | unchanged | 1766.6 |
+| tg128, 128 prompt | 9.61 | **10.51** | 28 | 31 | 37 | 45 | 62.39 |
+| Step time, release | 104.1 ms | **95.1 ms** | 35 ms | 31 ms | 26 ms | 19 ms | 16.03 ms |
+| Step time, profiled | 97.6 ms | **89.0 ms** | - | - | - | - | - |
+| Decode p50, 128 tokens | 13.21 s | **12.08 s** | - | - | - | - | 2.05 s |
+| Matvec bandwidth | 31 GB/s | **34.5** | 150 | 185 | 185 | 190 | about 170 |
+| Prefill pp128 tok/s | 1359.9 | **1465** | unchanged | unchanged | unchanged | unchanged | 1766.6 |
 
-The stage columns are arithmetic from the traffic floors of 2.8 and the gates of
-sections 4 to 8, not measurements; every cell must be replaced by a measured
-value before this document claims it. The reference column is measured. The
-tg128 column carries the gate value, which is deliberately below the projection:
-section 8.3 projects 52 tok/s from a 19 ms step and gates at 45.
+The After-D1 column is measured (4.5); the D2-D5 columns are arithmetic from the
+traffic floors of 2.8 and the gates of sections 5 to 8, not measurements, and
+every cell must be replaced by a measured value before this document claims it.
+The tg128 columns after D1 carry the gate value, which is deliberately below the
+projection: section 8.3 projects 52 tok/s from a 19 ms step and gates at 45. The
+reference column is measured.
 
 Additional acceptance:
 

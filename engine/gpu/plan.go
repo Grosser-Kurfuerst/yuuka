@@ -146,6 +146,20 @@ func (m *Model) buildDecodePlan(s *Session, trace bool) (*hip.Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The output projection is the widest matrix in the model and a single row
+	// is the shape the streaming LM head kernel serves, so the tail takes the
+	// same rule as the prefill tail: one streaming pass over the matrix at
+	// 187 GB/s instead of a latency-bound per-row GEMV at 46 GB/s
+	// (docs/benchmarks.md). A shape the rule does not cover keeps that GEMV,
+	// which stays the documented fallback.
+	if !m.forceGemvTail && hip.SelectLMHeadPath(output.dtype, 1,
+		int64(cfg.HiddenSize), int64(cfg.VocabSize)) {
+		if err := plan.AddLMHeadAt(output.buf, 0, m.act.norm, 0, m.act.logits, 0,
+			int64(cfg.HiddenSize), int64(cfg.VocabSize), 1, output.dtype); err != nil {
+			return nil, err
+		}
+		return plan, nil
+	}
 	if err := plan.AddGemv(output.buf, m.act.norm, m.act.logits,
 		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype); err != nil {
 		return nil, err

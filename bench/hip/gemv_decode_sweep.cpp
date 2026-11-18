@@ -5,10 +5,15 @@
 // streaming LM head kernel, and it is the native target for scripts/
 // decode_profile.sh because rocprofv3 cannot collect from a Go process.
 //
-// Cells run in a fixed order: every shape is submitted kSubmissions times in
-// each of the three forms, one dispatch per submission, so the dispatch order
+// Cells run in a fixed order: every shape is submitted kSubmissionsPerCell times
+// in each of the three forms, one dispatch per submission, so the dispatch order
 // of a kernel trace lines up with the printed rows. Keep this in sync with
 // kSubmissionsPerCell in scripts/decode_profile.py.
+//
+// --threshold runs a separate two-form sweep at the decode width instead: the
+// per-row GEMV against the streaming kernel for a range of output counts, which
+// is the measurement behind the lmHeadMinOutputs crossover. It prints its own
+// schema and is not traced.
 
 #include "yuuka_hip.h"
 
@@ -225,9 +230,85 @@ double time_plan(yuuka_plan * plan, yuuka_stream * stream, yuuka_event * complet
     return samples[samples.size() / 2];
 }
 
+// Cell is one device-resident matrix with its activation and output rows.
+struct Cell {
+    yuuka_buffer * weights = nullptr;
+    yuuka_buffer * x = nullptr;
+    yuuka_buffer * out = nullptr;
+    uint64_t weight_bytes = 0;
+};
+
+// alloc_cell allocates and fills one packed matrix plus rows activation rows and
+// rows output rows. The matrix stays resident for every form measured on it.
+bool alloc_cell(yuuka_device * device, const Shape & shape, uint64_t rows,
+                std::mt19937 & rng, Cell & cell) {
+    const uint64_t bytes_per_row = row_bytes(shape.dtype, shape.n_in);
+    if (bytes_per_row == 0) return false;
+    cell.weight_bytes = bytes_per_row * uint64_t(shape.n_out);
+    std::vector<uint8_t> weights(static_cast<size_t>(cell.weight_bytes), uint8_t(0));
+    fill_weights(weights, shape.dtype, shape.n_in, shape.n_out, rng);
+    if (!check(yuuka_buffer_alloc(device, cell.weight_bytes, &cell.weights), "alloc weights") ||
+        !check(yuuka_memcpy_h2d(cell.weights, weights.data(), cell.weight_bytes),
+               "h2d weights")) {
+        return false;
+    }
+    std::vector<float> x(size_t(shape.n_in) * size_t(rows));
+    for (float & value : x) {
+        value = float(int(rng() % 200) - 100) / 100.0f;
+    }
+    const uint64_t x_bytes = uint64_t(x.size()) * sizeof(float);
+    const uint64_t out_bytes = uint64_t(shape.n_out) * rows * sizeof(float);
+    return check(yuuka_buffer_alloc(device, x_bytes, &cell.x), "alloc x") &&
+           check(yuuka_memcpy_h2d(cell.x, x.data(), x_bytes), "h2d x") &&
+           check(yuuka_buffer_alloc(device, out_bytes, &cell.out), "alloc out");
+}
+
+void free_cell(Cell & cell) {
+    if (cell.out != nullptr) yuuka_buffer_free(cell.out);
+    if (cell.x != nullptr) yuuka_buffer_free(cell.x);
+    if (cell.weights != nullptr) yuuka_buffer_free(cell.weights);
+    cell = Cell{};
+}
+
+// submit measures one plan operation on the cell and returns the median
+// submission in milliseconds.
+double submit(yuuka_device * device, yuuka_stream * stream, yuuka_event * completion,
+              const Cell & cell, const Shape & shape, uint32_t code, uint64_t rows) {
+    yuuka_plan * plan = nullptr;
+    if (!check(yuuka_plan_create(device, &plan), "plan")) {
+        return 0;
+    }
+    yuuka_op op = make_op(code, cell.weights, cell.x, cell.out, uint64_t(shape.n_in),
+                          uint64_t(shape.n_out), rows, shape.dtype);
+    if (!check(yuuka_plan_add(plan, &op), "plan add")) {
+        yuuka_plan_destroy(plan);
+        return 0;
+    }
+    const double ms = time_plan(plan, stream, completion);
+    yuuka_plan_destroy(plan);
+    return ms;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    bool threshold = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--threshold") {
+            threshold = true;
+        } else if (arg == "-h" || arg == "--help") {
+            std::printf("usage: %s [--threshold]\n"
+                        "  (no option)  the twelve decode shapes in the per-row, batched,\n"
+                        "               and streaming forms, traced by scripts/decode_profile.sh\n"
+                        "  --threshold  the rows = 1 output projection crossover per dtype\n",
+                        argv[0]);
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 2;
+        }
+    }
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
         std::fprintf(stderr, "SKIP: no HIP device: %s\n", yuuka_last_error());
@@ -238,6 +319,71 @@ int main() {
     if (!check(yuuka_stream_create(device, &stream), "stream") ||
         !check(yuuka_event_create(device, &completion), "event")) {
         return 1;
+    }
+    std::mt19937 rng(1234);
+    int status = 0;
+
+    if (threshold) {
+        // The crossover behind lmHeadMinOutputs, at the decode width of
+        // Qwen3.5-4B (n_in = 2560) and one row, over the dtypes the dispatch
+        // rule accepts. N ascends so the printed order is the decision order.
+        const uint32_t dtypes[] = {YUUKA_DTYPE_Q4_K, YUUKA_DTYPE_Q5_K,
+                                   YUUKA_DTYPE_Q6_K, YUUKA_DTYPE_Q8_0,
+                                   YUUKA_DTYPE_F16};
+        const int64_t outputs[] = {256, 512, 768, 1024, 1536, 2048};
+        std::printf("dtype,n_in,n_out,gemv_ms,gemv_GB/s,lmhead_ms,lmhead_GB/s,winner\n");
+        for (uint32_t dtype : dtypes) {
+            // The crossover is the smallest output count at which the streaming
+            // kernel wins and keeps winning, so a cell that flips back to GEMV
+            // inside the launch-dominated range does not move the threshold.
+            int64_t sustained = 0;
+            for (int64_t n_out : outputs) {
+                const Shape shape = {"threshold", 2560, n_out, dtype};
+                Cell cell;
+                if (!alloc_cell(device, shape, 1, rng, cell)) {
+                    free_cell(cell);
+                    status = 1;
+                    break;
+                }
+                const double gemv_ms = submit(device, stream, completion, cell, shape,
+                                             YUUKA_OP_GEMV, 1);
+                const double lm_ms = submit(device, stream, completion, cell, shape,
+                                           YUUKA_OP_LM_HEAD, 1);
+                free_cell(cell);
+                if (gemv_ms <= 0 || lm_ms <= 0) {
+                    status = 1;
+                    break;
+                }
+                const char * winner = lm_ms < gemv_ms ? "lm_head" : "gemv";
+                if (gemv_ms <= lm_ms) {
+                    sustained = 0;
+                } else if (sustained == 0) {
+                    sustained = n_out;
+                }
+                const double bytes = double(row_bytes(dtype, shape.n_in)) *
+                                     double(shape.n_out);
+                std::printf("%s,%lld,%lld,%.4f,%.1f,%.4f,%.1f,%s\n", dtype_name(dtype),
+                            static_cast<long long>(shape.n_in),
+                            static_cast<long long>(n_out), gemv_ms,
+                            bytes / (gemv_ms * 1e6), lm_ms, bytes / (lm_ms * 1e6),
+                            winner);
+                std::fflush(stdout);
+            }
+            if (status == 0) {
+                if (sustained == 0) {
+                    std::printf("crossover,%s,none in 256..2048 outputs\n",
+                                dtype_name(dtype));
+                } else {
+                    std::printf("crossover,%s,streaming kernel wins from %lld outputs"
+                                " upward\n", dtype_name(dtype),
+                                static_cast<long long>(sustained));
+                }
+            }
+        }
+        yuuka_event_destroy(completion);
+        yuuka_stream_destroy(stream);
+        yuuka_device_close(device);
+        return status;
     }
 
     // The decode shapes of Qwen3.5-4B-Q4_K_M, one row per tensor role. attn_v
@@ -266,55 +412,25 @@ int main() {
         {"lm_head", YUUKA_OP_LM_HEAD, 1},
     };
 
-    std::mt19937 rng(1234);
     std::printf("name,dtype,n_in,n_out,ms,GB/s,ns_per_row,form,batch\n");
     for (const Shape & shape : shapes) {
-        const uint64_t bytes_per_row = row_bytes(shape.dtype, shape.n_in);
-        if (bytes_per_row == 0) {
+        Cell cell;
+        if (row_bytes(shape.dtype, shape.n_in) == 0) {
             std::fprintf(stderr, "SKIP shape %s: unsupported dtype %u\n", shape.name,
                          shape.dtype);
             continue;
         }
-        const uint64_t weight_bytes = bytes_per_row * uint64_t(shape.n_out);
-        std::vector<uint8_t> weights(static_cast<size_t>(weight_bytes), uint8_t(0));
-        fill_weights(weights, shape.dtype, shape.n_in, shape.n_out, rng);
-        yuuka_buffer * wbuf = nullptr;
-        if (!check(yuuka_buffer_alloc(device, weight_bytes, &wbuf), "alloc weights") ||
-            !check(yuuka_memcpy_h2d(wbuf, weights.data(), weight_bytes), "h2d weights")) {
-            return 1;
+        if (!alloc_cell(device, shape, kBatchRows, rng, cell)) {
+            free_cell(cell);
+            status = 1;
+            break;
         }
-        weights.clear();
-        weights.shrink_to_fit();
-
-        std::vector<float> x(size_t(shape.n_in) * size_t(kBatchRows));
-        for (float & value : x) {
-            value = float(int(rng() % 200) - 100) / 100.0f;
-        }
-        yuuka_buffer * xbuf = nullptr;
-        yuuka_buffer * obuf = nullptr;
-        const uint64_t x_bytes = uint64_t(x.size()) * sizeof(float);
-        const uint64_t out_bytes = uint64_t(shape.n_out) * kBatchRows * sizeof(float);
-        if (!check(yuuka_buffer_alloc(device, x_bytes, &xbuf), "alloc x") ||
-            !check(yuuka_memcpy_h2d(xbuf, x.data(), x_bytes), "h2d x") ||
-            !check(yuuka_buffer_alloc(device, out_bytes, &obuf), "alloc out")) {
-            return 1;
-        }
-
         for (const Form & form : forms) {
-            yuuka_plan * plan = nullptr;
-            if (!check(yuuka_plan_create(device, &plan), "plan")) {
-                return 1;
-            }
-            yuuka_op op = make_op(form.code, wbuf, xbuf, obuf, uint64_t(shape.n_in),
-                                  uint64_t(shape.n_out), form.batch, shape.dtype);
-            if (!check(yuuka_plan_add(plan, &op), "plan add")) {
-                yuuka_plan_destroy(plan);
-                return 1;
-            }
-            const double ms = time_plan(plan, stream, completion);
-            yuuka_plan_destroy(plan);
+            const double ms = submit(device, stream, completion, cell, shape, form.code,
+                                     form.batch);
             if (ms <= 0) {
-                return 1;
+                status = 1;
+                break;
             }
             // GB/s counts the packed weights the submission must read; the
             // activation and the output are three orders of magnitude smaller
@@ -322,19 +438,19 @@ int main() {
             std::printf("%s,%s,%lld,%lld,%.4f,%.1f,%.1f,%s,%llu\n", shape.name,
                         dtype_name(shape.dtype), static_cast<long long>(shape.n_in),
                         static_cast<long long>(shape.n_out), ms,
-                        double(weight_bytes) / (ms * 1e6),
+                        double(cell.weight_bytes) / (ms * 1e6),
                         ms * 1e6 / (double(shape.n_out) * double(form.batch)),
-                        form.name,
-                        static_cast<unsigned long long>(form.batch));
+                        form.name, static_cast<unsigned long long>(form.batch));
             std::fflush(stdout);
         }
-        yuuka_buffer_free(obuf);
-        yuuka_buffer_free(xbuf);
-        yuuka_buffer_free(wbuf);
+        free_cell(cell);
+        if (status != 0) {
+            break;
+        }
     }
 
     yuuka_event_destroy(completion);
     yuuka_stream_destroy(stream);
     yuuka_device_close(device);
-    return 0;
+    return status;
 }

@@ -210,7 +210,7 @@ func TestPlanLMHeadMatchesDequant(t *testing.T) {
 	}
 }
 
-// TestSelectLMHeadPath pins the dispatch rule for the prefill tail.
+// TestSelectLMHeadPath pins the dispatch rule both output tails use.
 func TestSelectLMHeadPath(t *testing.T) {
 	cases := []struct {
 		name      string
