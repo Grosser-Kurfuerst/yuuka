@@ -8,13 +8,15 @@ scope is the dense hybrid `qwen35` HIP path. Other Qwen models, including
 MoE, need their own supported runtime and measurements.
 
 **Status.** This is a follow-up plan based on measurements at `bfd36c0`.
-The implementation steps below are pending. The existing MMQ, split-register
-recurrence, paged attention and streaming LM head are the starting point.
+See the acceptance index for the current implementation status. The existing
+MMQ, split-register recurrence, paged attention and streaming LM head are
+the starting point.
 The earlier experiments and rejected variants are recorded in the
 [previous roadmap](../roadmap3.md).
 
 ## Document index
 
+- [Progress and acceptance](acceptance/README.md) — Iteration status, validation results, and review decisions.
 - [Measurement and acceptance](measurement.md) — Reference versions, baseline timings, reproducible commands and the final comparison protocol.
 - [Quantized projections and FFN](projections-and-ffn.md) — Q4_K and Q5_K MMQ specialization, dispatch and gate/up/down fusion.
 - [Final-layer output rows](output-rows.md) — Plan-tail placement, final-query positions, residual offsets and state-equivalence tests.
