@@ -1,5 +1,6 @@
 #include "yuuka_hip.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -422,6 +423,114 @@ bool run_batch_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * 
     return ok;
 }
 
+// run_stream_case checks the streaming channel-parallel matvec, which the
+// decode graph selects for every shape the dispatch rule covers (roadmap4 D2).
+// It compares one row block against the host dot product and against the
+// per-row GEMV on the same weights, so a change of summation order is the only
+// source of difference.
+bool run_stream_case(yuuka_device * device, yuuka_stream * stream,
+                     yuuka_event * event, yuuka_dtype dtype, const char * name,
+                     int64_t n_in, int64_t n_out, std::mt19937 & rng) {
+    if (n_in % 256 != 0) {
+        std::fprintf(stderr, "streaming case %s n_in=%lld is not a K step\n", name,
+                     static_cast<long long>(n_in));
+        return false;
+    }
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<size_t>(n_in));
+    for (float & value : x) value = xdist(rng);
+
+    Case tc;
+    if (!make_case(dtype, name, n_in, tc)) {
+        return false;
+    }
+    std::vector<uint8_t> weights(static_cast<size_t>(tc.row_bytes) * n_out);
+    std::vector<float> expected(n_out);
+    for (int64_t row = 0; row < n_out; ++row) {
+        uint8_t * base = weights.data() + row * tc.row_bytes;
+        fill_weights(base, tc.dtype, n_in, rng);
+        expected[row] = tc.ref(base, x.data(), n_in);
+    }
+
+    yuuka_buffer * wbuf = nullptr;
+    yuuka_buffer * xbuf = nullptr;
+    yuuka_buffer * obuf = nullptr;
+    yuuka_buffer * rbuf = nullptr;
+    bool ok = check(yuuka_buffer_alloc(device, weights.size(), &wbuf), "alloc weights") &&
+              check(yuuka_buffer_alloc(device, x.size() * 4, &xbuf), "alloc x") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &obuf), "alloc out") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &rbuf), "alloc per-row out") &&
+              check(yuuka_memcpy_h2d(wbuf, weights.data(), weights.size()), "h2d weights") &&
+              check(yuuka_memcpy_h2d(xbuf, x.data(), x.size() * 4), "h2d x");
+    if (ok) {
+        yuuka_plan * stream_plan = nullptr;
+        yuuka_plan * row_plan = nullptr;
+        ok = check(yuuka_plan_create(device, &stream_plan), "stream plan") &&
+             check(yuuka_plan_create(device, &row_plan), "row plan");
+        if (ok) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_LM_HEAD;
+            op.buf[0] = wbuf;
+            op.buf[1] = xbuf;
+            op.buf[2] = obuf;
+            op.n[0] = static_cast<uint64_t>(n_in);
+            op.n[1] = static_cast<uint64_t>(n_out);
+            op.n[2] = 1;
+            op.u[0] = static_cast<uint32_t>(tc.dtype);
+            ok = check(yuuka_plan_add(stream_plan, &op), "add streaming op");
+            yuuka_op row_op{};
+            row_op.code = YUUKA_OP_GEMV;
+            row_op.buf[0] = wbuf;
+            row_op.buf[1] = xbuf;
+            row_op.buf[2] = rbuf;
+            row_op.n[0] = static_cast<uint64_t>(n_in);
+            row_op.n[1] = static_cast<uint64_t>(n_out);
+            row_op.u[0] = static_cast<uint32_t>(tc.dtype);
+            ok = ok && check(yuuka_plan_add(row_plan, &row_op), "add per-row op");
+            ok = ok && check(yuuka_plan_execute(stream_plan, stream, 0, 0, 1, event),
+                             "execute streaming") &&
+                 check(yuuka_event_wait(event), "streaming event wait") &&
+                 check(yuuka_plan_execute(row_plan, stream, 0, 0, 1, event),
+                       "execute per-row") &&
+                 check(yuuka_event_wait(event), "per-row event wait");
+        }
+        if (stream_plan != nullptr) yuuka_plan_destroy(stream_plan);
+        if (row_plan != nullptr) yuuka_plan_destroy(row_plan);
+    }
+    std::vector<float> got(n_out);
+    std::vector<float> got_row(n_out);
+    ok = ok && check(yuuka_memcpy_d2h(got.data(), obuf, n_out * 4), "d2h") &&
+         check(yuuka_memcpy_d2h(got_row.data(), rbuf, n_out * 4), "d2h per-row");
+    float worst_ref = 0.0f;
+    float worst_row = 0.0f;
+    if (ok) {
+        for (int64_t row = 0; row < n_out; ++row) {
+            const float tolerance = 2e-3f * (1.0f + std::fabs(expected[row]));
+            const float ref_diff = std::fabs(got[row] - expected[row]);
+            const float row_diff = std::fabs(got[row] - got_row[row]);
+            worst_ref = std::max(worst_ref, ref_diff);
+            worst_row = std::max(worst_row, row_diff);
+            if (ref_diff > tolerance) {
+                std::fprintf(stderr, "%s n_in=%lld n_out=%lld row %lld: got %.6f"
+                             " expected %.6f\n", tc.name,
+                             static_cast<long long>(n_in), static_cast<long long>(n_out),
+                             static_cast<long long>(row), got[row], expected[row]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s n_in=%lld n_out=%lld streaming: %s (max |ref| %.3g,"
+                " max |per-row| %.3g)\n", tc.name,
+                static_cast<long long>(n_in), static_cast<long long>(n_out),
+                ok ? "ok" : "FAILED", worst_ref, worst_row);
+    yuuka_buffer_free(rbuf);
+    yuuka_buffer_free(obuf);
+    yuuka_buffer_free(xbuf);
+    yuuka_buffer_free(wbuf);
+    return ok;
+}
+
 int main() {
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
@@ -487,6 +596,26 @@ int main() {
     ok = ok && run_batch_case(device, stream, event, YUUKA_DTYPE_Q6_K,
                               "Q6_K large-K", 9216, 2560, 2, rng);
 
+    // The streaming family serves the whole decode matvec set, so it is checked
+    // for every dtype, at the K-step widths the model uses, at output counts
+    // that leave a partial final block, and against the per-row GEMV.
+    const int64_t stream_widths[] = {256, 512, 768, 2560};
+    const int64_t stream_outputs[] = {1, 5, 33, 129, 1024};
+    const struct { yuuka_dtype dtype; const char * name; } stream_dtypes[] = {
+        {YUUKA_DTYPE_F32, "F32"}, {YUUKA_DTYPE_F16, "F16"},
+        {YUUKA_DTYPE_Q4_0, "Q4_0"}, {YUUKA_DTYPE_Q5_0, "Q5_0"},
+        {YUUKA_DTYPE_Q8_0, "Q8_0"}, {YUUKA_DTYPE_Q4_K, "Q4_K"},
+        {YUUKA_DTYPE_Q5_K, "Q5_K"}, {YUUKA_DTYPE_Q6_K, "Q6_K"},
+    };
+    for (const auto & item : stream_dtypes) {
+        for (int64_t width : stream_widths) {
+            for (int64_t outputs : stream_outputs) {
+                ok = ok && run_stream_case(device, stream, event, item.dtype,
+                                           item.name, width, outputs, rng);
+            }
+        }
+    }
+
     yuuka_buffer * dummy = nullptr;
     if (ok && check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {
         const struct { yuuka_dtype dtype; uint64_t width; } invalid[] = {
@@ -506,6 +635,27 @@ int main() {
                        YUUKA_DTYPE_Q8_0, nullptr) != YUUKA_ERR_INVALID_ARGUMENT) {
             std::fprintf(stderr, "overflowing output width was not rejected\n");
             ok = false;
+        }
+        // A width that is not a K step cannot be served by the streaming family;
+        // the plan must reject it so dispatch falls back to the per-row GEMV.
+        for (uint64_t width : {32ull, 288ull, 544ull}) {
+            yuuka_plan * plan = nullptr;
+            if (!check(yuuka_plan_create(device, &plan), "plan create")) break;
+            yuuka_op op{};
+            op.code = YUUKA_OP_LM_HEAD;
+            op.buf[0] = dummy;
+            op.buf[1] = dummy;
+            op.buf[2] = dummy;
+            op.n[0] = width;
+            op.n[1] = 4;
+            op.n[2] = 1;
+            op.u[0] = YUUKA_DTYPE_Q8_0;
+            if (yuuka_plan_add(plan, &op) == YUUKA_OK) {
+                std::fprintf(stderr, "streaming width %llu that is not a K step was"
+                             " accepted\n", static_cast<unsigned long long>(width));
+                ok = false;
+            }
+            yuuka_plan_destroy(plan);
         }
 
         // Plan construction must reject unsupported dtype/shape combinations

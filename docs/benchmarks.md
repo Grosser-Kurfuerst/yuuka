@@ -130,23 +130,25 @@ F32 KV, median of three repetitions:
 
 | Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 320 | 0.087 s | 0.087 s | 12.079 s | 10.51 |
-| 256 | 448 | 0.088 s | 0.088 s | 24.531 s | 10.39 |
+| 128 | 320 | 0.086 s | 0.086 s | 4.245 s | 29.92 |
+| 256 | 448 | 0.085 s | 0.085 s | 8.807 s | 28.95 |
 
 Decode is weight-bandwidth bound and essentially flat in output length: the two
-rows differ by about 1%. Effective weight-read bandwidth is
-$2.726\\,\\mathrm{GB} \\times 10.5\\,\\mathrm{s^{-1}} \\approx 28.6\\,\\mathrm{GB/s}$,
-roughly one sixth of what the same weights stream at in llama.cpp
-([llama.cpp comparison](#llamacpp-comparison)). The single-request GEMV path is
-the limiter, not attention ([isolated kernels](#isolated-kernels)).
+rows differ by about 3%. Effective weight-read bandwidth is
+$2.726\\,\\mathrm{GB} \\times 29.9\\,\\mathrm{s^{-1}} \\approx 81.5\\,\\mathrm{GB/s}$,
+about half of what the same weights stream at in llama.cpp
+([llama.cpp comparison](#llamacpp-comparison)). The matvec family is still the
+limiter, not attention ([isolated kernels](#isolated-kernels)).
 
-The table was re-measured when the decode output projection moved to the
-streaming LM head kernel ([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)).
-The same rows before that change, same flags in the same session, were 13.241 s
-and 9.59 tokens/s, and the
-per-operation attribution dropped from 97.6 ms to 89.0 ms per step with the tail
-going from 11.23 ms at 46 GB/s to 2.81 ms at 186 GB/s. Prefill is unaffected:
-0.087 s and 0.088 s against 0.085 s and 0.088 s before the change.
+The table was re-measured twice: when the decode output projection moved to the
+streaming LM head kernel
+([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)) and when the rest of
+the decode matvec family followed it
+([roadmap4.md](roadmap4.md#55-implementation-2026-11-18)). Same flags, same
+session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s. The profiled
+step went 97.4, 89.4, 31.6 ms with the matvec family at 87.6, 79.2, 21.6 ms, so
+the matvec share fell from 90% to 68% and the gated delta-net became the second
+largest term at 24%. Prefill is unaffected across all three: 0.085-0.088 s.
 
 ## Speculative decoding
 
@@ -582,16 +584,17 @@ extra work; see the attribution in roadmap3.
 | pp512 | 2346.17 ± 80.87 | 1634.8 (F16 KV) | 0.70 |
 | pp2048 | 2409.70 ± 5.39 | 1641.5 (F16 KV) | 0.68 |
 | pp8192 | 2170.79 ± 4.19 | 1438.2 (F16 KV) | 0.66 |
-| tg128 (prompt 128) | 62.29 ± 0.19 | 10.51 (F32 KV) | 0.17 |
+| tg128 (prompt 128) | 62.29 ± 0.19 | 29.92 (F32 KV) | 0.48 |
 
 The remaining gaps, in order of size:
 
-1. Decode, 5.9x: llama.cpp streams the 2.726 GB of quantized weights at about
-   170 GB/s, near the practical memory roofline; yuuka's single-request GEMV
-   path reaches roughly 28.6 GB/s, and its decode step is dominated by that
-   pass. The output projection no longer contributes: it moved to the streaming
-   kernel at 187 GB/s ([decode matvec](#decode-matvec)), which is what took the
-   ratio from 0.15 to 0.17.
+1. Decode, 2.1x: llama.cpp streams the 2.726 GB of quantized weights at about
+   170 GB/s, near the practical memory roofline; yuuka now streams the same
+   weights at 126.5 GB/s inside a step (81.5 GB/s effective per token) after
+   moving the whole matvec family to the channel-parallel kernel
+   ([decode matvec](#decode-matvec)). What remains is 68% matvec at 127 GB/s
+   against a 244 GB/s read ceiling, plus 7.7 ms of gated delta-net and 2.7 ms of
+   other operations and submission gaps in a 31.6 ms step.
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
    runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see

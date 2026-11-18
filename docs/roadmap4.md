@@ -50,16 +50,18 @@ document in the same change.
 | --- | --- | --- |
 | D0: reproducible decode attribution tooling | **Done** (2026-11-18) | One command reproduces 2.3 and 2.4 within noise |
 | D1: decode output projection on the streaming kernel | **Done** (2026-11-18) | Decode p50 13.21 s -> 12.2 s or less; tokens unchanged |
-| D2: channel-parallel decode GEMV | Not started | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
+| D2: channel-parallel decode GEMV | **Done** (2026-11-18); isolated-width gate partly met, see 5.5 | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
 | D3: Q8_1 activations with `dp4a` | Not started | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
 | D4: gated delta-net per-token kernel | Not started | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
 | D5: launch gaps and operator fusion | Not started | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
 
 D0 is implemented; its record is 3.4 and its measurements are in
 [benchmarks.md](benchmarks.md#decode-matvec). D1 is implemented and meets its
-gate; its record is 4.5. D2-D5 are not started. The measurements in section 2
-describe the tree at commit `bfd36c0` and are the baseline each gate is compared
-against; each stage record states what that stage moved.
+gate; its record is 4.5. D2 is implemented and meets the throughput gate, with
+the isolated-width gate met on nine of twelve shapes; its record is 5.5. D3-D5
+are not started. The measurements in section 2 describe the tree at commit
+`bfd36c0` and are the baseline each gate is compared against; each stage record
+states what that stage moved.
 
 ## 2. Baseline attribution (2026-11-18)
 
@@ -277,7 +279,8 @@ A step at 13 ms of weight traffic plus 2 ms of state traffic plus 2.5 ms of
 overheads is about 19 ms, which is the reference's 16 ms plus its larger
 non-matvec work. Every stage below is aimed at one row of this table. The
 "Current" column is the state at `bfd36c0`; D1 moved the output-projection row
-to 2.79 ms (4.5) and left the rest untouched.
+to 2.81 ms (4.5) and D2 moved the per-layer matvec rows to 97-187 GB/s at 21.6 ms
+of matvec time (5.5).
 
 ## 3. Stage D0: reproducible decode attribution tooling
 
@@ -561,6 +564,81 @@ single change that closes most of the 6.5x gap: the same mapping that
 - `tests/hip/gemv_test.cpp` covers the new family against the per-row GEMV and
   the host dot product for every covered dtype at aligned and unaligned widths.
 
+### 5.5 Implementation (2026-11-18)
+
+The streaming kernel of [kernels.md](kernels.md#65-streaming-lm-head) already
+implements the mapping this stage describes, for every dtype the decode dispatch
+selects (F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K) and every `n_in` that is
+a multiple of 256. Rather than clone it, the decode graph now routes through it:
+
+- `backend/hip.SelectDecodeGemvPath` is the decode matvec rule. It shares the
+  output projection's predicate, so one measured crossover governs both and the
+  two cannot drift apart.
+- `Model.decodeMatmul` in `engine/gpu/plan.go` is the single call site: the
+  streaming kernel where the rule selects it, `AddGemv` otherwise. Every decode
+  matvec goes through it: q/k/v/o, qkv/gate, alpha/beta, ssm_out, ffn gate/up/
+  down, and the output projection.
+- `Options.ForceDecodeGemv` forces the whole family back to the per-row GEMV for
+  the differential test, replacing D1's `ForceGemvTail` (which only covered the
+  output projection).
+
+Plan shape. The step still submits 579 operations, but 201 of them are now the
+streaming kernel and 48 remain per-row: the 32-output `ssm_alpha` and `ssm_beta`
+projections, where the streaming kernel runs a single block and measures
+3.5 GB/s against 8.9. `gemv_test.cpp` covers the streaming family for all eight
+dtypes at K-step widths 256, 512, 768, and 2560 with 1, 5, 33, 129, and 1024
+outputs, against both the host dot product (2e-3 relative) and the per-row GEMV
+(maximum 2.4e-4 absolute).
+
+Numerics. The arithmetic per weight is `decode_span4` in both families, so only
+the summation order differs. `TestGPUStreamingDecodeMatchesGemv` compares the two
+whole plans on the real model over eight greedy decode steps: 8.34e-06 maximum
+absolute logit difference with identical tokens, against a 0.02 gate. It first
+asserts, through the D0 plan shadow, that the default plan streams 201 matvecs,
+that the forced plan streams none, and that every matvec in the default plan
+follows the rule.
+
+Measured, same session, `yuuka bench --chunk-size 512 --prompt-tokens 128
+--warmup 2 --reps 3`:
+
+| Quantity | After D1 | After D2 | Gate |
+| --- | ---: | ---: | ---: |
+| Decode p50, 128 tokens | 12.079 s | **4.245 s** | - |
+| Decode tokens/s | 10.51 | **29.92** | 28 or more |
+| Decode p50, 256 tokens | 24.531 s | **8.807 s** | - |
+| Profiled step (579 ops) | 89.350 ms | **31.600 ms** | - |
+| Matmul family | 79.197 ms (88.6%) | **21.558 ms (68.2%)** | - |
+| Matmul bandwidth, in step | 34.4 GB/s | **126.5 GB/s** | - |
+| Gated delta-net | 7.506 ms (8.4%) | 7.656 ms (24.2%) | - |
+| Prefill p50, 128 tokens | 0.087 s | 0.086 s | unchanged |
+
+That is 3.1x over D1 and 3.1x over the 9.61 tokens/s of the D0 baseline, so the
+28 tok/s gate is met with the step at 33.4 ms against a 35 ms projection.
+
+Gate 1 is partly met. By traced kernel time, which is the right measure for a
+kernel, nine of the twelve isolated shapes of 2.4 reach 150 GB/s or more:
+`ffn_gate` 287, `ffn_up` 287, `attn_q` 258, `attn_gate` 255, `ffn_down` Q6_K
+256, `attn_qkv` 249, `lm_head` 184, `ssm_out` 203, `attn_output` 203,
+`ffn_down` Q4_K 193. The three misses are the 1024-output attention cells:
+`attn_k` 90.4, `attn_v` Q4_K 90.7, `attn_v` Q6_K 136.7. Those cells submit a
+32-block grid on a 40-compute-unit device and walk a serial 10-step K chain per
+block, so they cannot saturate DRAM at 1.4-2.0 MB of weights; measured, one such
+submission costs 16 microseconds of a 33.4 ms step, 0.26 ms per step over the
+sixteen of them. Filling that in needs split-K or fewer channels per block, which
+buys at most 0.1 ms here and changes the kernel D3 is about to rewrite, so it is
+left open rather than taken.
+
+Deferred, with the measurement:
+
+- The narrow projections stay two launches per layer. Merging them is D5's
+  explicit item; measured here, 48 submissions cost 0.44 ms of the step
+  (0.198 + 0.243 ms), so the merge is worth at most 0.3 ms.
+- The gated delta-net is now 24.2% of the step: D4 is the next lever.
+- The in-step matmul bandwidth is 126.5 GB/s against 184-287 isolated. The
+  difference is the cold-weight effect D0 recorded, plus the per-K-step barrier
+  pair that the streaming kernel still pays. D3 replaces the inner loop with
+  int8 `dp4a` and revisits the staging granularity with it.
+
 ## 6. Stage D3: Q8_1 activations with `dp4a`
 
 ### 6.1 Problem
@@ -700,21 +778,22 @@ The stage gates are individually necessary; the plan is done when the whole
 matrix holds on the reference device, measured under
 [testing.md](testing.md)'s protocol with the metadata of 2.1:
 
-| Test | Current | After D1 (measured) | After D2 | After D3 | After D4 | After D5 | llama.cpp |
+| Test | Current | After D1 (measured) | After D2 (measured) | After D3 | After D4 | After D5 | llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128, 128 prompt | 9.61 | **10.51** | 28 | 31 | 37 | 45 | 62.39 |
-| Step time, release | 104.1 ms | **95.1 ms** | 35 ms | 31 ms | 26 ms | 19 ms | 16.03 ms |
-| Step time, profiled | 97.6 ms | **89.0 ms** | - | - | - | - | - |
-| Decode p50, 128 tokens | 13.21 s | **12.08 s** | - | - | - | - | 2.05 s |
-| Matvec bandwidth | 31 GB/s | **34.5** | 150 | 185 | 185 | 190 | about 170 |
-| Prefill pp128 tok/s | 1359.9 | **1465** | unchanged | unchanged | unchanged | unchanged | 1766.6 |
+| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | 31 | 37 | 45 | 62.39 |
+| Step time, release | 104.1 ms | **95.1 ms** | **33.4 ms** | 31 ms | 26 ms | 19 ms | 16.03 ms |
+| Step time, profiled | 97.6 ms | **89.0 ms** | **31.6 ms** | - | - | - | - |
+| Decode p50, 128 tokens | 13.21 s | **12.08 s** | **4.25 s** | - | - | - | 2.05 s |
+| Matvec bandwidth, in step | 31 GB/s | **34.5** | **126.5** | 185 | 185 | 190 | about 170 |
+| Matvec bandwidth, isolated | 46 GB/s | **186** | **184-287** | 185 | 185 | 190 | about 170 |
+| Prefill pp128 tok/s | 1359.9 | **1465** | **1484** | unchanged | unchanged | unchanged | 1766.6 |
 
-The After-D1 column is measured (4.5); the D2-D5 columns are arithmetic from the
-traffic floors of 2.8 and the gates of sections 5 to 8, not measurements, and
-every cell must be replaced by a measured value before this document claims it.
-The tg128 columns after D1 carry the gate value, which is deliberately below the
-projection: section 8.3 projects 52 tok/s from a 19 ms step and gates at 45. The
-reference column is measured.
+The After-D1 and After-D2 columns are measured (4.5, 5.5); the D3-D5 columns are
+arithmetic from the traffic floors of 2.8 and the gates of sections 6 to 8, not
+measurements, and every cell must be replaced by a measured value before this
+document claims it. The tg128 columns after D2 carry the gate value, which is
+deliberately below the projection: section 8.3 projects 52 tok/s from a 19 ms
+step and gates at 45. The reference column is measured.
 
 Additional acceptance:
 

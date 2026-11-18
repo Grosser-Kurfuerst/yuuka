@@ -66,7 +66,7 @@ func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Opt
 		KVType:              opts.KVType,
 		LegacyBlasAttention: opts.LegacyBlasAttention,
 		ForceTiledAttention: opts.ForceTiledAttention,
-		ForceGemvTail:       opts.ForceGemvTail,
+		ForceDecodeGemv:     opts.ForceDecodeGemv,
 	})
 	if err != nil {
 		return nil, err

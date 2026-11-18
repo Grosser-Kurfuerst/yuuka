@@ -12,16 +12,16 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
-// The recorded 2026-11-18 decode attribution of docs/roadmap4.md section 2.3,
-// measured on one gfx1151 device with Qwen3.5-4B-Q4_K_M before the decode
-// roadmap started. The gates below compare against it. A landed stage moves the
-// numbers by design (D1 took the step from 97.4 ms to 89.0 ms), so the band is
-// wide; the operation count is exact, and a change that moves the attribution
-// outside the band has to re-record the document rather than pass silently.
+// The recorded decode attribution the gates below compare against, measured on
+// one gfx1151 device with Qwen3.5-4B-Q4_K_M. The operation count is structural
+// and exact; the timings track the current tree and are re-recorded when a
+// roadmap4 stage lands, because each stage moves them by design: 97.6 ms in the
+// D0 record, 89.4 ms after D1 (section 4.5), and the values below after D2
+// (section 5.5). The per-stage history stays in docs/roadmap4.md.
 const (
 	decodeBaselineOps     = 579
-	decodeBaselineTotalMS = 97.605
-	decodeBaselineGemvMS  = 87.556
+	decodeBaselineTotalMS = 31.600
+	decodeBaselineGemvMS  = 21.558
 )
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated

@@ -115,14 +115,12 @@ hard-coded from another GPU.
 
 | Kernel family | Main scenario | Optimization focus |
 | --- | --- | --- |
-| `gemv_q4_k` | Single-token decode | Packed reads, fused dequantization, Wave reduction |
-| `gemv_q6_k` | Decode | High-precision K-quant layout |
-| `gemv_q8_0` | Decode / baseline | Simple, stable high-bandwidth quantization |
-| `gemv_q4_0` / `gemv_q5_0` | Decode / broader GGUF coverage | Nibble and high-bit unpack, batch reuse |
+| `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
+| `gemv_q4_k` / `gemv_q6_k` / `gemv_q8_0` / `gemv_q4_0` / `gemv_q5_0` | Decode fallback, narrow projections, kernel reference | Packed reads, fused dequantization, block reduction |
 | `gemm_fp16_wmma` | Prefill baseline | Tiling, WMMA, LDS, pipelining |
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
 | `gemm_q6_k_wmma` | Quantized prefill | Scale handling, tile reuse |
-| `lm_head_stream` | Prefill tail output projection | Stream each packed weight row once, reuse it across the row block |
+
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
 | `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
 | `paged_attention` | Decode | Block table, shared KV heads, long-context split |
@@ -166,13 +164,69 @@ requirements:
 
 ### 5.3 Workgroup mapping
 
-The main design axes to benchmark:
+Two mappings exist and `backend/hip.SelectDecodeGemvPath` is the measured rule
+between them. Both compute the same per-weight products through `decode_span4`;
+they differ in how much of the machine one output row keeps busy.
 
-- one wave per output channel versus multiple output channels per workgroup;
-- vectorized loads versus narrower packed loads;
-- register reuse versus LDS staging for scales and partial sums;
-- batch sizes 1, 2, 4, 8, and 16 to find the GEMV/GEMM crossover;
-- accumulation precision and deterministic reduction order.
+**Per-row GEMV** (`gemv_*_kernel`): one 256-thread block per output row, one
+packed element per thread per K step, a block-wide tree reduction, and for
+Q4_K/Q5_K two barriers per 256-value step for the scale staging. It reads the
+activation once per output row, so a Q4_K row reads 10 KiB of activation against
+1.44 KiB of weights. Measured 25-76 GB/s on the decode shapes.
+
+**Streaming** (`lm_head_kernel`, section 6.5): one wave owns four output
+channels and walks the K axis; a lane reads 16 bytes of packed weights per step,
+the activation row is staged in shared memory once per block, accumulators stay
+in registers, and the only reduction is one wave shuffle per channel. No block
+barrier sits inside the K loop. Measured 90-287 GB/s on the same shapes at 2.1-8.6
+instructions per weight fewer, and 0.16 LDS instructions per weight against up to
+2.66.
+
+The rule, in output width at `n_in = 2560` and one row: the streaming form wins
+from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1), so the
+selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
+family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
+recurrent projections are the only decode shapes that land on the fallback.
+
+Numerics. The per-row kernel sums a strided set of K values per thread and
+reduces over the block; the streaming kernel sums four neighbours per lane and
+reduces across the wave. Both accumulate in FP32, so the difference is that
+reassociation: `TestGPUStreamingDecodeMatchesGemv` measures 8.34e-06 maximum
+absolute logit difference over eight greedy decode steps of the real model, with
+identical tokens, and `tests/hip/gemv_test.cpp` checks every dtype against the
+host dot product at 2e-3 relative and against the per-row kernel at 2.4e-4
+absolute.
+
+#### 5.3.1 Measured decode shapes
+
+One submission per plan, matrix resident, five warmups and twenty-five timed
+submissions; `kernel` is the traced kernel time from
+`scripts/decode_profile.sh`, which excludes the launch the host column includes:
+
+| Shape | dtype | per-row GB/s | streaming GB/s |
+| --- | --- | ---: | ---: |
+| `ffn_gate` 2560 -> 9216 | Q4_K | 40.5 | 286.6 |
+| `ffn_down` 9216 -> 2560 | Q6_K | 81.6 | 256.1 |
+| `ffn_down` 9216 -> 2560 | Q4_K | 43.6 | 192.6 |
+| `attn_q` 2560 -> 8192 | Q4_K | 40.6 | 258.2 |
+| `attn_qkv` 2560 -> 8192 | Q5_K | 43.1 | 248.6 |
+| `attn_gate` 2560 -> 4096 | Q4_K | 39.9 | 254.8 |
+| `attn_output` 4096 -> 2560 | Q4_K | 42.6 | 203.2 |
+| `ssm_out` 4096 -> 2560 | Q5_K | 44.2 | 203.4 |
+| `attn_k` 2560 -> 1024 | Q4_K | 30.3 | 90.4 |
+| `attn_v` 2560 -> 1024 | Q6_K | 51.4 | 136.7 |
+| `ssm_beta` 2560 -> 32 | Q8_0 | 26.9 | 5.0 |
+| `lm_head` 2560 -> 248320 | Q6_K | 46.5 | 184.2 |
+
+The three cells below 150 GB/s are the 1024-output attention projections: a
+32-block grid cannot fill a 40-compute-unit device, and one such submission costs
+16 microseconds, so the decode step spends 0.26 ms of its 33.4 ms on the sixteen
+of them. Closing that needs split-K or fewer channels per block, which is not
+taken yet (roadmap4 5.5).
+
+Inside the decode step the same kernels run at 94-187 GB/s rather than the
+isolated figures, because a token rotates through 2.7 GB of weights and every
+matrix is cold in the 32 MB MALL (roadmap4 2.4).
 
 ### 5.4 Q4_0 and Q5_0
 
@@ -495,7 +549,8 @@ per-workstream status are in [roadmap2.md](roadmap2.md).
 ### 6.5 Streaming LM head
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
-projection of both graphs: the prefill tail and the decode tail:
+projection of both graphs (the prefill tail and the decode tail) and, since
+roadmap4 D2, every decode matvec that `SelectDecodeGemvPath` covers:
 
 ```text
 out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16
@@ -945,9 +1000,10 @@ per plan, not per tensor per token.
 Dispatch is recorded in one explicit Go selector:
 `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
 rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
-Single-token decode submits one GEMV per matrix, except the output projection,
-which `SelectLMHeadPath` sends to the streaming kernel for the same reason the
-prefill tail does; there is no separate runtime GEMV batch selector.
+Single-token decode submits one matvec per matrix. `SelectDecodeGemvPath`
+chooses between the per-row GEMV and the streaming kernel per operation
+(section 5.3), and the output projection takes the same rule; there is no
+separate runtime GEMV batch selector.
 
 Each plan addition validates the dtype, quantization row layout, shape
 constraints, and buffer ranges. Unsupported combinations fail during planning;

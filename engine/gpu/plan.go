@@ -29,6 +29,21 @@ func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint
 	}
 }
 
+// decodeMatmul appends one decode matmul. The streaming channel-parallel kernel
+// serves every shape the decode graph dispatches except the 32-output recurrent
+// projections, and the per-row GEMV stays for those and for any shape the
+// streaming kernel cannot serve (docs/roadmap4.md section 5, docs/kernels.md
+// section 5.3). Both routes compute the same products; only the summation order
+// differs.
+func (m *Model) decodeMatmul(plan *hip.Plan, w weight, x, out *hip.Buffer,
+	nIn, nOut int64) error {
+	if !m.forceDecodeGemv &&
+		hip.SelectDecodeGemvPath(w.dtype, nIn, nOut) == hip.DecodeGemvStreaming {
+		return plan.AddLMHeadAt(w.buf, 0, x, 0, out, 0, nIn, nOut, 1, w.dtype)
+	}
+	return plan.AddGemv(w.buf, x, out, nIn, nOut, w.dtype)
+}
+
 // prefillProjection is one prefill matmul that reads the shared activation
 // tile at offset zero.
 type prefillProjection struct {
@@ -146,22 +161,8 @@ func (m *Model) buildDecodePlan(s *Session, trace bool) (*hip.Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The output projection is the widest matrix in the model and a single row
-	// is the shape the streaming LM head kernel serves, so the tail takes the
-	// same rule as the prefill tail: one streaming pass over the matrix at
-	// 187 GB/s instead of a latency-bound per-row GEMV at 46 GB/s
-	// (docs/benchmarks.md). A shape the rule does not cover keeps that GEMV,
-	// which stays the documented fallback.
-	if !m.forceGemvTail && hip.SelectLMHeadPath(output.dtype, 1,
-		int64(cfg.HiddenSize), int64(cfg.VocabSize)) {
-		if err := plan.AddLMHeadAt(output.buf, 0, m.act.norm, 0, m.act.logits, 0,
-			int64(cfg.HiddenSize), int64(cfg.VocabSize), 1, output.dtype); err != nil {
-			return nil, err
-		}
-		return plan, nil
-	}
-	if err := plan.AddGemv(output.buf, m.act.norm, m.act.logits,
-		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype); err != nil {
+	if err := m.decodeMatmul(plan, output, m.act.norm, m.act.logits,
+		int64(cfg.HiddenSize), int64(cfg.VocabSize)); err != nil {
 		return nil, err
 	}
 	return plan, nil
@@ -202,13 +203,13 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := plan.AddRMSNorm(m.act.x, attnNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(q.buf, m.act.norm, m.act.q, hidden, qDim, q.dtype); err != nil {
+	if err := m.decodeMatmul(plan, q, m.act.norm, m.act.q, hidden, qDim); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(k.buf, m.act.norm, m.act.k, hidden, kvDim, k.dtype); err != nil {
+	if err := m.decodeMatmul(plan, k, m.act.norm, m.act.k, hidden, kvDim); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(v.buf, m.act.norm, m.act.v, hidden, kvDim, v.dtype); err != nil {
+	if err := m.decodeMatmul(plan, v, m.act.norm, m.act.v, hidden, kvDim); err != nil {
 		return err
 	}
 	if err := plan.AddRMSNormHeadsAt(m.act.q, 0, qNorm.buf, m.act.q, 0,
@@ -236,7 +237,7 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 		m.capacity, s.capacity, m.blockSize, scale, m.kvType); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(o.buf, m.act.attn, m.act.tmp, oDim, hidden, o.dtype); err != nil {
+	if err := m.decodeMatmul(plan, o, m.act.attn, m.act.tmp, oDim, hidden); err != nil {
 		return err
 	}
 	return plan.Add(m.act.x, m.act.tmp, hidden)
@@ -290,16 +291,16 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	if err := plan.AddRMSNorm(m.act.x, attnNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(qkv.buf, m.act.norm, m.act.qkv, hidden, convDim, qkv.dtype); err != nil {
+	if err := m.decodeMatmul(plan, qkv, m.act.norm, m.act.qkv, hidden, convDim); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(gate.buf, m.act.norm, m.act.z, hidden, inner, gate.dtype); err != nil {
+	if err := m.decodeMatmul(plan, gate, m.act.norm, m.act.z, hidden, inner); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(beta.buf, m.act.norm, m.act.beta, hidden, rank, beta.dtype); err != nil {
+	if err := m.decodeMatmul(plan, beta, m.act.norm, m.act.beta, hidden, rank); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(alpha.buf, m.act.norm, m.act.alpha, hidden, rank, alpha.dtype); err != nil {
+	if err := m.decodeMatmul(plan, alpha, m.act.norm, m.act.alpha, hidden, rank); err != nil {
 		return err
 	}
 	if err := plan.AddConv1D(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv, int(convDim), cfg.SSMConvKernel); err != nil {
@@ -326,7 +327,7 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 		rank, stateSize, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(out.buf, m.act.gdnNorm, m.act.tmp, inner, hidden, out.dtype); err != nil {
+	if err := m.decodeMatmul(plan, out, m.act.gdnNorm, m.act.tmp, inner, hidden); err != nil {
 		return err
 	}
 	return plan.Add(m.act.x, m.act.tmp, hidden)
@@ -351,16 +352,16 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	if err := plan.AddRMSNorm(m.act.x, postNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(gate.buf, m.act.norm, m.act.ffnGate, hidden, ffn, gate.dtype); err != nil {
+	if err := m.decodeMatmul(plan, gate, m.act.norm, m.act.ffnGate, hidden, ffn); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(up.buf, m.act.norm, m.act.ffnUp, hidden, ffn, up.dtype); err != nil {
+	if err := m.decodeMatmul(plan, up, m.act.norm, m.act.ffnUp, hidden, ffn); err != nil {
 		return err
 	}
 	if err := plan.AddSiluMul(m.act.ffnGate, m.act.ffnUp, m.act.ffnGate, ffn); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(down.buf, m.act.ffnGate, m.act.tmp, ffn, hidden, down.dtype); err != nil {
+	if err := m.decodeMatmul(plan, down, m.act.ffnGate, m.act.tmp, ffn, hidden); err != nil {
 		return err
 	}
 	return plan.Add(m.act.x, m.act.tmp, hidden)

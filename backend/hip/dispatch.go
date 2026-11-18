@@ -100,9 +100,10 @@ func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 // an output projection. The kernel serves 1..16 rows and streams every packed
 // weight row once, which is what makes both output tails bandwidth bound
 // instead of latency bound; it is measured against the per-row GEMV in
-// docs/benchmarks.md. The prefill tail and the decode tail both use this rule,
-// and any shape it does not cover keeps the per-row GEMV, which stays the
-// documented fallback rather than a silent substitution.
+// docs/benchmarks.md. The prefill tail and the decode tail use it directly, and
+// SelectDecodeGemvPath uses it for the whole decode matvec family; any shape it
+// does not cover keeps the per-row GEMV, which stays the documented fallback
+// rather than a silent substitution.
 func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 	if rows <= 0 || rows > MaxLMHeadRows {
 		return false
@@ -127,6 +128,55 @@ func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 // projection sits between 512 and 1536. Sweeps: build/yuuka_prefill_sweep
 // (LMHEAD cells) and build/yuuka_gemv_decode_sweep --threshold.
 const lmHeadMinOutputs = 1024
+
+// DecodeGemvPath is the selected decode matvec implementation.
+type DecodeGemvPath int
+
+const (
+	// DecodeGemvPerRow is one 256-thread block per output row with a block-wide
+	// tree reduction and, for Q4_K/Q5_K, two barriers per 256-value K step. It
+	// is the fallback for shapes the streaming kernel does not cover and the
+	// reference the kernel test compares against.
+	DecodeGemvPerRow DecodeGemvPath = iota
+	// DecodeGemvStreaming is the channel-parallel streaming kernel: one wave
+	// owns four output channels and walks the K axis itself, every lane reads
+	// 16 bytes of packed weights per step, the activation row is staged in
+	// shared memory once per block, and the only reduction is one wave shuffle
+	// per channel.
+	DecodeGemvStreaming
+)
+
+// String returns the diagnostic name of a decode matvec path.
+func (p DecodeGemvPath) String() string {
+	switch p {
+	case DecodeGemvPerRow:
+		return "per-row"
+	case DecodeGemvStreaming:
+		return "streaming"
+	default:
+		return "unknown"
+	}
+}
+
+// SelectDecodeGemvPath returns the measured decode matvec choice for a weight
+// dtype and shape. It is the same kernel and the same rule as the output
+// projection: the streaming mapping is bandwidth bound on every shape the
+// decode graph dispatches (measured 64-199 GB/s against 25-76 GB/s for the
+// per-row form), and it keeps the per-row GEMV below the crossover and for the
+// shapes it cannot serve (a K step that is not 256 values, or an unsupported
+// dtype). Sharing one predicate keeps the two tails and the layer matvecs from
+// drifting apart; the crossover measurement is in docs/benchmarks.md.
+//
+// The narrow recurrent projections (ssm_alpha and ssm_beta, 32 outputs) stay on
+// the per-row form because the streaming kernel needs 32 blocks to fill the
+// device: at 32 outputs it runs one block and measures 3.7 GB/s against 9.5.
+// Merging those launches is a launch-count change, owned by roadmap4 D5.
+func SelectDecodeGemvPath(dtype tensor.DType, nIn, nOut int64) DecodeGemvPath {
+	if SelectLMHeadPath(dtype, 1, nIn, nOut) {
+		return DecodeGemvStreaming
+	}
+	return DecodeGemvPerRow
+}
 
 // PrefillAttentionMMA reports whether the FP16 MMA paged prefill attention
 // kernel is selected for a shape. It mirrors the C++ rule in

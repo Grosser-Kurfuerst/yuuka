@@ -123,8 +123,9 @@ Implemented and tested:
 - rocWMMA FP16 and quantized prefill GEMM with measured 64x64 and 32x64 tile
   selection, an int8 MMQ route for K-quant weights (Q8_1 activations, exact
   int32 WMMA accumulation, FP32 scales), a fused gate/up SwiGLU kernel, a
-  streaming LM head that reads the output matrix once per row block of up to
-  16 rows and serves both output tails, a
+  streaming channel-parallel matvec that reads each packed weight row once, serves
+  the decode matvec family and both output projections (one wave per four output
+  channels, LDS-staged activation, wave reduction), a
   rocBLAS FP16 baseline, causal paged
   prefill attention with an FP16 MMA kernel for F32 and F16 pools (four query
   heads per workgroup, 16-key tiles, FP32 online softmax) and a tiled fallback
