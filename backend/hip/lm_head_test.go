@@ -205,8 +205,8 @@ func TestPlanLMHeadMatchesDequant(t *testing.T) {
 		tensor.Q8_0); err == nil {
 		t.Fatal("misaligned weight offset was accepted")
 	}
-	if plan.Ops() != 0 {
-		t.Fatalf("rejected operations were added: %d", plan.Ops())
+	if plan.OpCount() != 0 {
+		t.Fatalf("rejected operations were added: %d", plan.OpCount())
 	}
 }
 

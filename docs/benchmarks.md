@@ -30,7 +30,9 @@ clock, power, and thermal state are not pinned.
 | Warmup / repetitions | 2 / 5 for prefill rows, 2 / 3 for decode and serving rows, median reported |
 
 Tables re-measured at the commit above are the prompt-length prefill rows, the
-correctness gates, the prefill LM head, and the kernel resource usage. The
+correctness gates, the prefill LM head, and the kernel resource usage. The decode
+matvec table was measured at `bfd36c0`, which differs from the commit above only
+in documentation. The
 decode, KV-format, attention, isolated GEMM, batched GEMV, MoE, gated delta-net,
 serving, server, and llama.cpp comparison tables were measured at `161fbba` and
 were not repeated: the LM head change is confined to the prefill tail and does
@@ -56,6 +58,11 @@ Protocol:
   [roadmap3.md](roadmap3.md#2-baseline-attribution-2026-11-18). It profiles the
   native sweep binary only: `rocprofv3` cannot write its database for a Go
   process, as recorded in [testing.md](testing.md#63-what-to-measure-separately).
+- `scripts/decode_profile.sh` reproduces the [decode matvec](#decode-matvec)
+  table in one command: it runs `build/yuuka_gemv_decode_sweep` unprofiled and
+  under `rocprofv3`, then runs `TestGPUProfileDecode` for the per-operation
+  attribution of one real decode step. The sweep keeps every matrix resident, so
+  its GB/s figures are the hot-matrix upper bound of the real step.
 - Only one benchmark process may use the GPU at a time; two processes sharing
   the device invalidate both results.
 - The llama.cpp reference is `strix-llama.cpp` commit `c8912d7f5` (build 12216,
@@ -317,6 +324,78 @@ reaches on this device with the same matrix size, and the row count is nearly
 free: sixteen rows cost 2.6x one row instead of 16x. See
 [kernels.md](kernels.md#65-streaming-lm-head) for the kernel contract.
 
+### Decode matvec
+
+`build/yuuka_gemv_decode_sweep`, the exact shapes one `qwen35` decode token
+dispatches at the dtypes the GGUF carries, measured 2026-11-18 at commit
+`bfd36c0` on the reference device with the matrix resident. Each cell runs five
+warmups and twenty-five timed submissions of one plan operation; the value is
+the median submission, timed on the host around the submit and the wait. The
+traced run of the same binary supplies the kernel time and the instruction
+counts. `scripts/decode_profile.sh` reproduces this table, and
+[roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18) holds the
+attribution it feeds.
+
+`GEMV` is the per-row kernel the decode plan uses today, `batch 4` the batched
+form, and `LM head` the streaming kernel that the prefill tail already uses.
+`attn_k` and `attn_v` share the `2560 -> 1024` shape, so the `Q4_K` row covers
+both; `ffn_gate` and `ffn_up` share `2560 -> 9216`.
+
+| tensor | dtype | shape (K -> N) | GEMV ms | GB/s | batch 4 ms | GB/s | LM head ms | GB/s |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate`, `ffn_up` | Q4_K | 2560 -> 9216 | 0.351 | 38 | 0.553 | 24 | 0.067 | 197 |
+| `ffn_down` | Q6_K | 9216 -> 2560 | 0.255 | 76 | 0.494 | 39 | 0.097 | 199 |
+| `ffn_down` | Q4_K | 9216 -> 2560 | 0.316 | 42 | 0.517 | 26 | 0.096 | 139 |
+| `attn_q` | Q4_K | 2560 -> 8192 | 0.316 | 37 | 0.501 | 24 | 0.069 | 172 |
+| `attn_k`, `attn_v` | Q4_K | 2560 -> 1024 | 0.059 | 25 | 0.094 | 16 | 0.023 | 64 |
+| `attn_v` | Q6_K | 2560 -> 1024 | 0.055 | 39 | 0.094 | 23 | 0.022 | 97 |
+| `attn_output` | Q4_K | 4096 -> 2560 | 0.146 | 40 | 0.230 | 26 | 0.054 | 109 |
+| `attn_gate` | Q4_K | 2560 -> 4096 | 0.171 | 34 | 0.264 | 22 | 0.036 | 165 |
+| `attn_qkv` | Q5_K | 2560 -> 8192 | 0.355 | 41 | 0.533 | 27 | 0.083 | 173 |
+| `ssm_out` | Q5_K | 4096 -> 2560 | 0.185 | 39 | 0.249 | 29 | 0.058 | 124 |
+| `ssm_beta` | Q8_0 | 2560 -> 32 | 0.009 | 10 | 0.016 | 6 | 0.024 | 4 |
+| `lm_head` | Q6_K | 2560 -> 248320 | 11.218 | 46 | 17.138 | 30 | 2.780 | 188 |
+
+Per-cell instruction counts from the traced run, as wave-level instructions
+times 32 lanes per packed weight. `lds/w` counts shared-memory instructions, and
+the per-row GEMV's scale staging is what puts it two orders of magnitude above
+the streaming kernel:
+
+| cell | form | waves | VALU per weight | LDS per weight |
+| --- | --- | ---: | ---: | ---: |
+| `ffn_gate` Q4_K 2560 -> 9216 | GEMV | 73,728 | 18.0 | 2.66 |
+| `ffn_gate` Q4_K 2560 -> 9216 | batch 4 | 73,728 | 62.6 | 1.65 |
+| `ffn_gate` Q4_K 2560 -> 9216 | LM head | 2,304 | 8.5 | 0.16 |
+| `ffn_down` Q6_K 9216 -> 2560 | GEMV | 20,480 | 26.9 | 0.11 |
+| `ffn_down` Q6_K 9216 -> 2560 | LM head | 640 | 10.9 | 0.11 |
+| `attn_qkv` Q5_K 2560 -> 8192 | GEMV | 65,536 | 20.2 | 2.66 |
+| `attn_qkv` Q5_K 2560 -> 8192 | LM head | 2,048 | 13.8 | 0.16 |
+| `lm_head` Q6_K 2560 -> 248320 | GEMV | 1,986,560 | 29.1 | 0.41 |
+| `lm_head` Q6_K 2560 -> 248320 | LM head | 62,080 | 11.3 | 0.16 |
+
+Findings:
+
+- The per-row GEMV is 4-6x slower than the streaming kernel on every shape the
+  model uses except `ssm_beta` at 32 outputs, where it is 2.6x faster. That
+  crossover is why the streaming route stays behind a shape rule rather than
+  becoming the default.
+- The instruction counts explain the shape of the loss, but not all of it: the
+  per-row GEMV executes 18 to 29 VALU per weight against 8.5 to 13.8 for the
+  streaming kernel, a factor of two, while the time differs by four to six. The
+  rest is the per-row GEMV's block structure: one 256-thread block per output
+  row, a block-wide tree reduction, and two barriers per 256-value K step.
+- Batching four rows into one submission does not amortize the weight read. The
+  batched kernel executes 3.5x the instructions of the single-row form because
+  it repeats the K loop per row, so its per-row cost is 1.5-2x better and its
+  per-submission cost is worse. Decode at batch 1 gains nothing from it.
+- Wall time minus kernel time is the per-submission launch cost: 20-30
+  microseconds for the small cells. The instrumented decode step pays that 579
+  times, which is the 6.2% submission gap recorded in
+  [roadmap4.md](roadmap4.md#23-per-operation-attribution).
+- Two consecutive runs of `scripts/decode_profile.sh` agree within 9% on every
+  cell and within 0.3% on the profiled decode step, so the table is stable
+  enough to judge a kernel change against.
+
 ### Grouped MoE pipeline
 
 Synthetic single-layer shape: 128 experts, top-8, hidden 2048, expert FFN 768,
@@ -547,7 +626,10 @@ YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
 ./build/yuuka_prefill_sweep
 ./build/yuuka_gemv_sweep
 ./build/yuuka_moe_sweep
+./build/yuuka_gemv_decode_sweep
 scripts/kernel_resources.sh
+YUUKA_TEST_MODEL="$MODEL" scripts/decode_profile.sh   # decode matvec table
+YUUKA_TEST_MODEL="$MODEL" scripts/prefill_counters.sh # prefill counter table
 
 for p in 128 512 1024 2048 4096 8192; do
   /tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \

@@ -364,9 +364,10 @@ prefill diagnostic of [roadmap3.md](roadmap3.md#2-baseline-attribution-2026-11-1
 glibc `atexit` handler, and the Go runtime exits without running those
 handlers, so a `rocprofv3` session around `yuuka`, `yuuka-server`, or `go test`
 leaves no usable database. Collect per-kernel counters from the native binaries
-(`build/yuuka_prefill_sweep`, `build/yuuka_gemv_sweep`, `build/yuuka_moe_sweep`)
-and use the HIP event timings from `TestGPUProfilePrefill` for per-operation
-attribution of the engine.
+(`build/yuuka_prefill_sweep`, `build/yuuka_gemv_sweep`,
+`build/yuuka_gemv_decode_sweep`, `build/yuuka_moe_sweep`) and use the HIP event
+timings from `TestGPUProfilePrefill` and `TestGPUProfileDecode` for
+per-operation attribution of the engine.
 
 `scripts/prefill_counters.sh` is the reproducible procedure for that
 attribution: it verifies the recorded GGUF SHA-256 when a model is supplied,
@@ -383,6 +384,36 @@ aggregating across shapes. The reference column needs one executed MMA count
 per matched reference dispatch (`--reference-mma-counts`) because only the
 reference's matrix shapes give that denominator; without it the reference side
 is reported per wave.
+
+Decode attribution follows the same split. `TestGPUProfileDecode` profiles one
+decode step after a real-model forward pass with HIP events around every plan
+operation, resolves each operation to the model buffer it reads, and prints the
+per-operation, per-tensor, and per-dtype tables plus one line per plan index
+sorted by time. It is opt-in through `YUUKA_TEST_MODEL`, and it gates the result
+against the recorded attribution of
+[roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18): the plan must hold
+the recorded 579 operations, the profiled total must stay inside a wide band
+around the recorded 97.605 ms, and the GEMV share must stay within five points
+of 89.7%. The bands are wide because device clocks are not pinned; the operation
+count is exact because it is structural, and a change that moves the attribution
+has to re-record the document rather than pass silently. Event instrumentation
+adds a submission gap per operation, so the totals exceed a release run and are
+a diagnosis, not a benchmark result.
+
+`scripts/decode_profile.sh` is the reproducible procedure for the isolated
+decode matvec table. It verifies the recorded GGUF SHA-256 when a model is
+supplied, fails when the device is not `gfx1151`, runs
+`build/yuuka_gemv_decode_sweep` once unprofiled (five warmups and twenty-five
+timed submissions per cell, median host timing), then traces it with
+`SQ_WAVES SQ_INSTS_VALU SQ_INSTS_LDS` and reduces the database with
+`scripts/decode_profile.py`. The reduction pairs dispatches with sweep cells in
+submission order, thirty per cell, checks that each dispatch matches the form of
+its cell, and checks `SQ_WAVES` against the launch geometry before normalizing
+instructions per packed weight. It then runs `TestGPUProfileDecode` and prints
+the same report `go test -run TestGPUProfileDecode -v` produces. The sweep keeps
+every matrix resident, so its GB/s figures are the hot-matrix upper bound of the
+real step; the wall time minus the traced kernel time is the per-submission
+launch cost, which is the quantity roadmap4 D5 targets.
 
 ## 7. Metric definitions
 

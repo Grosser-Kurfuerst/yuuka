@@ -119,6 +119,17 @@ func (d *Device) Alloc(bytes uint64) (*Buffer, error) {
 // Bytes returns the allocation size.
 func (b *Buffer) Bytes() uint64 { return b.bytes }
 
+// ID returns a process-local identity for the allocation. Diagnostic tooling
+// uses it to match a planned operation slot (OpInfo.Bufs) to the buffer it
+// reads; the value must not be dereferenced and becomes meaningless once the
+// buffer is freed.
+func (b *Buffer) ID() uintptr {
+	if b == nil || b.ptr == nil {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(b.ptr))
+}
+
 // Close releases the allocation exactly once.
 func (b *Buffer) Close() error {
 	if b == nil || b.closed {
@@ -349,12 +360,13 @@ func statusError(st C.yuuka_status, what string) error {
 	return fmt.Errorf("hip: %s: %s", what, message)
 }
 
-// Plan batches generic device operations into one submission.
+// Plan batches generic device operations into one submission. It keeps a
+// Go-side shadow of the operations it added so diagnostics can name them.
 type Plan struct {
 	ptr    *C.yuuka_plan
 	device *Device
 	tail   bool
-	ops    int
+	ops    []OpInfo
 }
 
 func (d *Device) NewPlan() (*Plan, error) {
@@ -382,7 +394,24 @@ func (p *Plan) add(op C.yuuka_op) error {
 	if err := status(C.yuuka_plan_add(p.ptr, &op), "plan_add"); err != nil {
 		return err
 	}
-	p.ops++
+	info := OpInfo{
+		Index: len(p.ops),
+		Code:  uint32(op.code),
+		Flags: uint32(op.flags),
+		Roles: opRoles(uint32(op.code)),
+	}
+	for i := range info.N {
+		info.N[i] = int64(op.n[i])
+	}
+	for i := range info.U {
+		info.U[i] = uint32(op.u[i])
+	}
+	for i := range info.Bufs {
+		if op.buf[i] != nil {
+			info.Bufs[i] = uintptr(unsafe.Pointer(op.buf[i]))
+		}
+	}
+	p.ops = append(p.ops, info)
 	return nil
 }
 
@@ -1657,8 +1686,8 @@ func (p *Plan) ExecuteProfiled(stream *Stream, token int32, position uint32, run
 	if event != nil {
 		ev = event.ptr
 	}
-	codes := make([]C.uint32_t, p.ops)
-	times := make([]C.uint64_t, p.ops)
+	codes := make([]C.uint32_t, len(p.ops))
+	times := make([]C.uint64_t, len(p.ops))
 	var codesPtr *C.uint32_t
 	var timesPtr *C.uint64_t
 	if len(codes) != 0 {
@@ -1749,5 +1778,20 @@ func (g *Graph) Close() error {
 	return nil
 }
 
-// Ops returns the number of operations in the plan.
-func (p *Plan) Ops() int { return p.ops }
+// Ops returns a copy of the plan's operation shadow in submission order. The
+// slice has one entry per operation the plan holds, including tail operations
+// that an Execute call can skip; ExecuteProfiled returns times only for the
+// operations it executed, so a call with runTail=false lines its results up
+// with a prefix of this slice. The copy keeps the caller from mutating the
+// plan's record; it is a diagnostic path, not a hot-path accessor.
+func (p *Plan) Ops() []OpInfo {
+	if p == nil {
+		return nil
+	}
+	out := make([]OpInfo, len(p.ops))
+	copy(out, p.ops)
+	return out
+}
+
+// OpCount returns the number of operations in the plan.
+func (p *Plan) OpCount() int { return len(p.ops) }

@@ -48,15 +48,17 @@ document in the same change.
 
 | Stage | Status | Gate |
 | --- | --- | --- |
-| D0: reproducible decode attribution tooling | Not started | One command reproduces 2.3 and 2.4 within noise |
+| D0: reproducible decode attribution tooling | **Done** (2026-11-18) | One command reproduces 2.3 and 2.4 within noise |
 | D1: decode output projection on the streaming kernel | Not started | Decode p50 13.21 s -> 12.2 s or less; tokens unchanged |
 | D2: channel-parallel decode GEMV | Not started | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
 | D3: Q8_1 activations with `dp4a` | Not started | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
 | D4: gated delta-net per-token kernel | Not started | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
 | D5: launch gaps and operator fusion | Not started | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
 
-No stage is implemented. The measurements in section 2 describe the current
-tree at commit `bfd36c0` and are the baseline each gate is compared against.
+D0 is implemented; its record is 3.4 and its measurements are in
+[benchmarks.md](benchmarks.md#decode-matvec). D1-D5 are not started. The
+measurements in section 2 describe the tree at commit `bfd36c0` and are the
+baseline each gate is compared against.
 
 ## 2. Baseline attribution (2026-11-18)
 
@@ -67,7 +69,7 @@ tree at commit `bfd36c0` and are the baseline each gate is compared against.
 | Date | 2026-11-18 |
 | Model | `Qwen3.5-4B-Q4_K_M.gguf` |
 | Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
-| Model file size | 2,729,969,664 bytes; quantized matmul weights 2,726 MB per token |
+| Model file size | 2,740,937,888 bytes; quantized matmul weights 2,726 MB per token |
 | Architecture | `qwen35`, 32 layers (8 full attention, 24 gated delta-net) |
 | Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs, Wave32 |
 | ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
@@ -173,6 +175,10 @@ packed weights. Weighting the table by each shape's byte count gives a
 projected GEMV time of about 63 ms against the measured 87.6 ms; the
 difference is the cold-weight effect in the real step, where every matrix is
 read once.
+
+These cells are reproduced by `build/yuuka_gemv_decode_sweep`, including the
+batched and streaming forms on the same shapes, and recorded in
+[benchmarks.md](benchmarks.md#decode-matvec).
 
 The `ssm_beta`/`ssm_alpha` cell is not bandwidth at all: 32 output rows cost
 9.5 microseconds, which is the launch and block-reduction floor, repeated 48
@@ -313,6 +319,79 @@ The current tooling cannot support the later stages:
   within 5% for the same matrix size.
 - No change to measured behavior: `go test ./...`, `go test -tags hip ./...`,
   and `ctest --test-dir build` stay green.
+
+### 3.4 Implementation (2026-11-18)
+
+Added:
+
+- `backend/hip/opinfo.go`: `OpInfo`, `OpRole`, the op-code constants, `OpName`,
+  and `opRoles`. `backend/hip.Plan` keeps a shadow slice and exposes
+  `Ops() []OpInfo` and `OpCount()`; `Buffer.ID()` gives a slot identity.
+  `ExecuteProfiled` now sizes its output from the shadow, and its doc states
+  that a `runTail=false` run lines up with a prefix of the shadow.
+- `engine/gpu/decode_profile_test.go`: `TestGPUProfileDecode` reports the
+  per-operation-code table, the per-tensor table, the per-dtype table, and one
+  line per plan index sorted by time, all resolved from the model buffers, and
+  gates the result against 2.3.
+- `bench/hip/gemv_decode_sweep.cpp` (`build/yuuka_gemv_decode_sweep`): the
+  twelve shapes of 2.4 in the per-row, batched, and streaming forms.
+- `scripts/decode_profile.sh` and `scripts/decode_profile.py`: one command that
+  runs the sweep unprofiled, traces it with `SQ_WAVES SQ_INSTS_VALU
+  SQ_INSTS_LDS`, reduces the database to GB/s and per-weight instruction counts,
+  and then runs `TestGPUProfileDecode`.
+- `docs/testing.md` 6.3 records how the decode attribution is produced;
+  [benchmarks.md](benchmarks.md#decode-matvec) holds the measurements.
+
+Two decisions differ from 3.2 as written:
+
+1. **Roles are recorded per op code, not per `Add*` call site.** A buffer role is
+   a property of the ABI opcode: every launcher in `bridge.cpp` reads buf[0..2]
+   with one meaning for a given code. Recording it once in `opRoles` keeps the
+   forty `Add*` methods unchanged, and `opinfo_test.go` fails when a code the C
+   ABI declares has no name or no first-slot role, so the table cannot drift
+   silently. What 3.2 needs from the shadow is that the Go side can name an
+   operation and the buffers it reads; that holds.
+2. **Slot identity is a `uintptr` in `OpInfo`, not a `*Buffer`.** The plan
+   records what it handed to the C ABI, and inverting a C buffer pointer back to
+   a Go `*Buffer` would need a registry or an aliasing map. `Buffer.ID()` returns
+   the same value, so the caller resolves names with a map of its own; the test
+   builds that map from the model weights, the activation structs, the KV pool,
+   and the session state.
+
+Measured reproduction (two consecutive runs of `scripts/decode_profile.sh` on
+the reference device):
+
+| Quantity | Recorded in 2.3 | Run 1 | Run 2 |
+| --- | ---: | ---: | ---: |
+| Plan operations | 579 | 579 | 579 |
+| Profiled step | 97.605 ms | 97.421 ms | 97.721 ms |
+| GEMV family | 87.556 ms (89.7%) | 87.599 ms (89.9%) | 87.501 ms (89.5%) |
+| Gated delta-net | 7.233 ms | 7.130 ms | 7.878 ms |
+| Matmul bytes per token | 2,726 MB | 2,726.1 MB | 2,726.1 MB |
+| Matmul bandwidth | 31 GB/s | 31.1 GB/s | 31.2 GB/s |
+
+The per-cell GB/s of 2.4 reproduces within 9% on every swept cell and within
+0.3% on the profiled step. The largest residual is on the sub-100 microsecond
+cells, where the host timing of a submission is dominated by the launch cost;
+the traced kernel time is stable and is reported next to it.
+
+What the new measurements add to 2.4-2.6, recorded in
+[benchmarks.md](benchmarks.md#decode-matvec):
+
+- The streaming kernel that D1 and D2 target already reaches 172-199 GB/s on
+  every shape the model dispatches except the 32-output `ssm_beta` cell, where
+  the per-row GEMV wins 2.6x. That is the measured basis for the D1 threshold
+  requirement in 4.2 and for keeping a shape rule in D2.
+- The per-row GEMV executes 18-29 VALU and 0.1-2.7 LDS per weight against
+  8.5-13.8 VALU and 0.16 LDS for the streaming kernel. The instruction ratio is
+  about two, while the time ratio is four to six, so the remaining loss is the
+  per-row block structure (one block per output row, a tree reduction, two
+  barriers per K step) and the activation re-read, not the arithmetic alone.
+- The batched form repeats the K loop per row and therefore costs 3.5x the
+  instructions of the single-row form; decode at batch 1 cannot use it as a
+  substitute for the mapping change in D2.
+- Wall time minus kernel time is 20-30 microseconds per submission on the small
+  cells, which is the per-operation launch cost that D5 has to remove.
 
 ## 4. Stage D1: decode output projection on the streaming kernel
 

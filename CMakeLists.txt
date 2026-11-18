@@ -83,6 +83,9 @@ if(YUUKA_ENABLE_HIP)
 
         add_executable(yuuka_moe_sweep bench/hip/moe_sweep.cpp)
         target_link_libraries(yuuka_moe_sweep PRIVATE yuuka_hip)
+
+        add_executable(yuuka_gemv_decode_sweep bench/hip/gemv_decode_sweep.cpp)
+        target_link_libraries(yuuka_gemv_decode_sweep PRIVATE yuuka_hip)
     endif()
 
     if(YUUKA_BUILD_TESTS)
