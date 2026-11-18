@@ -93,6 +93,10 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
+### Module indexes
+
+- [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
+
 ## Implementation status
 
 Implemented and tested:
@@ -202,7 +206,7 @@ Other architectures are rejected at load time.
 - **Hardware bring-up:** [hardware](hardware.md) → [roadmap Phase 0](roadmap.md#3-phase-0--bootstrap-and-hardware-validation).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
   [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode) →
-  [prefill optimization plan](roadmap2.md).
+  [Qwen prefill implementation plan](prefill-optimization/README.md).
 - **Runtime/service work:** [architecture](architecture.md) →
   [serving](serving.md) → [roadmap Phase 4](roadmap.md#7-phase-4--multi-request-serving).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →
