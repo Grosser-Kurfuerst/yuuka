@@ -188,7 +188,7 @@ F16 and Q8_0 rows are not routed through `mmq`; for reference, `wmma` reaches
 reaches 16.0-19.0 on F16 for the wide shapes (8.1 on the tall-`K` row) plus the
 dequantize pass, and is rejected for K-quants on numeric grounds.
 
-The int8 route profiles at 41.6 instructions (22.2 VALU, 4.8 LDS) per
+The int8 route profiles at 22.2 VALU and 4.8 LDS instructions per
 4096-MAC WMMA on Q4_K `2560 -> 9216` at M=512, with `LDSBankConflict` at 0.0%
 and two blocks resident per CU (`OccupancyPercent` 45.6%), against an MMA-only
 ceiling of 48-52 TFLOP/s for the same tile geometry. The loop is VALU-issue

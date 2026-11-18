@@ -405,10 +405,10 @@ channel, so each store instruction covers two 64-byte runs. Transposing through
 a shared-memory tile instead needs 33 KiB, which would break the two-block
 residency, and the direct stores measure the same within noise.
 
-The loop is limited by VALU issue, not by LDS: 41.6 instructions per WMMA of
-which 22.2 are VALU and 4.8 are LDS on Q4_K `2560 -> 9216` at `M=512`. Two
-costs dominate. First, rocWMMA duplicates gfx11 wave32 operands in registers, so
-every `mma_sync` costs 2.5 `ds_swizzle_b32` on the LDS pipe; feeding the builtin
+The loop is limited by VALU issue, not by LDS: 22.2 VALU and 4.8 LDS
+instructions per WMMA on Q4_K `2560 -> 9216` at `M=512`. Two costs dominate.
+First, rocWMMA duplicates gfx11 wave32 operands in registers, so every
+`mma_sync` costs 2.5 `ds_swizzle_b32` on the LDS pipe; feeding the builtin
 directly needs the duplicated 16-byte operands staged in LDS, which doubles the
 operand budget to 51 KiB and drops to one block per CU, and reconstructing the
 duplicate in registers costs the same two moves per fragment on the VALU pipe.
@@ -430,7 +430,7 @@ Measured throughput at `M = 512` (sweep, five timed submissions after two
 warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
 12.4-14.4 TFLOP/s across the three shapes, against 13.5-14.1, 12.6-13.4, and
 11.0-11.6 TFLOP/s before the layout and occupancy change. The route is still
-1.2x below llama.cpp's MMQ kernel on the same device; the remaining
+1.2-1.3x below llama.cpp's MMQ kernel on the same device; the remaining
 attribution is in [roadmap3.md](roadmap3.md#4-stage-s1-mmq-gemm-highest-value-73-of-the-gap).
 
 The q/k/v and qkv/gate groups read the same normalized tile, so the plan
