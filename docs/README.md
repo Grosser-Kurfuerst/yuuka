@@ -89,6 +89,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
 | [roadmap2.md](roadmap2.md) | Ordered prefill optimization plan: measured attribution, workstreams, gates, and references | Kernel and performance contributors |
+| [roadmap3.md](roadmap3.md) | Prefill gap closure plan against the llama.cpp reference: 2026-11-18 attribution, stages S0-S4, gates, and rejected routes | Kernel and performance contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
