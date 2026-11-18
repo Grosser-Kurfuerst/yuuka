@@ -418,6 +418,15 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 			cfg.RMSNormEps); err != nil {
 			return nil, err
 		}
+		if hip.SelectLMHeadPath(output.dtype, rows64, int64(cfg.HiddenSize), int64(cfg.VocabSize)) {
+			// One streaming pass over the output matrix for every candidate
+			// row instead of one GEMV per row.
+			if err := plan.AddLMHeadAt(output.buf, 0, p.norm, 0, m.specLogits, 0,
+				int64(cfg.HiddenSize), int64(cfg.VocabSize), rows64, output.dtype); err != nil {
+				return nil, err
+			}
+			return plan, nil
+		}
 		for row := range rows {
 			if err := plan.AddGemvAt(output.buf, 0, p.norm,
 				uint64(row)*uint64(cfg.HiddenSize)*4, m.specLogits,
@@ -432,6 +441,16 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 	if err := plan.AddRMSNormAt(p.x, lastOff, outputNorm.buf, p.norm, 0,
 		int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
 		return nil, err
+	}
+	if hip.SelectLMHeadPath(output.dtype, 1, int64(cfg.HiddenSize), int64(cfg.VocabSize)) {
+		// The chunk tail needs the last row only. The projection reads the
+		// output matrix once at streaming bandwidth instead of running the
+		// decode GEMV, which is latency bound at a single row.
+		if err := plan.AddLMHeadAt(output.buf, 0, p.norm, 0, m.act.logits, 0,
+			int64(cfg.HiddenSize), int64(cfg.VocabSize), 1, output.dtype); err != nil {
+			return nil, err
+		}
+		return plan, nil
 	}
 	if err := plan.AddGemv(output.buf, p.norm, m.act.logits,
 		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype); err != nil {

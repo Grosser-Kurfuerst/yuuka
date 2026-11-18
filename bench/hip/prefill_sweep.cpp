@@ -229,6 +229,72 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     release(wb);
 }
 
+// run_lm_head compares the streaming LM head against one GEMV submission per
+// row for the shapes the prefill tail actually asks for. The output matrix is
+// the widest in the model and is read once, so the crossover between the two
+// routes is a bandwidth question and is measured per dtype here rather than
+// assumed.
+void run_lm_head(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+                 yuuka_dtype dtype, int64_t n_in, int64_t n_out, int64_t rows) {
+    const uint64_t rb = row_bytes(dtype, uint64_t(n_in));
+    std::vector<uint8_t> weights(rb * uint64_t(n_out), 0x31);
+    std::vector<float> x(size_t(n_in * rows), 0.25f);
+    Buffer wb, xb, ob;
+    bool ok = alloc(device, wb, weights.size()) &&
+              alloc(device, xb, x.size() * 4) &&
+              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              check(yuuka_memcpy_h2d(wb.buf, weights.data(), weights.size()), "h2d w") &&
+              check(yuuka_memcpy_h2d(xb.buf, x.data(), x.size() * 4), "h2d x");
+    yuuka_plan * plan = nullptr;
+    if (ok) {
+        ok = check(yuuka_plan_create(device, &plan), "plan create");
+    }
+    if (ok) {
+        for (int64_t row = 0; row < rows; ++row) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_GEMV;
+            op.buf[0] = wb.buf;
+            op.buf[1] = xb.buf;
+            op.buf[2] = ob.buf;
+            op.off[1] = uint64_t(row * n_in) * 4;
+            op.off[2] = uint64_t(row * n_out) * 4;
+            op.n[0] = uint64_t(n_in);
+            op.n[1] = uint64_t(n_out);
+            op.u[0] = dtype;
+            if (!check(yuuka_plan_add(plan, &op), "add per-row gemv")) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    auto wait_event = [&]() { return check(yuuka_event_wait(event), "wait"); };
+    const Result row_gemv = ok
+        ? bench_rows(device, stream, event, plan, "row-gemv", 5, [&]() {
+              (void)yuuka_plan_execute(plan, stream, 0, 0, 1, event);
+          }, wait_event)
+        : Result{"row-gemv", 0, false};
+    const Result lm_head = ok
+        ? bench_rows(device, stream, event, plan, "lmhead", 5, [&]() {
+              (void)yuuka_lm_head(stream, ob.buf, xb.buf, wb.buf, n_in, n_out,
+                                  rows, dtype, event);
+          }, wait_event)
+        : Result{"lmhead", 0, false};
+    if (ok) {
+        const double weight_gb = double(weights.size()) / 1e9;
+        const double row_rate = row_gemv.ok ? weight_gb / (row_gemv.ms / 1000.0) : 0.0;
+        const double head_rate = lm_head.ok ? weight_gb / (lm_head.ms / 1000.0) : 0.0;
+        std::printf("LMHEAD %s K=%lld N=%lld M=%lld  row-gemv=%.3fms %.1fGB/s"
+                    "  lmhead=%.3fms %.1fGB/s\n",
+                    dtype_name(dtype), static_cast<long long>(n_in),
+                    static_cast<long long>(n_out), static_cast<long long>(rows),
+                    row_gemv.ms, row_rate, lm_head.ms, head_rate);
+    }
+    if (plan != nullptr) yuuka_plan_destroy(plan);
+    release(ob);
+    release(xb);
+    release(wb);
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +322,18 @@ int main() {
         for (const auto & shape : shapes) {
             for (int64_t m : rows) {
                 run_shape(device, stream, event, dtype, shape.n_in, shape.n_out, m);
+            }
+        }
+    }
+    // Prefill tail shapes: every supported output-matrix dtype at the real
+    // vocabulary width, plus two smaller widths that show the crossover.
+    const yuuka_dtype lm_dtypes[] = {YUUKA_DTYPE_Q4_K, YUUKA_DTYPE_Q6_K,
+                                     YUUKA_DTYPE_Q8_0};
+    const int64_t lm_out[] = {512, 1024, 2048, 4096, 32768, 248320};
+    for (yuuka_dtype dtype : lm_dtypes) {
+        for (int64_t n_out : lm_out) {
+            for (int64_t m : {1, 16}) {
+                run_lm_head(device, stream, event, dtype, 2560, n_out, m);
             }
         }
     }

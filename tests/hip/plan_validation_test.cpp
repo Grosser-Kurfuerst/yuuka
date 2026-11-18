@@ -133,6 +133,38 @@ int main() {
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
                     "MOE_REDUCE_ADD overflow") && ok;
     }
+    {
+        // The streaming LM head keeps one accumulator per row per channel in
+        // registers, so a row block above the cap has no kernel.
+        yuuka_op op = make_op(YUUKA_OP_LM_HEAD, roomy);
+        op.n[0] = 256;
+        op.n[1] = 1;
+        op.n[2] = 17;
+        op.u[0] = YUUKA_DTYPE_Q8_0;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "LM_HEAD rows") && ok;
+    }
+    {
+        // A K step that is not a multiple of 256 cannot be one quantization
+        // block, which is a capability failure rather than an argument error.
+        yuuka_op op = make_op(YUUKA_OP_LM_HEAD, roomy);
+        op.n[0] = 384;
+        op.n[1] = 1;
+        op.n[2] = 1;
+        op.u[0] = YUUKA_DTYPE_Q8_0;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_UNSUPPORTED,
+                    "LM_HEAD width") && ok;
+    }
+    {
+        // roomy holds 256 bytes, while one 256-wide Q8_0 weight row is 272.
+        yuuka_op op = make_op(YUUKA_OP_LM_HEAD, roomy);
+        op.n[0] = 256;
+        op.n[1] = 1;
+        op.n[2] = 1;
+        op.u[0] = YUUKA_DTYPE_Q8_0;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "LM_HEAD weight size") && ok;
+    }
 
     // The same shapes with roomy buffers must still be accepted.
     {

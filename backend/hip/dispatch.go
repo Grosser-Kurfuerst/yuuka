@@ -96,6 +96,36 @@ func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 	return PrefillWMMA
 }
 
+// SelectLMHeadPath reports whether the streaming LM head kernel is selected for
+// a prefill output projection. The kernel serves 1..16 rows and streams every
+// packed weight row once, which is what makes the prefill tail bandwidth bound
+// instead of latency bound; it is measured against the per-row GEMV in
+// docs/benchmarks.md. The rule is deliberately narrow: the decode path keeps
+// AddGemv, and a shape the kernel does not cover keeps the existing per-row
+// GEMV tail.
+func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
+	if rows <= 0 || rows > MaxLMHeadRows {
+		return false
+	}
+	if nIn <= 0 || nOut < lmHeadMinOutputs || nIn%256 != 0 {
+		return false
+	}
+	switch dtype {
+	case tensor.F32, tensor.F16, tensor.Q4_0, tensor.Q5_0, tensor.Q8_0,
+		tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+		return true
+	default:
+		return false
+	}
+}
+
+// lmHeadMinOutputs is the measured crossover below which the per-row GEMV is
+// still the better route. At 2560 input values the streaming kernel is level
+// with the GEMV at 1024 Q8_0 outputs and ahead at every larger width for every
+// dtype, so the rule starts there. The sweep behind it is the LMHEAD section of
+// build/yuuka_prefill_sweep; see docs/benchmarks.md.
+const lmHeadMinOutputs = 1024
+
 // PrefillAttentionMMA reports whether the FP16 MMA paged prefill attention
 // kernel is selected for a shape. It mirrors the C++ rule in
 // kernels/hip/prefill/attention_wmma.hip: the kernel serves the four query

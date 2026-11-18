@@ -99,6 +99,18 @@ void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
                             const void * w, uint64_t n_in, uint64_t n_out,
                             uint64_t batch, uint32_t dtype, hipStream_t stream);
 
+/* Streaming LM head for the prefill graph.
+ *
+ * out[rows, n_out] = W[n_out, n_in] * x[rows, n_in], with x and out row major
+ * and rows in [1, 16]. Each packed weight row is read exactly once and dotted
+ * against every activation row, so the operator runs at the streaming weight
+ * bandwidth instead of one GEMV per row. Every dtype in yuuka_dtype is
+ * supported. n_in must be a multiple of 256 and rows must be at most 16; an
+ * out-of-range shape or an unknown dtype launches nothing. */
+void launch_lm_head_f32out(float * out, const float * x, const void * w,
+                           uint64_t n_in, uint64_t n_out, uint64_t rows,
+                           uint32_t dtype, hipStream_t stream);
+
 /* Dequantizes a packed K-quant weight matrix into FP16.
  *
  * dst holds n_in*n_out FP16 elements. src holds the packed [n_out, n_in] matrix

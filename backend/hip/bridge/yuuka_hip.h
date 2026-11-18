@@ -137,7 +137,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_REDUCE_ADD = 33,
     YUUKA_OP_GEMM_SWIGLU = 34,
     YUUKA_OP_DEQUANT_F16 = 35,
-    YUUKA_OP_QUANT_Q8_1 = 36
+    YUUKA_OP_QUANT_Q8_1 = 36,
+    YUUKA_OP_LM_HEAD = 37
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -249,6 +250,22 @@ YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out
                         const yuuka_buffer * w, uint64_t n_in, uint64_t n_out,
                         uint64_t batch, yuuka_event * completion);
 
+/* Streaming LM head for the prefill tail:
+ *
+ * out[rows, n_out] = W[n_out, n_in] * x[rows, n_in]
+ *
+ * x and out are row-major [rows, n_in] and [rows, n_out]. Every packed weight
+ * element is read once and reused across all rows, so the call runs at the
+ * streaming weight bandwidth; rows is limited to 16, which covers the last-row
+ * chunk tail and the speculative verification row block. Every dtype in
+ * yuuka_dtype is supported and n_in must be a multiple of 256. This is the
+ * prefill form of the output projection only: the decode path keeps its GEMV.
+ */
+YUUKA_API yuuka_status yuuka_lm_head(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * x, const yuuka_buffer * w,
+                        uint64_t n_in, uint64_t n_out, uint64_t rows,
+                        uint32_t dtype, yuuka_event * completion);
+
 /* Dequantizes a packed K-quant weight matrix into an FP16 scratch:
  *
  * dst[n_out, n_in] = dequant(src[n_out, n_in])
@@ -281,7 +298,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
 
 /* Plans batch generic device operations into one submission.
  *
- * GEMV, GEMM, GEMM_SWIGLU, GEMV_BATCH, the legacy single-token family (RMSNORM, L2NORM,
+ * GEMV, GEMM, GEMM_SWIGLU, GEMV_BATCH, LM_HEAD, the legacy single-token family (RMSNORM, L2NORM,
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
  * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
@@ -329,6 +346,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                        buf3 out; n={n_in,n_out,rows}; u[0]=dtype. Both
  *                        weights share dtype and shape; out holds
  *                        silu(W_gate*x) * (W_up*x) in FP32.
+ *   LM_HEAD:             buf0 packed weights, buf1 FP32 x, buf2 FP32 out;
+ *                        n={n_in,n_out,rows}; u[0]=dtype; n_in must be a
+ *                        multiple of 256 and rows at most 16
  *
  * Paged family. The block table is an int32 buffer with ceil(capacity/block_size)
  * entries mapping logical token positions to pool blocks. The pool holds

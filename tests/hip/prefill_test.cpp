@@ -878,6 +878,123 @@ bool test_gemm_blas_dequant(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
+// test_lm_head runs the streaming prefill LM head over every supported dtype
+// and row-block size, including a row block that starts inside the last
+// channel tile. The kernel is checked against the independent host dot
+// products, and the plan path is checked to reject a row block above the cap.
+bool test_lm_head(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+                  std::mt19937 & rng) {
+    const struct {
+        yuuka_dtype dtype;
+        const char * name;
+    } cases[] = {
+        {YUUKA_DTYPE_F32, "lm head F32"},
+        {YUUKA_DTYPE_F16, "lm head F16"},
+        {YUUKA_DTYPE_Q4_0, "lm head Q4_0"},
+        {YUUKA_DTYPE_Q5_0, "lm head Q5_0"},
+        {YUUKA_DTYPE_Q8_0, "lm head Q8_0"},
+        {YUUKA_DTYPE_Q4_K, "lm head Q4_K"},
+        {YUUKA_DTYPE_Q5_K, "lm head Q5_K"},
+        {YUUKA_DTYPE_Q6_K, "lm head Q6_K"},
+    };
+    // 2560 keeps ten full K steps; 400 outputs makes the last block serve four
+    // channels and leave the fifth warp idle, which exercises the channel tail.
+    const struct {
+        int64_t n_in;
+        int64_t n_out;
+        int64_t rows;
+    } shapes[] = {
+        {2560, 400, 1},
+        {2560, 400, 3},
+        {2560, 400, 16},
+        {512, 96, 2},
+    };
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    bool ok = true;
+    for (const auto & c : cases) {
+        for (const auto & s : shapes) {
+            std::vector<float> x(size_t(s.n_in * s.rows));
+            for (float & v : x) v = dist(rng);
+            std::vector<uint8_t> packed = pack_weights(c.dtype, rng, s.n_in, s.n_out);
+            Buffer wb, xb, ob;
+            bool pass = alloc(device, wb, packed.size()) &&
+                        alloc(device, xb, x.size() * 4) &&
+                        alloc(device, ob, size_t(s.n_out * s.rows) * 4) &&
+                        upload(wb, packed.data(), packed.size()) &&
+                        upload_vec(xb, x);
+            std::vector<float> got(size_t(s.n_out * s.rows));
+            std::vector<float> again(size_t(s.n_out * s.rows));
+            if (pass) {
+                pass = check(yuuka_lm_head(stream, ob.buf, xb.buf, wb.buf, s.n_in,
+                                          s.n_out, s.rows, c.dtype, event),
+                             "lm head") &&
+                       check(yuuka_event_wait(event), "lm head wait") &&
+                       download_vec(ob, got);
+            }
+            // A second run must reproduce the first one exactly: the kernel
+            // reduces each output over a fixed lane order.
+            if (pass) {
+                pass = check(yuuka_lm_head(stream, ob.buf, xb.buf, wb.buf, s.n_in,
+                                          s.n_out, s.rows, c.dtype, event),
+                             "lm head repeat") &&
+                       check(yuuka_event_wait(event), "lm head repeat wait") &&
+                       download_vec(ob, again);
+            }
+            if (pass && got != again) {
+                std::fprintf(stderr, "%s [%lld]: repeated run differs\n", c.name,
+                             static_cast<long long>(s.rows));
+                pass = false;
+            }
+            if (pass) {
+                pass = compare_gemm(c.name, packed, x, got, c.dtype, s.n_in,
+                                    s.n_out, s.rows);
+            }
+            ok = ok && pass;
+            release(ob);
+            release(xb);
+            release(wb);
+        }
+    }
+    // The plan entry point rejects a row block above the kernel cap instead of
+    // launching a partially covered output block.
+    {
+        yuuka_plan * plan = nullptr;
+        Buffer wb, xb, ob;
+        const int64_t n_in = 512, n_out = 64, rows = 17;
+        const uint64_t rb = row_bytes(YUUKA_DTYPE_Q8_0, n_in);
+        bool pass = alloc(device, wb, rb * uint64_t(n_out)) &&
+                    alloc(device, xb, size_t(n_in * rows) * 4) &&
+                    alloc(device, ob, size_t(n_out * rows) * 4) &&
+                    check(yuuka_plan_create(device, &plan), "lm head plan create");
+        if (pass) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_LM_HEAD;
+            op.buf[0] = wb.buf;
+            op.buf[1] = xb.buf;
+            op.buf[2] = ob.buf;
+            op.n[0] = n_in;
+            op.n[1] = n_out;
+            op.n[2] = rows;
+            op.u[0] = YUUKA_DTYPE_Q8_0;
+            const yuuka_status status = yuuka_plan_add(plan, &op);
+            if (status != YUUKA_ERR_INVALID_ARGUMENT) {
+                std::fprintf(stderr, "lm head: %lld rows accepted with status %d\n",
+                             static_cast<long long>(rows), int(status));
+                pass = false;
+            }
+        }
+        if (plan != nullptr) {
+            yuuka_plan_destroy(plan);
+        }
+        release(ob);
+        release(xb);
+        release(wb);
+        std::printf("lm head row cap: %s\n", pass ? "ok" : "FAILED");
+        ok = ok && pass;
+    }
+    return ok;
+}
+
 bool test_norm_and_rope(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
                         std::mt19937 & rng) {
     const int rows = 7, cols = 64, heads = 4, head_dim = 16, stride = 2 * head_dim;
@@ -1656,6 +1773,7 @@ int main() {
                                         s.n_in, s.n_out, s.rows, rng) && ok;
         }
     }
+    ok = test_lm_head(device, stream, event, rng) && ok;
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;

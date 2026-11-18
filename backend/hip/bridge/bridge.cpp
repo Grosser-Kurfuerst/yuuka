@@ -267,6 +267,57 @@ yuuka_status validate_gemv_plan_op(const yuuka_op & op, bool batched) {
     return YUUKA_OK;
 }
 
+// validate_lm_head_plan_op checks the streaming LM head operation. It accepts
+// the same dtypes as the GEMV family, requires a 256-wide K step so that every
+// step is one quantization block, and caps the row block at 16 because the
+// accumulators live in registers.
+yuuka_status validate_lm_head_plan_op(const yuuka_op & op) {
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "lm head buffer %d is null", i);
+        }
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint32_t dtype = op.u[0];
+    if (!check_gemv_shapes(n_in, dtype) || n_in % 256 != 0) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "unsupported lm head dtype %u or input width %llu",
+                    dtype, static_cast<unsigned long long>(n_in));
+    }
+    if (n_out == 0 || rows == 0 || rows > 16) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid lm head output width %llu or row block %llu",
+                    static_cast<unsigned long long>(n_out),
+                    static_cast<unsigned long long>(rows));
+    }
+    if ((op.off[0] % 16) != 0 || (op.off[1] % 16) != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "lm head offsets must be 16-byte aligned");
+    }
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    if (!checked_row_bytes(n_in, dtype, &row_bytes) ||
+        __builtin_mul_overflow(row_bytes, n_out, &weight_bytes) ||
+        __builtin_mul_overflow(n_in, rows * uint64_t(sizeof(float)), &input_bytes) ||
+        __builtin_mul_overflow(n_out, rows * uint64_t(sizeof(float)), &output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "lm head dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "lm head weight buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], input_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "lm head input buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[2], op.off[2], output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "lm head output buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 // validate_gemm_plan_op checks a prefill GEMM operation. Path AUTO and WMMA
 // read FP32 activations and accept every supported weight dtype. Path BLAS is
 // the rocBLAS FP16 baseline and therefore requires FP16 activations.
@@ -1531,13 +1582,37 @@ yuuka_status launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
     return YUUKA_OK;
 }
 
-yuuka_status launch_gemm_swiglu_dispatch(yuuka_op const & op, hipStream_t stream) {
-    auto * out = op_ptr<float>(op, 3);
+yuuka_status launch_gemm_swiglu_dispatch(yuuka_op const & op, hipStream_t stream) {    auto * out = op_ptr<float>(op, 3);
     const auto * x = op_ptr<const float>(op, 2);
     const void * gate = op_ptr<const void>(op, 0);
     const void * up = op_ptr<const void>(op, 1);
     yuuka::launch_gemm_wmma_swiglu_f32out(out, x, gate, up, op.n[0], op.n[1],
                                           op.n[2], op.u[0], stream);
+    return YUUKA_OK;
+}
+
+yuuka_status launch_lm_head_dispatch(yuuka_op const & op, hipStream_t stream) {
+    auto * out = op_ptr<float>(op, 2);
+    const auto * x = op_ptr<const float>(op, 1);
+    const void * w = op_ptr<const void>(op, 0);
+    if (out == nullptr || x == nullptr || w == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "lm head requires weights, x, and out");
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t rows = op.n[2];
+    if (n_in == 0 || n_out == 0 || rows == 0 || rows > 16 || n_in % 256 != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid lm head shape %llu -> %llu for %llu rows",
+                    static_cast<unsigned long long>(n_in),
+                    static_cast<unsigned long long>(n_out),
+                    static_cast<unsigned long long>(rows));
+    }
+    uint64_t row_bytes = 0;
+    if (!checked_row_bytes(n_in, op.u[0], &row_bytes)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported lm head dtype %u", op.u[0]);
+    }
+    yuuka::launch_lm_head_f32out(out, x, w, n_in, n_out, rows, op.u[0], stream);
     return YUUKA_OK;
 }
 
@@ -1597,6 +1672,13 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         }
         case YUUKA_OP_GEMM_SWIGLU: {
             yuuka_status status = launch_gemm_swiglu_dispatch(op, stream);
+            if (status != YUUKA_OK) {
+                return status;
+            }
+            break;
+        }
+        case YUUKA_OP_LM_HEAD: {
+            yuuka_status status = launch_lm_head_dispatch(op, stream);
             if (status != YUUKA_OK) {
                 return status;
             }
@@ -2776,6 +2858,44 @@ YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out
     });
 }
 
+YUUKA_API yuuka_status yuuka_lm_head(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * x, const yuuka_buffer * w,
+                        uint64_t n_in, uint64_t n_out, uint64_t rows,
+                        uint32_t dtype, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || out == nullptr || x == nullptr || w == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        yuuka_op op{};
+        op.code = YUUKA_OP_LM_HEAD;
+        op.buf[0] = const_cast<yuuka_buffer *>(w);
+        op.buf[1] = const_cast<yuuka_buffer *>(x);
+        op.buf[2] = out;
+        op.n[0] = n_in;
+        op.n[1] = n_out;
+        op.n[2] = rows;
+        op.u[0] = dtype;
+        yuuka_status status = validate_lm_head_plan_op(op);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        yuuka::launch_lm_head_f32out(static_cast<float *>(out->ptr),
+                                     static_cast<const float *>(x->ptr), w->ptr,
+                                     n_in, n_out, rows, dtype, stream->stream);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "lm head launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
 YUUKA_API yuuka_status yuuka_cast_f32_to_f16(yuuka_stream * stream, yuuka_buffer * dst,
                         const yuuka_buffer * src, uint64_t n, yuuka_event * completion) {
     return guard([&]() -> yuuka_status {
@@ -2971,7 +3091,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_QUANT_Q8_1) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_LM_HEAD) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3020,6 +3140,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_QUANT_Q8_1:
                 status = validate_quantize_plan_op(*op);
+                break;
+            case YUUKA_OP_LM_HEAD:
+                status = validate_lm_head_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

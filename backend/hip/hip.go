@@ -958,6 +958,68 @@ func (p *Plan) AddGemmSwigluAt(gate *Buffer, gateOff uint64, up *Buffer, upOff u
 	return p.add(op)
 }
 
+// MaxLMHeadRows is the row-block cap of the streaming LM head kernel. The
+// prefill tail uses one row, and speculative verification uses at most one row
+// per draft token, which is the same cap.
+const MaxLMHeadRows = 16
+
+// AddLMHeadAt appends the streaming prefill LM head: out[rows, nOut] =
+// W * x[rows, nIn] with packed weights that may be any dtype the GEMV family
+// supports. Each weight element is read once and reused across rows, so this is
+// the prefill form of the output projection; the decode path keeps AddGemv.
+// nIn must be a multiple of 256 and rows must be in 1..MaxLMHeadRows. The
+// weight and activation offsets must stay 16-byte aligned because the decoders
+// read whole 128-bit groups of packed values and activations.
+func (p *Plan) AddLMHeadAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut, rows int64, dtype tensor.DType) error {
+	if nIn <= 0 || nOut <= 0 {
+		return errors.New("hip: LM head dimensions must be positive")
+	}
+	if rows <= 0 || rows > MaxLMHeadRows {
+		return fmt.Errorf("hip: LM head row block %d is outside 1..%d", rows, MaxLMHeadRows)
+	}
+	if nIn%256 != 0 {
+		return fmt.Errorf("hip: LM head input width %d is not a multiple of 256", nIn)
+	}
+	if wOff%16 != 0 || xOff%16 != 0 {
+		return fmt.Errorf("hip: LM head offset w=%d x=%d is not 16-byte aligned",
+			wOff, xOff)
+	}
+	if err := checkGemvDType(dtype, nIn); err != nil {
+		return err
+	}
+	if err := p.check(w, x, out); err != nil {
+		return err
+	}
+	rowBytes, err := dtype.RowBytes(nIn)
+	if err != nil {
+		return fmt.Errorf("hip: LM head shape: %w", err)
+	}
+	if wOff > w.bytes || int64(rowBytes)*nOut > int64(w.bytes-wOff) {
+		return fmt.Errorf("hip: LM head weight buffer holds %d bytes, want %d",
+			w.bytes-wOff, int64(rowBytes)*nOut)
+	}
+	if xOff > x.bytes || rows*nIn*4 > int64(x.bytes-xOff) {
+		return fmt.Errorf("hip: LM head activation buffer holds %d bytes, want %d",
+			x.bytes-xOff, rows*nIn*4)
+	}
+	if outOff > out.bytes || rows*nOut*4 > int64(out.bytes-outOff) {
+		return fmt.Errorf("hip: LM head output buffer holds %d bytes, want %d",
+			out.bytes-outOff, rows*nOut*4)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_LM_HEAD}
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	op.buf[2] = out.ptr
+	op.off[0] = C.uint64_t(wOff)
+	op.off[1] = C.uint64_t(xOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(rows)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
 // AddRMSNormBatchAt appends a row-wise RMSNorm over rows rows of cols values.
 func (p *Plan) AddRMSNormBatchAt(src *Buffer, srcOff uint64, weight *Buffer, dst *Buffer, dstOff uint64, rows, cols, srcStride, dstStride int64, eps float32) error {
 	if rows <= 0 || cols <= 0 || srcStride < cols || dstStride < cols {
