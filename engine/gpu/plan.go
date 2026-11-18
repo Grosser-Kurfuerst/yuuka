@@ -64,6 +64,70 @@ func (m *Model) decodeMatmul(plan *hip.Plan, w weight, x, out *hip.Buffer,
 	}
 }
 
+// decodeMatmulResidual appends the decode matvec that ends a sub-layer together
+// with its residual add. out = W*x + res in one launch when the streaming kernel
+// is selected, which is the D5 fusion of roadmap4 section 8.2; the per-row route
+// keeps the two operations it has always had, because that kernel has no
+// epilogue and the choice is made here, at plan build time, not at run time.
+func (m *Model) decodeMatmulResidual(plan *hip.Plan, w weight, x, out, res *hip.Buffer,
+	nIn, nOut int64) error {
+	if !m.noResidualFusion && !m.forceDecodeGemv && !m.int8Matvec &&
+		hip.SelectDecodeGemvPath(w.dtype, nIn, nOut, false) == hip.DecodeGemvStreaming {
+		return plan.AddGemvResidualAt(w.buf, 0, x, 0, out, 0, res, 0, nIn, nOut, 1, w.dtype)
+	}
+	if err := m.decodeMatmul(plan, w, x, m.act.tmp, nIn, nOut); err != nil {
+		return err
+	}
+	return plan.Add(out, m.act.tmp, nOut)
+}
+
+// decodeMatmulPair appends two projections that read the same activation row as
+// one launch. It needs both shapes on the streaming route, because the fused
+// block forms both dots over one traversal of the row; otherwise the plan keeps
+// the two matvecs, and with the SwiGLU epilogue the separate SILU_MUL as well.
+//
+// The choice is made here, at plan build time, and the two forms are asserted to
+// agree by the differential tests in decode_fusion_test.go.
+func (m *Model) decodeMatmulPair(plan *hip.Plan, a, b weight, x, outA, outB *hip.Buffer,
+	nIn, nOutA, nOutB int64, epilogue int) error {
+	// The pair kernel decodes both matrices with one instantiation, so it needs
+	// one weight dtype; a mixed pair keeps the two matvecs. That is a plan-build
+	// decision, not a silent route change.
+	usable := !m.noPairFusion && !m.forceDecodeGemv && !m.int8Matvec &&
+		a.dtype == b.dtype &&
+		hip.SelectDecodeGemvPath(a.dtype, nIn, nOutA, false) == hip.DecodeGemvStreaming &&
+		hip.SelectDecodeGemvPath(b.dtype, nIn, nOutB, false) == hip.DecodeGemvStreaming &&
+		(epilogue != hip.PairSwiglu || nOutA == nOutB)
+	if usable {
+		// The SwiGLU epilogue consumes the second row inside the kernel, so the
+		// fused form takes no second output.
+		second := outB
+		if epilogue == hip.PairSwiglu {
+			second = nil
+		}
+		return plan.AddGemvPairAt(a.buf, 0, b.buf, 0, x, 0, outA, 0, second, 0, nIn,
+			nOutA, nOutB, a.dtype, b.dtype, epilogue)
+	}
+	if err := m.decodeMatmul(plan, a, x, outA, nIn, nOutA); err != nil {
+		return err
+	}
+	if err := m.decodeMatmul(plan, b, x, outB, nIn, nOutB); err != nil {
+		return err
+	}
+	if epilogue == hip.PairSwiglu {
+		return plan.AddSiluMul(outA, outB, outA, nOutA)
+	}
+	return nil
+}
+
+// decodeMatmulSwiglu appends the gate and up projections and their SwiGLU
+// product, either as one fused launch or as two matvecs and a SILU_MUL.
+func (m *Model) decodeMatmulSwiglu(plan *hip.Plan, gate, up weight, x, out *hip.Buffer,
+	nIn, nOut int64) error {
+	return m.decodeMatmulPair(plan, gate, up, x, out, m.act.ffnUp, nIn, nOut, nOut,
+		hip.PairSwiglu)
+}
+
 // decodeActGroup prepares the Q8_1 digits of one decode activation row for the
 // matvecs that read it. It emits one quantization operation for the group, which
 // is what keeps the activation from being re-quantized per projection, and skips
@@ -262,6 +326,11 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := m.decodeActGroup(plan, m.act.norm, hidden, q.dtype, k.dtype, v.dtype); err != nil {
 		return err
 	}
+	// q, k, and v are independent and read the same row, but only a pair of
+	// comparable widths pays for a merge: the q and k pair was measured 0.4 ms
+	// slower per step than two launches, because the grid follows the wider
+	// matrix and the narrow one then shares its staging (roadmap4 8.5). They keep
+	// their own launches.
 	if err := m.decodeMatmul(plan, q, m.act.norm, m.act.q, hidden, qDim); err != nil {
 		return err
 	}
@@ -299,10 +368,7 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := m.decodeActGroup(plan, m.act.attn, oDim, o.dtype); err != nil {
 		return err
 	}
-	if err := m.decodeMatmul(plan, o, m.act.attn, m.act.tmp, oDim, hidden); err != nil {
-		return err
-	}
-	return plan.Add(m.act.x, m.act.tmp, hidden)
+	return m.decodeMatmulResidual(plan, o, m.act.attn, m.act.x, m.act.x, oDim, hidden)
 }
 
 // fusedDeltaNet reports whether the recurrent layer can take the fused
@@ -370,6 +436,9 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 		alpha.dtype, beta.dtype); err != nil {
 		return err
 	}
+	// The qkv projection and the delta-net gate read the same row, but their
+	// dtypes differ in this model (Q5_K against Q4_K) and their widths are 2:1, so
+	// they keep separate launches; see the measurement in roadmap4 8.5.
 	if err := m.decodeMatmul(plan, qkv, m.act.norm, m.act.qkv, hidden, convDim); err != nil {
 		return err
 	}
@@ -430,10 +499,7 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	if err := m.decodeActGroup(plan, m.act.gdnNorm, inner, out.dtype); err != nil {
 		return err
 	}
-	if err := m.decodeMatmul(plan, out, m.act.gdnNorm, m.act.tmp, inner, hidden); err != nil {
-		return err
-	}
-	return plan.Add(m.act.x, m.act.tmp, hidden)
+	return m.decodeMatmulResidual(plan, out, m.act.gdnNorm, m.act.x, m.act.x, inner, hidden)
 }
 
 func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
@@ -459,22 +525,14 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	if err := m.decodeActGroup(plan, m.act.norm, hidden, gate.dtype, up.dtype); err != nil {
 		return err
 	}
-	if err := m.decodeMatmul(plan, gate, m.act.norm, m.act.ffnGate, hidden, ffn); err != nil {
-		return err
-	}
-	if err := m.decodeMatmul(plan, up, m.act.norm, m.act.ffnUp, hidden, ffn); err != nil {
-		return err
-	}
-	if err := plan.AddSiluMul(m.act.ffnGate, m.act.ffnUp, m.act.ffnGate, ffn); err != nil {
+	if err := m.decodeMatmulSwiglu(plan, gate, up, m.act.norm, m.act.ffnGate, hidden, ffn); err != nil {
 		return err
 	}
 	if err := m.decodeActGroup(plan, m.act.ffnGate, ffn, down.dtype); err != nil {
 		return err
 	}
-	if err := m.decodeMatmul(plan, down, m.act.ffnGate, m.act.tmp, ffn, hidden); err != nil {
-		return err
-	}
-	return plan.Add(m.act.x, m.act.tmp, hidden)
+	// The projection that ends the sub-layer adds the residual itself.
+	return m.decodeMatmulResidual(plan, down, m.act.ffnGate, m.act.x, m.act.x, ffn, hidden)
 }
 
 // buildPrefillPlan constructs the chunked prompt graph for one session.

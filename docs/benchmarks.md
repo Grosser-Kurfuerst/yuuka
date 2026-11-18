@@ -132,31 +132,66 @@ F32 KV, median of three repetitions:
 
 | Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 320 | 0.085 s | 0.085 s | 3.341 s | 38.02 |
-| 256 | 448 | 0.160 s | 0.160 s | 7.547 s | 33.79 |
+| 128 | 320 | 0.085 s | 0.085 s | 3.280 s | 38.70 |
+| 256 | 448 | 0.162 s | 0.162 s | 7.429 s | 34.32 |
 
 Decode is weight-bandwidth bound and flat in output length: the two rows differ by
 11%, which is the prefill of the longer prompt plus the drift of an unpinned
 clock, not a change of regime. Effective weight-read bandwidth is
-$2.726\\,\\mathrm{GB} \\times 38.0\\,\\mathrm{s^{-1}} \\approx 103.6\\,\\mathrm{GB/s}$
-against the 127 GB/s the profiled step measures for the family, so the family
-itself is still the limiter ([isolated kernels](#isolated-kernels)).
+$2.726\\,\\mathrm{GB} \\times 38.7\\,\\mathrm{s^{-1}} \\approx 105.5\\,\\mathrm{GB/s}$
+against the 130 GB/s the profiled step measures for the family, so the family
+itself is still the limiter ([isolated kernels](#isolated-kernels)). The 3 ms per
+token between the two figures is the host side of the loop: the sampler reads
+248,320 logits and the row is copied device-to-host once per token.
 
 The decode rows measure the selected route, which is the FP32 streaming matvec
 (the int8 route of roadmap4 D3 is measured slower and stays opt-in; see
 [int8 decode matvec](#int8-decode-matvec-d3)).
 
-The table was re-measured three times: when the decode output projection moved to
+The table was re-measured four times: when the decode output projection moved to
 the streaming LM head kernel
 ([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)), when the rest of the
 decode matvec family followed it
-([roadmap4.md](roadmap4.md#55-implementation-2026-11-18)), and when the gated
+([roadmap4.md](roadmap4.md#55-implementation-2026-11-18)), when the gated
 delta-net moved to the fused per-token pair
-([roadmap4.md](roadmap4.md#75-implementation-2026-11-18)). Same flags, same
-session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s, then 3.341 s.
-The profiled step went 97.4, 89.4, 31.6, 24.3 ms with the matvec family at 87.6,
-79.2, 21.6, 21.5 ms, so the matvec share rose from 68% to 88% as the delta-net
-left the critical path. Prefill is unaffected across all four: 0.085-0.088 s.
+([roadmap4.md](roadmap4.md#75-implementation-2026-11-18)), and when the residual
+add and the gate/up pair were folded into the matvec
+([roadmap4.md](roadmap4.md#85-implementation-2026-11-18)). Same flags, same
+session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s, 3.341 s, then
+3.280 s. The profiled step went 97.4, 89.4, 31.6, 24.3, 23.4 ms with the matvec
+family at 87.6, 79.2, 21.6, 21.5, 21.1 ms, so the matvec share rose from 68% to
+90% as everything else left the critical path. Prefill is unaffected across all
+five: 0.085-0.088 s.
+
+### Decode fusion (D5)
+
+`TestGPUProfileDecode` with and without `YUUKA_TEST_DECODE_UNFUSED=1`, same
+session, same plan input, one decode step after a real forward pass:
+
+| Plan | Operations | Matvec | Everything else | Step |
+| --- | ---: | ---: | ---: | ---: |
+| fusions off | 507 | 21.452 ms | 3.01 ms | 24.461 ms |
+| fusions on | 379 | 21.104 ms | 2.39 ms | **23.492 ms** |
+
+The residual epilogue replaces 64 ADD operations, and the gate/up pair replaces
+64 operations (two matvecs and a SILU_MUL) with 32. Both plans produce
+bit-identical logits over eight greedy steps
+(`TestGPUDecodeFusionsMatchUnfused`, maximum difference 0).
+
+`TestGPUGraphReplayMatchesAndTimes`, 32 decode steps: 22.398 ms per step on the
+plain submission path against 22.385 ms with the plan captured into a HIP Graph,
+a ratio of 0.999 with identical tokens. Replay removes every per-operation host
+submission, so the inter-operation gap is below the resolution of that comparison,
+which is what the D5 gap gate asked for.
+
+Variants measured and rejected in the same stage:
+
+| Variant | Step | Matvec | Verdict |
+| --- | ---: | ---: | --- |
+| D4 tree (before the stage) | 24.26 ms | 21.45 ms | - |
+| eight output channels per wave | 25.9 ms | 21.8 ms | 28% slower, spills |
+| `kStepK` 512 | 24.2 ms | 21.8 ms | 7% slower, staging outweighs barriers |
+| pair with a run-time dtype switch | 26.2 ms | 23.9 ms | 40% slower than the templated pair |
 
 ### Gated delta-net (D4)
 
@@ -685,18 +720,21 @@ extra work; see the attribution in roadmap3.
 | pp512 | 2346.17 ± 80.87 | 1634.8 (F16 KV) | 0.70 |
 | pp2048 | 2409.70 ± 5.39 | 1641.5 (F16 KV) | 0.68 |
 | pp8192 | 2170.79 ± 4.19 | 1438.2 (F16 KV) | 0.66 |
-| tg128 (prompt 128) | 62.29 ± 0.19 | 38.02 (F32 KV) | 0.61 |
+| tg128 (prompt 128) | 62.29 ± 0.19 | 38.70 (F32 KV) | 0.62 |
 
 The remaining gaps, in order of size:
 
 1. Decode, 1.6x: llama.cpp streams the 2.726 GB of quantized weights at about
-   170 GB/s, near the practical memory roofline; yuuka now streams the same
-   weights at 126.7 GB/s inside a step after moving the whole matvec family to
-   the channel-parallel kernel ([decode matvec](#decode-matvec)). What remains is
-   88% matvec at 126.7 GB/s against a 244 GB/s read ceiling, plus 0.79 ms of
-   gated delta-net and 2.0 ms of other operations and submission gaps in a
-   24.3 ms step; the gated delta-net left the critical path when the fused
-   per-token pair landed ([gated delta-net](#gated-delta-net-d4)).
+   170 GB/s, near the practical memory roofline; yuuka streams the same weights at
+   129.7 GB/s inside a step after moving the whole matvec family to the
+   channel-parallel kernel ([decode matvec](#decode-matvec)). What remains is 90%
+   matvec at 129.7 GB/s against a 244 GB/s read ceiling, plus 0.79 ms of gated
+   delta-net and 1.6 ms of other operations in a 23.4 ms step; the delta-net and
+   the submission gaps left the critical path in D4 and D5
+   ([gated delta-net](#gated-delta-net-d4), [decode fusion](#decode-fusion-d5)).
+   The matvec's remaining loss is a per-launch ramp of about 22 us on the 5-19 MB
+   matrices, which only merges of same-dtype, comparable-width projections
+   amortize.
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
    runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see

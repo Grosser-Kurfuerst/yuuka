@@ -249,6 +249,8 @@ int main() {
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_OK, "KV_WRITE valid") && ok;
     }
 
+    // The fused decode matvec forms need a packed weight buffer and a 256-aligned
+    // input width, so they are checked separately below.
     // The fused delta-net pair needs more room than the elementwise buffers: the
     // recurrent state is 128x128 FP32 per head.
     yuuka_buffer * wide = nullptr;
@@ -284,6 +286,57 @@ int main() {
         unaligned.n[4] = 128;
         ok = expect(yuuka_plan_add(plan, &unaligned), YUUKA_ERR_UNSUPPORTED,
                     "CONV_L2NORM unaligned channels") && ok;
+
+        // The fused decode matvec forms: the residual epilogue and the two-matrix
+        // pair. Two megabytes hold the 256 x 256 Q4_K matrices the shape rules
+        // ask for; the input and output rows are 256 floats.
+        yuuka_buffer * packed = nullptr;
+        yuuka_buffer * rows = nullptr;
+        if (yuuka_buffer_alloc(device, 1u << 21, &packed) != YUUKA_OK ||
+            yuuka_buffer_alloc(device, 4096, &rows) != YUUKA_OK) {
+            std::fprintf(stderr, "fused matvec buffers: %s\n", yuuka_last_error());
+            ok = false;
+        } else {
+            yuuka_op residual = make_op(YUUKA_OP_GEMV_RESIDUAL, packed);
+            residual.buf[1] = rows;
+            residual.buf[2] = rows;
+            residual.buf[3] = rows;
+            residual.n[0] = 256;
+            residual.n[1] = 256;
+            residual.n[2] = 1;
+            residual.u[0] = YUUKA_DTYPE_Q4_K;
+            ok = expect(yuuka_plan_add(plan, &residual), YUUKA_OK, "GEMV_RESIDUAL valid") && ok;
+            yuuka_op pair = make_op(YUUKA_OP_GEMV_PAIR, packed);
+            pair.buf[1] = packed;
+            pair.buf[2] = rows;
+            pair.buf[3] = rows;
+            pair.n[0] = 256;
+            pair.n[1] = 256;
+            pair.n[2] = 256;
+            pair.u[0] = YUUKA_DTYPE_Q4_K;
+            pair.u[1] = YUUKA_DTYPE_Q4_K;
+            pair.u[2] = 0;
+            ok = expect(yuuka_plan_add(plan, &pair), YUUKA_OK, "GEMV_PAIR valid") && ok;
+            // The SwiGLU epilogue consumes the second row and needs equal widths.
+            yuuka_op swiglu = pair;
+            swiglu.u[2] = 1;
+            swiglu.n[2] = 128;
+            ok = expect(yuuka_plan_add(plan, &swiglu), YUUKA_ERR_INVALID_ARGUMENT,
+                        "GEMV_PAIR swiglu unequal widths") && ok;
+            // A mixed-dtype pair would need a run-time dispatch the kernel does
+            // not take, so it is rejected instead of being run the slow way.
+            yuuka_op mixed = pair;
+            mixed.u[1] = YUUKA_DTYPE_Q6_K;
+            ok = expect(yuuka_plan_add(plan, &mixed), YUUKA_ERR_UNSUPPORTED,
+                        "GEMV_PAIR mixed dtypes") && ok;
+            // An unsupported input width is rejected before the kernel sees it.
+            yuuka_op narrow_in = residual;
+            narrow_in.n[0] = 192;
+            ok = expect(yuuka_plan_add(plan, &narrow_in), YUUKA_ERR_UNSUPPORTED,
+                        "GEMV_RESIDUAL unaligned input") && ok;
+            yuuka_buffer_free(rows);
+            yuuka_buffer_free(packed);
+        }
         yuuka_buffer_free(wide);
     }
 

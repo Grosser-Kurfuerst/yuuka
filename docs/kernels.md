@@ -117,6 +117,7 @@ hard-coded from another GPU.
 | --- | --- | --- |
 | `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
 | `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
+| `lm_head_stream` epilogues | Decode matvec (selected) | Same streaming kernel with the residual add in the epilogue, or walking a second packed matrix to form the SwiGLU product (`GEMV_RESIDUAL`, `GEMV_PAIR`) |
 | `recurrent_token` | Gated delta-net per-token state (selected) | Head state in registers across four thread groups, decay and update fused in one pass, gated RMSNorm folded in |
 | `conv_l2norm` | Recurrent convolution and q/k L2 norm (selected) | One block per 256 channels, whole norm groups per block, ring state advanced in place |
 | `gemv_q4_k` / `gemv_q6_k` / `gemv_q8_0` / `gemv_q4_0` / `gemv_q5_0` | Decode fallback, narrow projections, kernel reference | Packed reads, fused dequantization, block reduction |
@@ -190,6 +191,24 @@ from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1), so the
 selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
 family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
 recurrent projections are the only decode shapes that land on the fallback.
+
+**Epilogues and the two-matrix form (roadmap4 D5).** The same kernel carries two
+plan-selected extensions. `GEMV_RESIDUAL` adds a residual row to every output
+element in the epilogue, which folds the ADD that ends a sub-layer into the
+projection and lets the output alias the residual row. `GEMV_PAIR` walks a second
+packed matrix of the same dtype in the same block over the same staged activation
+row, either writing both rows or forming `silu(A x) * (B x)`, which replaces
+`ffn_gate`, `ffn_up`, and `SILU_MUL` with one operation. Both are plan-build-time
+choices; the plain form stays for the int8 and per-row routes.
+
+Three shapes of this idea were measured and rejected (roadmap4 8.5): eight output
+channels per wave (28% slower, the wider wave spills), a 512-value K step (7%
+slower, the staging tile costs more than the barriers it removes), and a pair that
+dispatches the decoder at run time so the two matrices could mix dtypes (40%
+slower than the templated decode, because the switch dominates a loop that runs
+0.3 instructions per weight). A pair of matrices whose widths differ by 8:1
+(`q` and `k`) is also slower than two launches, because the grid follows the wider
+matrix.
 
 **Int8 variant, implemented and not selected.** `gemv_i8_kernel` keeps the same
 mapping but dots the four packed digits of a lane against the Q8_1 activation
@@ -1062,6 +1081,14 @@ per plan, not per tensor per token.
 Dispatch is recorded in one explicit Go selector:
 `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
 rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
+The decode plan decides the fused matvec forms when it is built, not at run time:
+`Model.decodeMatmulResidual` takes the residual epilogue when the streaming route
+is selected, and `Model.decodeMatmulPair` takes the two-matrix form when both
+shapes are on the streaming route, the two weight dtypes are equal, and — for the
+SwiGLU epilogue — the widths match. Everything else keeps the separate
+operations, and `Options.NoResidualFusion` / `Options.NoPairFusion` restore them
+for differential measurement.
+
 The decode plan builds a recurrent layer from `RECURRENT_TOKEN` and
 `CONV_L2NORM` when the model's geometry is inside what those kernels are compiled
 for (a 128-wide state and 256-aligned channel counts) and from the five separate

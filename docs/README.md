@@ -146,7 +146,10 @@ Implemented and tested:
   reachable through `Options.LegacyDeltaNet`. The CLI and server select HIP with
   `--backend hip` when built with `-tags hip`.
 - Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
-  event profile path, and per-quantization/per-batch decode baselines.
+  event profile path, and per-quantization/per-batch decode baselines. The decode
+  matvec carries two plan-selected fusions: the residual add in its epilogue and
+  a two-matrix form that forms the gate/up pair and its SwiGLU product in one
+  launch, which removed 128 operations from a decode step.
 - CPU reference dequantization and matrix-vector products for `IQ2_XXS`,
   `IQ2_S`, and `IQ3_S`, validated against ggml's dequantizers on blocks from
   Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf. HIP kernels for these IQ types are not

@@ -17,14 +17,14 @@ import (
 // one gfx1151 device with Qwen3.5-4B-Q4_K_M. The operation count is structural
 // and exact; the timings track the current tree and are re-recorded when a
 // roadmap4 stage lands, because each stage moves them by design: 97.6 ms in the
-// D0 record, 89.4 ms after D1 (section 4.5), 31.6 ms after D2 (section 5.5), and
-// the values below after D4 (section 7.5), which replaced five delta-net
-// operators per recurrent layer with two. The per-stage history stays in
-// docs/roadmap4.md.
+// D0 record, 89.4 ms after D1 (section 4.5), 31.6 ms after D2 (section 5.5), the
+// D4 values of section 7.5, and the values below after D5 (section 8.5), which
+// folded the residual add and the gate/up pair into the matvec. The per-stage
+// history stays in docs/roadmap4.md.
 const (
-	decodeBaselineOps     = 507
-	decodeBaselineTotalMS = 24.258
-	decodeBaselineGemvMS  = 21.438
+	decodeBaselineOps     = 379
+	decodeBaselineTotalMS = 23.400
+	decodeBaselineGemvMS  = 21.050
 )
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated
@@ -49,6 +49,14 @@ func TestGPUProfileDecode(t *testing.T) {
 	// activation group. Unset keeps the default FP32 streaming route.
 	opts := Options{}
 	route := "fp32 streaming"
+	// YUUKA_TEST_DECODE_UNFUSED=1 builds the plan without the D5 residual
+	// epilogue and gate/up pair, which is how the same-session A/B of roadmap4
+	// section 8.5 measured the fusions.
+	if os.Getenv("YUUKA_TEST_DECODE_UNFUSED") != "" {
+		opts.NoResidualFusion = true
+		opts.NoPairFusion = true
+		route += ", fusions off"
+	}
 	switch route8 := os.Getenv("YUUKA_TEST_DECODE_INT8"); route8 {
 	case "":
 	case "fused":
@@ -131,6 +139,8 @@ func (s decodeSample) gbps() float64 {
 // count for everything else.
 func (s decodeSample) shapeText() string {
 	switch {
+	case s.info.Code == hip.OpGemvPair:
+		return fmt.Sprintf("%d->%d x2", s.nIn, s.nOut)
 	case s.matmul:
 		text := fmt.Sprintf("%d->%d", s.nIn, s.nOut)
 		if s.rows > 1 {
@@ -168,7 +178,7 @@ func decodeSamples(shadow []hip.OpInfo, times []hip.OpTime, names map[uintptr]st
 		}
 		switch info.Code {
 		case hip.OpGemv, hip.OpGemvBatch, hip.OpGemm, hip.OpLMHead, hip.OpGemvQ8_1,
-			hip.OpGemmSwiglu, hip.OpQuantQ8_1:
+			hip.OpGemmSwiglu, hip.OpQuantQ8_1, hip.OpGemvResidual, hip.OpGemvPair:
 			s.dtype = tensor.DType(info.U[0])
 			s.hasDType = true
 		}
@@ -228,13 +238,22 @@ func operationTraffic(info hip.OpInfo) (moved uint64, matmul bool, rows int64) {
 		batch = 1
 	}
 	switch info.Code {
-	case hip.OpGemv, hip.OpLMHead, hip.OpGemvQ8_1:
+	case hip.OpGemv, hip.OpLMHead, hip.OpGemvQ8_1, hip.OpGemvResidual:
 		dtype := tensor.DType(info.U[0])
 		rowBytes, err := dtype.RowBytes(info.N[0])
 		if err != nil {
 			return 0, false, 0
 		}
 		return uint64(rowBytes) * uint64(info.N[1]), true, 1
+	case hip.OpGemvPair:
+		// Two packed matrices read by one launch; they may differ in dtype and
+		// width.
+		rowA, errA := tensor.DType(info.U[0]).RowBytes(info.N[0])
+		rowB, errB := tensor.DType(info.U[1]).RowBytes(info.N[0])
+		if errA != nil || errB != nil {
+			return 0, false, 0
+		}
+		return uint64(rowA)*uint64(info.N[1]) + uint64(rowB)*uint64(info.N[2]), true, 1
 	case hip.OpGemvBatch:
 		dtype := tensor.DType(info.U[0])
 		rowBytes, err := dtype.RowBytes(info.N[0])
@@ -332,7 +351,8 @@ func newDecodeReport(samples []decodeSample) *decodeReport {
 		r.total += s.ms
 		if s.info.Code == hip.OpGemv || s.info.Code == hip.OpLMHead ||
 			s.info.Code == hip.OpGemvBatch || s.info.Code == hip.OpGemm ||
-			s.info.Code == hip.OpGemvQ8_1 {
+			s.info.Code == hip.OpGemvQ8_1 || s.info.Code == hip.OpGemvResidual ||
+			s.info.Code == hip.OpGemvPair {
 			r.matmul += s.ms
 		}
 		if row, ok := codes[s.info.Code]; ok {

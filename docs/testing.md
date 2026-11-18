@@ -223,6 +223,24 @@ Qwen3.5-4B recurrent layer:
   are rejected with `YUUKA_ERR_UNSUPPORTED`, so a plan builder that selected the
   fused pair for an unsupported geometry fails instead of running.
 
+`tests/hip/plan_validation_test.cpp` covers the two fused matvec forms as well:
+an undersized buffer, a mixed-dtype pair, a SwiGLU pair with unequal widths, and
+an input width that is not a multiple of 256 are each rejected at plan
+construction.
+
+`TestGPUDecodeFusionsMatchUnfused` is the same differential for the D5 matvec
+fusions: the default plan against `Options{NoResidualFusion, NoPairFusion}`, with
+the operation counts of both asserted (64 `GEMV_RESIDUAL` and 32 `GEMV_PAIR`
+against 64 `ADD` and 32 `SILU_MUL`) and eight greedy steps compared at 1e-3. The
+fusions move work rather than arithmetic, so the two plans agree bit for bit.
+
+`TestGPUGraphReplayMatchesAndTimes` runs the same greedy loop on a plain session
+and on one with `Options.EnableGraph`, requires identical tokens, and reports both
+step times. It is the measurement behind the D5 gap gate: replay removes every
+per-operation host submission, so a ratio near one says there is no submission gap
+left to remove. It asserts correctness only, because a timing assertion on an
+unpinned clock is not a gate.
+
 `TestGPUFusedDeltaNetMatchesLegacy` is the full-model differential: it builds the
 default plan and the `Options.LegacyDeltaNet` plan, checks the operator counts of
 both, and compares eight greedy decode steps (identical tokens, 9.5e-6 maximum
@@ -428,19 +446,25 @@ per-operation, per-tensor, and per-dtype tables plus one line per plan index
 sorted by time. It is opt-in through `YUUKA_TEST_MODEL`, and it gates the result
 against the recorded attribution of
 [roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18): the plan must hold
-the recorded 507 operations, the profiled total must stay inside a wide band
-around the recorded 24.258 ms, and the matvec share must stay within five points
+the recorded 379 operations, the profiled total must stay inside a wide band
+around the recorded 23.400 ms, and the matvec share must stay within five points
 of the recorded share. The bands are wide because device clocks are not pinned,
 and the recorded constants are re-recorded when a roadmap4 stage lands, because
 each stage moves the total by design: 97.6 ms in the D0 record, 89.4 ms after D1,
-31.6 ms after D2, 24.3 ms after D4, in 579 operations until D4 folded the five
-delta-net operators of a recurrent layer into two and the count became 507. The
-operation count is exact because it is structural, so a plan change is always
-visible, and a change that moves the attribution outside the bands has to
-re-record the constants and the document rather than pass silently. Sections 5.5
-and 7.5 of roadmap4 keep the per-stage history. Event instrumentation adds a
+31.6 ms after D2, 24.3 ms after D4, and 23.4 ms after D5, in 579 operations until
+D4 folded the five delta-net operators of a recurrent layer into two (507) and D5
+folded the residual add and the gate/up pair into the matvec (379). The operation
+count is exact because it is structural, so a plan change is always visible, and a
+change that moves the attribution outside the bands has to re-record the constants
+and the document rather than pass silently. Sections 5.5, 7.5, and 8.5 of
+roadmap4 keep the per-stage history. Event instrumentation adds a
 submission gap per operation, so the totals exceed a release run and are a
 diagnosis, not a benchmark result.
+
+`YUUKA_TEST_DECODE_UNFUSED=1` builds the same plan without the D5 residual
+epilogue and gate/up pair, which is the same-session A/B of roadmap4 section 8.5:
+the two runs differ only in the fused operations, so the difference in the report
+is what the fusions are worth.
 
 `YUUKA_TEST_DECODE_INT8=fused` or `=prequantized` runs the same attribution with
 the opt-in int8 decode matvec instead of the FP32 streaming kernel, which is how

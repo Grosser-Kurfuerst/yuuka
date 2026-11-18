@@ -53,7 +53,7 @@ document in the same change.
 | D2: channel-parallel decode GEMV | **Done** (2026-11-18); isolated-width gate partly met, see 5.5 | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
 | D3: Q8_1 activations with `dp4a` | **Implemented** (2026-11-18); gate missed, not selected, see 6.5 | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
 | D4: gated delta-net per-token kernel | **Done** (2026-11-18); both gates met, see 7.5 | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
-| D5: launch gaps and operator fusion | Not started | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
+| D5: launch gaps and operator fusion | **Implemented** (2026-11-18); gap gate met, throughput gate missed, see 8.5 | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
 
 D0 is implemented; its record is 3.4 and its measurements are in
 [benchmarks.md](benchmarks.md#decode-matvec). D1 is implemented and meets its
@@ -62,7 +62,11 @@ the isolated-width gate met on nine of twelve shapes; its record is 5.5. D3 is
 implemented and measured, misses both gates, and is not the selected route; its
 record is 6.5. D4 is implemented and meets both gates: the delta-net unit of all
 24 recurrent layers fell from 7.72 ms to 0.79 ms and decode from 29.92 to 38.02
-tok/s; its record is 7.5. D5 is not started. The measurements in section 2
+tok/s; its record is 7.5. D5 is implemented: the decode plan lost 128 operations
+(507 to 379), the step fell from 24.3 to 23.4 ms and decode reached 38.7 tok/s,
+but the throughput gate of 45 tok/s is missed because the matvec family runs at
+130 GB/s inside a step against the 190 GB/s the gate assumes; its record is 8.5.
+The measurements in section 2
 describe the tree at commit
 `bfd36c0` and are the baseline each gate is compared against; each stage record
 states what that stage moved.
@@ -979,32 +983,134 @@ operations.
 - Cancellation, event-lifetime, and leak checks from
   [testing.md](testing.md) stay green, including `go test -race ./...`.
 
+### 8.5 Implementation (2026-11-18)
+
+Two fusions are implemented and selected; the rest of 8.2 was measured and
+either rejected or left open with the evidence below. Decode moved from 38.02 to
+38.7 tok/s, the gap gate is met, and the throughput gate is not: the matvec
+family, not the launch structure, is now the only large term, and this stage did
+not move it far enough.
+
+Added:
+
+- `YUUKA_OP_GEMV_RESIDUAL` (41): the streaming matvec of D2 with the residual add
+  in its epilogue, so the projection that ends a sub-layer no longer needs an ADD
+  operation of its own. `out = W x + residual`, and the output may alias the
+  residual row, which is how the plan ends `attn_output`, `ssm_out`, and
+  `ffn_down` in place.
+- `YUUKA_OP_GEMV_PAIR` (42): two single-row matvecs over one activation row in
+  one launch, with `u[2]` selecting the epilogue. Epilogue 0 writes both rows;
+  epilogue 1 forms `silu(A x) * (B x)`, which replaces `ffn_gate`, `ffn_up`, and
+  `SILU_MUL` with one operation. Both matrices carry one dtype, because the
+  templated decode is what makes the pair pay (see the rejected variants below).
+- ABI 7, `AddGemvResidualAt` and `AddGemvPairAt` in Go, and
+  `Model.decodeMatmulResidual` / `Model.decodeMatmulPair` as the single decision
+  points. `Options.NoResidualFusion` and `Options.NoPairFusion` restore the
+  unfused plan for the differential test and for A/B measurement.
+
+What the fusions are worth, measured in one session on the same plan input
+(`TestGPUProfileDecode` with and without `YUUKA_TEST_DECODE_UNFUSED=1`):
+
+| Plan | Operations | Matvec | Everything else | Step |
+| --- | ---: | ---: | ---: | ---: |
+| fusions off | 507 | 21.452 ms | 3.01 ms | 24.461 ms |
+| fusions on | 379 | 21.104 ms | 2.39 ms | **23.492 ms** |
+
+so the pair saves 0.62 ms of non-matvec work and 0.35 ms of matvec, which is
+4.0% of the step. End to end, same flags: 3.341 s -> 3.280 s for 128 decode
+tokens, 38.02 -> 38.70 tok/s, and 7.547 -> 7.429 s at 256 tokens. The fused and
+unfused plans produce bit-identical logits over eight greedy steps
+(`TestGPUDecodeFusionsMatchUnfused`, maximum difference 0), because the fusions
+move work and not arithmetic.
+
+Measured and rejected, each with the number that rejected it:
+
+| Variant | Result | Why |
+| --- | --- | --- |
+| Eight output channels per wave in the streaming kernel | 25.9 ms step (21.8 ms matvec) against 20.3 ms | 28% slower: the wider wave spills the weight registers it keeps live per K step |
+| `kStepK` 512 instead of 256 | 24.2 ms step (21.8 ms matvec) | 7% slower: the larger staging tile costs more than the barriers it removes |
+| Pair with a run-time dtype dispatch per span | 13.8 ms of pairs at 97 GB/s | 40% slower than the templated decode: the switch dominates a 0.3-instruction-per-weight loop |
+| Pair of `q` and `k` (8192 and 1024 wide) | 1.42 ms against 1.02 ms separate | the grid follows the wider matrix, so 3/4 of the blocks stage the row only to walk it for nothing |
+| Merge `ssm_alpha` and `ssm_beta` | not done | both are 32-output per-row shapes, where the streaming form measures 5 GB/s against 8.9; a merge needs a per-row pair kernel, which is open work |
+
+HIP Graph replay does not pay, re-measured on the reduced plan
+(`TestGPUGraphReplayMatchesAndTimes`): 22.398 ms per step plain against 22.385 ms
+replayed over 32 steps, a ratio of 0.999, with identical tokens. That is also the
+strongest evidence for the gap gate: replay removes every per-operation host
+submission, and it moves the step by 0.01 ms. The reason the gap is already gone
+is that the executor enqueues four hundred asynchronous launches ahead of the
+device, so the host stays ahead of a 23 ms step; the per-operation event
+instrumentation costs more than the gap it would measure (the instrumented sum
+exceeds the un-instrumented step by about 1 ms).
+
+Gates of 8.3:
+
+- Inter-operation time at 1.5 ms or less: **met**. End-to-end minus the profiled
+  sum is now negative for the plain path (the instrumentation costs about 1 ms on
+  379 operations), and graph replay, which is the direct measurement of the
+  submission side, changes the step by 0.01 ms.
+- Decode at 45 tok/s or more: **missed**, at 38.70 tok/s (3.280 s for 128 decode
+  tokens). The gate's decomposition assumes 2.726 GB of weights at 190 GB/s, that
+  is 14.3 ms of matvec; the step measures 21.0 ms at 129.7 GB/s. Every matvec
+  whose matrix is 5-19 MB pays a fixed in-kernel cost of about 22 us, and 192
+  such launches account for the 6.7 ms difference. This stage could amortize that
+  cost only where two projections of the same dtype and comparable width share a
+  row: `ffn_gate` plus `ffn_up` runs at 160 GB/s merged, against 130 GB/s for the
+  same bytes separately, and the largest single kernel in the model (`lm_head`,
+  521 MB) reaches 186 GB/s in step. A descriptor-driven kernel that merges every
+  projection reading one row, regardless of dtype and width, is the next lever
+  and is recorded as an open item rather than claimed.
+- Cancellation, event lifetime, and leak checks: green; `go test -race ./...` and
+  the scheduler and serving suites pass unchanged.
+
+Three items of 8.2 were measured as not worth building, and the reasons belong
+next to the ones that were:
+
+- Folding the D3 activation quantization into its consumers has nothing to fold:
+  D3's int8 route is not the selected one (6.5), so no decode matvec reads a
+  quantized row.
+- Fusing RMSNorm into the matvec prologue would make every block of the matvec
+  recompute the row norm, because the reduction spans the whole hidden row and a
+  matvec block owns only 32 output channels. The norm row is 10 KB against the
+  46 KB of weights a block reads, so the trade is a full extra read of the row per
+  block plus a block barrier per block, against the 12 us the separate norm
+  kernel costs. At the widths this model uses the fusion cannot win, and the
+  measurement that would settle it needs the descriptor kernel below.
+- Fusing RoPE and the KV write into the attention prologue changes the operator
+  boundary of the paged attention contract (serving.md and kernels.md section 7
+  own it) for 0.15 ms of the step. It is not attempted in this stage.
+
+Two other observations belong here. The CLI's decode rate sits about 3 ms per
+token below the step the GPU reports, because the host samples 248,320 logits and
+copies the row device-to-host once per token; that cost is outside the plan and
+was not addressed by this stage. And the matvec family is now 89.8% of the step,
+so any further decode work is a matvec work.
+
 ## 9. End-to-end acceptance
 
 The stage gates are individually necessary; the plan is done when the whole
 matrix holds on the reference device, measured under
 [testing.md](testing.md)'s protocol with the metadata of 2.1:
 
-| Test | Current | After D1 (measured) | After D2 (measured) | After D3 (measured) | After D4 (measured) | After D5 | llama.cpp |
+| Test | Current | After D1 (measured) | After D2 (measured) | After D3 (measured) | After D4 (measured) | After D5 (measured) | llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | **29.91** (gate missed) | **38.02** | 45 | 62.39 |
-| Step time, release | 104.1 ms | **95.1 ms** | **33.4 ms** | 31 ms | **26.1 ms** | 19 ms | 16.03 ms |
-| Step time, profiled | 97.6 ms | **89.0 ms** | **31.6 ms** | - | **24.28 ms** | - | - |
-| Decode p50, 128 tokens | 13.21 s | **12.08 s** | **4.25 s** | - | **3.34 s** | - | 2.05 s |
-| Matvec bandwidth, in step | 31 GB/s | **34.5** | **126.5** | 185 | **126.7** | 190 | about 170 |
-| Matvec bandwidth, isolated | 46 GB/s | **186** | **184-287** | 185 | **376** (delta-net state) | 190 | about 170 |
-| Prefill pp128 tok/s | 1359.9 | **1465** | **1484** | unchanged | **1507** | unchanged | 1766.6 |
+| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | **29.91** (gate missed) | **38.02** | **38.70** (gate missed) | 62.39 |
+| Step time, release | 104.1 ms | **95.1 ms** | **33.4 ms** | 31 ms | **26.1 ms** | **25.6 ms** | 16.03 ms |
+| Step time, profiled | 97.6 ms | **89.0 ms** | **31.6 ms** | - | **24.28 ms** | **23.40 ms** | - |
+| Decode p50, 128 tokens | 13.21 s | **12.08 s** | **4.25 s** | - | **3.34 s** | **3.28 s** | 2.05 s |
+| Matvec bandwidth, in step | 31 GB/s | **34.5** | **126.5** | 185 | **126.7** | **129.7** | about 170 |
+| Matvec bandwidth, isolated | 46 GB/s | **186** | **184-287** | 185 | **376** (delta-net state) | **160** (merged pair) | about 170 |
+| Prefill pp128 tok/s | 1359.9 | **1465** | **1484** | unchanged | **1507** | **1501** | 1766.6 |
 
-The After-D1, After-D2, After-D3, and After-D4 columns are measured (4.5, 5.5,
-6.5, 7.5); the D5 column is arithmetic from the traffic floors of 2.8 and the
-gates of section 8, not a measurement, and every cell must be replaced by a
-measured value before this document claims it. The tg128 columns after D2 carry
-the gate value, which is deliberately below the projection: section 8.3 projects
-52 tok/s from a 19 ms step and gates at 45; D4 measured 38.02, above its own gate
-of 37. After D3 the matvec row stays at the measured in-step rate because D3's
-route was not selected, and after D4 the isolated row is the delta-net state rate
-of the RECURRENT cell: the matvec isolated rate did not change. The reference
-column is measured.
+Every column from After-D1 to After-D5 is measured (4.5, 5.5, 6.5, 7.5, 8.5).
+The tg128 columns after D2 carry the gate value, which is deliberately below the
+projection: section 8.3 projects 52 tok/s from a 19 ms step and gates at 45; D4
+measured 38.02, above its own gate of 37, and D5 measured 38.70, below its gate of
+45 and recorded as such. After D3 the matvec row stays at the measured in-step
+rate because D3's route was not selected; after D4 the isolated row is the
+delta-net state rate of the RECURRENT cell, and after D5 it is the rate of the
+merged gate/up pair, because the family's isolated rate did not change
+otherwise. The reference column is measured.
 
 Additional acceptance:
 

@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 6
+const RequiredABI = 7
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -704,6 +704,82 @@ func (p *Plan) AddConvL2Norm(convState, weights, qkv, out *Buffer, channels, ker
 	op.n[4] = C.uint64_t(stateSize)
 	op.f[0] = C.float(eps)
 	op.f[1] = C.float(qScale)
+	return p.add(op)
+}
+
+// AddGemvResidualAt appends the streaming matvec of roadmap4 D5 with the
+// residual epilogue: out = W*x + residual. out may alias residual, which is how
+// the decode plan ends a sub-layer in one launch instead of a matvec plus an ADD.
+// The shape and dtype rules are those of AddLMHeadAt, and rows must be 1..16.
+func (p *Plan) AddGemvResidualAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, res *Buffer, resOff uint64, nIn, nOut, rows int64, dtype tensor.DType) error {
+	if err := p.check(w, x, out, res); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_RESIDUAL}
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	op.buf[2] = out.ptr
+	op.buf[3] = res.ptr
+	op.off[0] = C.uint64_t(wOff)
+	op.off[1] = C.uint64_t(xOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.off[3] = C.uint64_t(resOff)
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(rows)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// Epilogues of AddGemvPairAt.
+const (
+	// PairWriteBoth writes both projection rows.
+	PairWriteBoth = 0
+	// PairSwiglu writes silu(A*x) * (B*x) into the first output and requires equal
+	// output widths.
+	PairSwiglu = 1
+)
+
+// AddGemvPairAt appends two single-row matvecs over one activation row as a
+// single launch (roadmap4 D5). The two matrices may differ in packed dtype and
+// width, which is what lets the plan merge projections that are independent but
+// share their input row. With PairSwiglu the second output is unused and nil is
+// allowed; with PairWriteBoth both outputs are written.
+func (p *Plan) AddGemvPairAt(a *Buffer, aOff uint64, b *Buffer, bOff uint64, x *Buffer, xOff uint64, outA *Buffer, outAOff uint64, outB *Buffer, outBOff uint64, nIn, nOutA, nOutB int64, dtypeA, dtypeB tensor.DType, epilogue int) error {
+	if err := p.check(a, b, x, outA); err != nil {
+		return err
+	}
+	if outB == nil {
+		if epilogue != PairSwiglu {
+			return errors.New("hip: a gemv pair that writes both rows needs both outputs")
+		}
+	} else if err := p.check(outB); err != nil {
+		return err
+	}
+	if epilogue != PairWriteBoth && epilogue != PairSwiglu {
+		return fmt.Errorf("hip: unknown gemv pair epilogue %d", epilogue)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_PAIR}
+	op.buf[0] = a.ptr
+	op.buf[1] = b.ptr
+	op.buf[2] = x.ptr
+	op.buf[3] = outA.ptr
+	if outB != nil {
+		op.buf[4] = outB.ptr
+	}
+	op.off[0] = C.uint64_t(aOff)
+	op.off[1] = C.uint64_t(bOff)
+	op.off[2] = C.uint64_t(xOff)
+	op.off[3] = C.uint64_t(outAOff)
+	if outB != nil {
+		op.off[4] = C.uint64_t(outBOff)
+	}
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOutA)
+	op.n[2] = C.uint64_t(nOutB)
+	op.u[0] = C.uint32_t(dtypeA)
+	op.u[1] = C.uint32_t(dtypeB)
+	op.u[2] = C.uint32_t(epilogue)
 	return p.add(op)
 }
 

@@ -74,9 +74,13 @@ type prefillActivations struct {
 
 // Options configures a shared GPU model and its KV pool.
 type Options struct {
-	Blocks        int
-	BlockSize     int
-	PrefillChunk  int
+	Blocks       int
+	BlockSize    int
+	PrefillChunk int
+	// EnableGraph lets the session capture the decode plan into a HIP Graph
+	// after GraphMinSteps steps and replay it; serving.md owns the contract and
+	// the CLI and server leave it off. roadmap4 D5 re-measured the replay path
+	// on the reduced decode plan.
 	EnableGraph   bool
 	GraphMinSteps int
 	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
@@ -106,6 +110,15 @@ type Options struct {
 	// It exists so the two activation sources can be measured against each other;
 	// the fused form is the selected one (docs/benchmarks.md).
 	PrequantizedInt8 bool
+	// NoResidualFusion keeps the decode matvec that ends a sub-layer and the
+	// separate residual ADD as two operations instead of letting the matvec add
+	// the residual in its epilogue, which is the default (roadmap4 8.2).
+	NoResidualFusion bool
+	// NoPairFusion keeps two projections that share an activation row as two
+	// launches instead of the fused pair that forms both dots over one traversal,
+	// which is the default. With the SwiGLU epilogue it also restores the
+	// separate SILU_MUL.
+	NoPairFusion bool
 	// LegacyDeltaNet builds the recurrent layer from the separate CONV1D,
 	// L2NORM, GDN, and GATED_RMSNORM operations instead of the fused
 	// CONV_L2NORM and RECURRENT_TOKEN pair, which is the selected path. It
@@ -154,6 +167,8 @@ type Model struct {
 	int8Matvec           bool
 	prequantizedInt8     bool
 	legacyDeltaNet       bool
+	noResidualFusion     bool
+	noPairFusion         bool
 	// int8Act and int8ActWidth record the activation row whose Q8_1 digits the
 	// int8 matvecs of the current group read. They are a build-time check: the
 	// plan is sequential, so a matvec on any other row means the planner forgot
@@ -214,6 +229,8 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		int8Matvec:           opts.Int8Matvec,
 		prequantizedInt8:     opts.PrequantizedInt8,
 		legacyDeltaNet:       opts.LegacyDeltaNet,
+		noResidualFusion:     opts.NoResidualFusion,
+		noPairFusion:         opts.NoPairFusion,
 		device:               device,
 		stream:               stream,
 		event:                event,

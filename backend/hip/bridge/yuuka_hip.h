@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 6
+#define YUUKA_HIP_ABI_VERSION 7
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -141,7 +141,9 @@ typedef enum yuuka_op_code {
     YUUKA_OP_LM_HEAD = 37,
     YUUKA_OP_GEMV_Q8_1 = 38,
     YUUKA_OP_RECURRENT_TOKEN = 39,
-    YUUKA_OP_CONV_L2NORM = 40
+    YUUKA_OP_CONV_L2NORM = 40,
+    YUUKA_OP_GEMV_RESIDUAL = 41,
+    YUUKA_OP_GEMV_PAIR = 42
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -315,7 +317,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * GEMV, GEMM, GEMM_SWIGLU, GEMV_BATCH, LM_HEAD, the legacy single-token family (RMSNORM, L2NORM,
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
  * COPY, SCALE, and KV_WRITE), the fused delta-net pair (CONV_L2NORM and
- * RECURRENT_TOKEN), and the chunked prefill family are validated when
+ * RECURRENT_TOKEN), the fused decode matvec pair (GEMV_RESIDUAL and
+ * GEMV_PAIR), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
  * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
  * DEQUANT_F16, and QUANT_Q8_1. Unsupported
@@ -374,6 +377,22 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                        of the head rather than the raw delta-net result.
  *                        state must be 128, and the operation fails with
  *                        YUUKA_ERR_UNSUPPORTED for any other width.
+ *   GEMV_RESIDUAL:       buf0 packed weights, buf1 FP32 x, buf2 FP32 out,
+ *                        buf3 FP32 residual; n={n_in,n_out,rows}; u[0]=dtype.
+ *                        Same shape rules as LM_HEAD; out = W x + residual, and
+ *                        out may alias the residual row.
+ *   GEMV_PAIR:           buf0 weights A, buf1 weights B, buf2 FP32 x,
+ *                        buf3 FP32 out A, buf4 FP32 out B;
+ *                        n={n_in,n_out_a,n_out_b}; u[0]=dtype (both matrices),
+ *                        u[2]=epilogue. Both matrices are walked over the same
+ *                        activation row in one launch, which is the decode
+ *                        counterpart of GEMM_SWIGLU and the projection merge of
+ *                        roadmap4 section 8.2. Epilogue 0 writes both rows;
+ *                        epilogue 1 requires n_out_a == n_out_b and writes
+ *                        silu(A x) * (B x) into out A with buf4 unused. u[1] must
+ *                        equal u[0]: a mixed-dtype pair is rejected, because a
+ *                        run-time dispatch inside the span loop is measured 60%
+ *                        slower than the templated decode.
  *   CONV_L2NORM:         buf0 conv state, buf1 conv weights, buf2 qkv, buf3 out;
  *                        n={channels,kernel,qk_channels,q_channels,state};
  *                        f[0]=eps; f[1]=q scale. out receives the SiLU of the
