@@ -43,6 +43,11 @@ Protocol:
   `yuuka-server` and `llama-server` with a stock streaming client on the same
   host, so TTFT includes HTTP and SSE overhead. Prompt caching is disabled on
   both sides (`--prefix-cache=false`, `"cache_prompt": false`).
+- `scripts/prefill_counters.sh` reproduces the per-MMA prefill counters
+  (instruction mix, bank conflicts, occupancy) recorded in
+  [roadmap3.md](roadmap3.md#2-baseline-attribution-2026-11-18). It profiles the
+  native sweep binary only: `rocprofv3` cannot write its database for a Go
+  process, as recorded in [testing.md](testing.md#63-what-to-measure-separately).
 - Only one benchmark process may use the GPU at a time; two processes sharing
   the device invalidate both results.
 - The llama.cpp reference is `strix-llama.cpp` commit `c8912d7f5` (build 12216,

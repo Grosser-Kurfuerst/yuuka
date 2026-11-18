@@ -346,7 +346,31 @@ with HIP events around every plan operation. It is opt-in through
 `YUUKA_TEST_MODEL`, and `YUUKA_TEST_KV=f16` selects the F16 KV pool. Use it to
 rank work; confirm any accepted change with the protocol above and report it in
 [benchmarks.md](benchmarks.md). The current attribution is recorded in the
-prefill diagnostic section of that document.
+prefill diagnostic of [roadmap3.md](roadmap3.md#2-baseline-attribution-2026-11-18).
+
+`rocprofv3` cannot profile a Go process. It writes its result database from a
+glibc `atexit` handler, and the Go runtime exits without running those
+handlers, so a `rocprofv3` session around `yuuka`, `yuuka-server`, or `go test`
+leaves no usable database. Collect per-kernel counters from the native binaries
+(`build/yuuka_prefill_sweep`, `build/yuuka_gemv_sweep`, `build/yuuka_moe_sweep`)
+and use the HIP event timings from `TestGPUProfilePrefill` for per-operation
+attribution of the engine.
+
+`scripts/prefill_counters.sh` is the reproducible procedure for that
+attribution: it verifies the recorded GGUF SHA-256 when a model is supplied,
+fails when the device is not `gfx1151`, runs
+`build/yuuka_prefill_sweep` once unprofiled, then traces it with
+`SQ_INSTS_VALU SQ_INSTS_LDS SQ_WAVES` and with `LDSBankConflict ALUStalledByLDS
+LdsLatency OccupancyPercent`, optionally traces a llama.cpp reference run, and
+reduces the databases to the per-MMA table of
+[roadmap3.md](roadmap3.md#3-stage-s0-reproducible-counter-attribution). The
+reduction lives in `scripts/prefill_counters.py` and pairs `gemm_mmq`
+dispatches with sweep cells in submission order, seven submissions per cell;
+it fails when the launch geometry no longer matches a cell rather than
+aggregating across shapes. The reference column needs one executed MMA count
+per matched reference dispatch (`--reference-mma-counts`) because only the
+reference's matrix shapes give that denominator; without it the reference side
+is reported per wave.
 
 ## 7. Metric definitions
 

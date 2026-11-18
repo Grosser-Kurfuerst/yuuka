@@ -38,16 +38,16 @@ document in the same change.
 
 | Stage | Status | Gate |
 | --- | --- | --- |
-| S0: counter and attribution tooling in `scripts/` | Not started | Reproducible counters for both engines |
+| S0: counter and attribution tooling in `scripts/` | Implemented (2026-11-18), see 3.1 | Reproducible counters for both engines |
 | S1: MMQ GEMM layout, epilogue, and K-stage pipelining | Not started | Isolated Q4_K `2560 -> 9216` at `M=512` at 19 TF/s or more |
 | S2: gated delta-net chunked form | Not started | 512-row chunk at 15 ms or less for 24 layers |
 | S3: MMA prefill attention | Not started | 512-token chunk at 6 ms or less; position 7680 at 150 ms or less |
 | S4: prefill LM head via batched GEMM | Not started | 4 ms or less per chunk |
 
-No stage is implemented. The tables in section 2 are the decision summary;
-[benchmarks.md](benchmarks.md) stays the authoritative record of measured
-throughput, and this document records the attribution that motivates the
-order.
+Only S0 is implemented; S1-S4 are not. The tables in section 2 are the decision
+summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
+measured throughput, and this document records the attribution that motivates
+the order.
 
 ## 2. Baseline attribution (2026-11-18)
 
@@ -252,6 +252,56 @@ commands.
 Acceptance: one command reproduces section 2.4 within run-to-run noise on two
 consecutive runs, and the script fails loudly when the model hash or the
 device does not match.
+
+### 3.1 Implementation (2026-11-18)
+
+`scripts/prefill_counters.sh` runs `build/yuuka_prefill_sweep` once unprofiled
+to read the cell list and achieved throughput, then twice under `rocprofv3`:
+`SQ_INSTS_VALU SQ_INSTS_LDS SQ_WAVES`, and `LDSBankConflict ALUStalledByLDS
+LdsLatency OccupancyPercent`. It prints the date, commit, host, device,
+performance level, ROCm and HIP version, and the recorded GGUF SHA-256, which it
+verifies against a supplied `--model`. It exits with status 2 when the GPU is
+not `gfx1151` or the hash differs, and when a profiled run does not exercise the
+same cells as the unprofiled one. `scripts/prefill_counters.py` reduces the
+databases to the section 2.4 table plus one machine-readable CSV row per cell.
+
+Reduction: each cell owns seven `gemm_mmq` dispatches in submission order,
+instruction counters are summed over them, and percentage and cycle counters are
+averaged over them. The per-MMA denominator is the executed MMA count, because
+sweep cells with fewer than 128 rows still run the padded tile; for the
+section 2.4 cell the executed and useful counts agree at 2,949,120 per
+submission. The reduction prints how many cells the two counts disagree on, and
+the CSV carries both counts.
+
+Two consecutive runs at `80ab905` on `gfx1151`, ROCm 10.1.0, HIP 7.16.26385,
+`power_dpm_force_performance_level=auto`, both with the GGUF SHA-256 verified
+through `--model`:
+
+| Metric | Run 1 | Run 2 | Section 2.4 |
+| --- | ---: | ---: | ---: |
+| VALU per MMA | 24.77 | 24.77 | 24.8 |
+| LDS per MMA | 4.89 | 4.89 | 4.9 |
+| `LDSBankConflict` | 35.94% | 35.94% | 35.9% |
+| ALU stalled by LDS | 0.29% | 0.29% | 0.3% |
+| `LdsLatency` | 68.21 cycles | 68.64 cycles | 67.6 cycles |
+| `OccupancyPercent` | 23.95% | 23.95% | 23.9% |
+| Waves per workgroup | 8.00 | 8.00 | 8 |
+| Achieved | 13.80 TF/s | 14.40 TF/s | 12.6 TF/s |
+
+The instruction counters reproduce to 0.1%, and `LdsLatency` moves by about 0.6%
+between runs. The achieved throughput is the current tree's measurement (13.7
+TF/s in [benchmarks.md](benchmarks.md), 13.8-14.4 TF/s in these runs) rather than
+the 12.6 TF/s recorded in section 2.4, so that row tracks code and clock state,
+not the counters.
+
+The llama.cpp column is filled only with `--llama-bench PATH`. Normalizing the
+reference per MMA needs one executed MMA count per dispatch, which depends on
+the reference's matrix shapes and is not visible in a kernel trace; the script
+therefore reports the reference per wave unless `--reference-mma-counts`
+supplies those counts. That path has not been run against a llama.cpp binary on
+this host, so the recorded 17.1 VALU and 2.0 LDS per MMA in section 2.4 remain
+the only reference measurements. The Go `rocprofv3` limitation is documented in
+[testing.md](testing.md#63-what-to-measure-separately).
 
 ## 4. Stage S1: MMQ GEMM (highest value, 73% of the gap)
 
