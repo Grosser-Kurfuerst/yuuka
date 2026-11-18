@@ -327,7 +327,7 @@ server scheduling, so CLI and server numbers are not interchangeable.
 Per recurrent layer of a 512-row chunk, one `RECURRENT_CHUNK` op in a plan,
 20 repetitions after 3 warmups, 24 layers reported as the total. The per-token
 path is the selected one; the chunkwise form is measured for
-[kernels.md](kernels.md#65-chunkwise-gated-delta-net-form) and
+[kernels.md](kernels.md#91-chunkwise-form) and
 [roadmap3.md](roadmap3.md#51-implementation-2026-11-18).
 
 | Path / kernel | Per layer | 24 layers |

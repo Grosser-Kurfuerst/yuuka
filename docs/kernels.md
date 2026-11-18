@@ -717,7 +717,9 @@ traffic without reducing occupancy:
   The register path is the measured fast path; see the attribution in
   [benchmarks.md](benchmarks.md).
 
-### 6.5 Chunkwise gated delta-net form
+## 9. Gated delta-net
+
+### 9.1 Chunkwise form
 
 `kernels/hip/prefill/gdn_chunk.hip` implements the chunkwise WY form of the same
 recurrence and is validated against `gdn_chunk_splitreg_f32_kernel` and the CPU
@@ -797,9 +799,9 @@ Over-fusion can reduce occupancy or increase register pressure enough to lose
 performance. A fused kernel that wins on one shape may lose on another; retain
 the unfused path as a fallback when measurements justify it.
 
-## 9. Dispatch and tuning
+## 10. Dispatch and tuning
 
-### 9.1 Shape signature
+### 10.1 Shape signature
 
 Dispatch decisions and plan validation use these shape and capability fields:
 
@@ -812,7 +814,7 @@ fields they need to a concrete path, and plan construction validates supported
 dtypes, row layout, buffer ranges, and dimensions before submission. Lookup is
 per plan, not per tensor per token.
 
-### 9.2 Dispatch selection and validation
+### 10.2 Dispatch selection and validation
 
 Dispatch is recorded in one explicit Go selector:
 `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
@@ -825,7 +827,7 @@ constraints, and buffer ranges. Unsupported combinations fail during planning;
 there is no size-keyed registry, scratch registry, or graph-compatibility
 registry to consult at runtime.
 
-### 9.3 Offline tuning
+### 10.3 Offline tuning
 
 Dispatch decisions are offline. Thresholds measured on gfx1151 are encoded in
 `backend/hip.SelectPrefillPath`, keyed by dtype, shape class, and row class, and
@@ -833,14 +835,14 @@ recorded with the measurement environment in [benchmarks.md](benchmarks.md).
 There is no runtime autotuner. Adding a device requires re-running the sweeps
 and updating the selector and tests.
 
-### 9.4 Fallback
+### 10.4 Fallback
 
 If a custom kernel is unavailable, unsupported for a shape, or slower than the
 library baseline, the planner selects the documented fallback. Silent numerical
 substitution is forbidden. A fallback must be visible in diagnostics and
 benchmarks.
 
-## 10. Numerical requirements
+## 11. Numerical requirements
 
 - Prefill converts FP32 activations and dequantized weights to FP16 for WMMA
   input and accumulates products in FP32. This is a documented prefill policy,
@@ -865,7 +867,7 @@ benchmarks.
   for critical operators.
 - Do not tune a kernel against a single prompt or a single shape.
 
-## 11. Kernel acceptance criteria
+## 12. Kernel acceptance criteria
 
 A kernel is not complete until:
 
