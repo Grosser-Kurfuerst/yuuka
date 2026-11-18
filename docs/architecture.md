@@ -341,7 +341,8 @@ planner either selects a measured dispatch path or fails during planning with a
 precise diagnostic. Silent numerical substitution is not allowed.
 
 Plan construction applies the same rule to every GEMV, batched GEMV, and GEMM
-operation. An unsupported dtype or a width that violates the quantization
+operation, and to the streaming LM head that the prefill tail uses. An
+unsupported dtype or a width that violates the quantization
 block layout is a capability error, and invalid dimensions, batch sizes, or
 buffer ranges are argument errors. A rejected operation is not appended to the
 plan, so execution cannot silently skip it.

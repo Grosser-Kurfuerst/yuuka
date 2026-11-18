@@ -23,11 +23,19 @@ clock, power, and thermal state are not pinned.
 | Kernel | 7.0.14-28-pve |
 | Power performance level | `auto` (amdgpu sysfs) |
 | Go | go1.24.4, Release `cmake --build build` |
-| Commit | `161fbba` |
+| Commit | `d56ad88` |
 | Tokenizer / chat template | GGUF-embedded Qwen3.5 vocabulary and template |
 | Sampling | Greedy, temperature 0 |
 | Prefill chunk | 512 tokens (`--chunk-size 512`), except where a row states otherwise |
 | Warmup / repetitions | 2 / 5 for prefill rows, 2 / 3 for decode and serving rows, median reported |
+
+Tables re-measured at the commit above are the prompt-length prefill rows, the
+correctness gates, the prefill LM head, and the kernel resource usage. The
+decode, KV-format, attention, isolated GEMM, batched GEMV, MoE, gated delta-net,
+serving, server, and llama.cpp comparison tables were measured at `161fbba` and
+were not repeated: the LM head change is confined to the prefill tail and does
+not touch the decode dispatch. `scripts/prefill_counters.sh` was rerun and still
+reproduces the recorded S1 instruction counters.
 
 Protocol:
 
@@ -65,6 +73,9 @@ Current tree, same commit:
 | `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
 | `TestGPUMatchesCPU` | first-step maximum logit difference `0.00309944`, greedy tokens match |
 | `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.9e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
+| `tests/hip/prefill_test.cpp` LM head checks | every dtype within `1.3e-4` of the host dot products for 1/3/16 rows, bitwise reproducible |
+| `TestPlanLMHeadMatchesDequant` | Q8_0 bitwise equal to the dequantized CPU dot; Q6_K within `2e-6` |
+| `yuuka run` at 101 / 501 / 2001 prompt tokens | generated tokens identical before and after the LM head change |
 | `go build ./...`, `go vet ./...`, `go test ./...`, `go test -tags hip ./...` | pass |
 
 The Q8_1 prefill path moves logits against an FP16-activation reference
@@ -80,18 +91,30 @@ stated, median of five repetitions:
 
 | Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 0.093 s | 1380.1 | 0.095 s | 1344.4 | 0.096 s | 1326.9 |
-| 512 | 0.300 s | 1704.8 | 0.313 s | 1634.8 | 0.330 s | 1553.6 |
-| 2048 | 1.194 s | 1715.2 | 1.248 s | 1641.5 | 1.524 s | 1343.7 |
-| 8192 | 5.682 s | 1441.7 | 5.696 s | 1438.2 | 9.480 s | 864.1 |
+| 128 | 0.085 s | 1511.8 | 0.095 s | 1344.4 | 0.096 s | 1326.9 |
+| 512 | 0.292 s | 1756.2 | 0.313 s | 1634.8 | 0.330 s | 1553.6 |
+| 2048 | 1.201 s | 1705.6 | 1.248 s | 1641.5 | 1.524 s | 1343.7 |
+| 8192 | 5.697 s | 1437.9 | 5.696 s | 1438.2 | 9.480 s | 864.1 |
 
-Measured 2026-11-18 after the FP16 MMA prefill attention kernel
-([kernels.md](kernels.md#75-fp16-mma-paged-prefill-attention)). F32 and F16 KV
-are now within 4% of each other at every length, because both run the same
-attention kernel; Q8_0 keeps the tiled kernel and diverges from 2048 tokens,
-where attention starts to dominate. Against the 2026-11-18 pre-S3 tree the
-same-length results are 1.06x at 512 tokens, 1.21x at 2048, and 1.64x at 8192
-for F32 KV.
+Measured 2026-11-18 after the streaming prefill LM head
+([kernels.md](kernels.md#65-streaming-lm-head)). The F32 column is a same-session
+comparison: back-to-back runs at `aec0570` with the same warmup and repetitions
+gave 1345.1 / 1626.2 / 1673.9 / 1409.2 tok/s at the four lengths, so the stage is
++12.4% / +8.0% / +1.9% / +2.0%. The gain follows the 8.4 ms the tail saves per
+chunk, which is a larger share of the shorter prompts. F32 and F16 KV are within
+4% of each other at every length, because both run the same attention kernel;
+Q8_0 keeps the tiled kernel and diverges from 2048 tokens, where attention
+starts to dominate. The F16 and Q8_0 rows are the pre-LM-head measurements and
+were not repeated.
+
+Before this stage the same table read 1380.1 / 1704.8 / 1715.2 / 1441.7 tok/s for
+F32 KV at `161fbba`. That earlier row was measured after the FP16 MMA prefill
+attention kernel ([kernels.md](kernels.md#75-fp16-mma-paged-prefill-attention)),
+which had moved the same F32 KV lengths from 1609.1 / 1415.4 / 877.7 to
+1704.8 / 1715.2 / 1441.7 at 512 / 2048 / 8192 tokens. Its values differ from the
+current ones by 0.5-1.6% at the longer prompts, which is the run-to-run noise of
+an unpinned clock on this device, so the same-session A/B above is the number to
+compare the LM head stage against.
 
 ## Decode: output length
 
@@ -257,6 +280,43 @@ K-quants win from batch 2, the other types from batch 4; the dispatch table uses
 those thresholds. Single-request decode always runs batch 1, so this table is
 prefill and batching evidence, not decode evidence.
 
+### Prefill LM head
+
+`LMHEAD` cells of `build/yuuka_prefill_sweep`: the streaming LM head against one
+GEMV submission per row, `n_in = 2560`, median of five timed submissions after
+two warmups, per-row GEMV inside one plan:
+
+| dtype | N | M | per-row GEMV | GB/s | streaming LM head | GB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q4_K | 512 | 1 | 0.039 ms | 19 | 0.024 ms | 31 |
+| Q4_K | 1024 | 1 | 0.056 ms | 26 | 0.024 ms | 62 |
+| Q4_K | 2048 | 1 | 0.098 ms | 30 | 0.035 ms | 83 |
+| Q4_K | 4096 | 1 | 0.173 ms | 34 | 0.035 ms | 167 |
+| Q4_K | 32768 | 1 | 1.876 ms | 25 | 0.319 ms | 148 |
+| Q4_K | 248320 | 1 | 15.008 ms | 24 | 2.356 ms | 152 |
+| Q4_K | 248320 | 16 | 240.817 ms | 1.5 | 6.585 ms | 54 |
+| Q6_K | 512 | 1 | 0.076 ms | 14 | 0.022 ms | 48 |
+| Q6_K | 1024 | 1 | 0.047 ms | 46 | 0.023 ms | 93 |
+| Q6_K | 2048 | 1 | 0.076 ms | 57 | 0.036 ms | 121 |
+| Q6_K | 4096 | 1 | 0.136 ms | 63 | 0.039 ms | 220 |
+| Q6_K | 32768 | 1 | 1.519 ms | 45 | 0.393 ms | 175 |
+| Q6_K | 248320 | 1 | 11.937 ms | 44 | 2.896 ms | 180 |
+| Q6_K | 248320 | 16 | 191.002 ms | 2.7 | 7.667 ms | 68 |
+| Q8_0 | 512 | 1 | 0.072 ms | 20 | 0.092 ms | 15 |
+| Q8_0 | 1024 | 1 | 0.025 ms | 111 | 0.025 ms | 110 |
+| Q8_0 | 2048 | 1 | 0.045 ms | 125 | 0.040 ms | 140 |
+| Q8_0 | 4096 | 1 | 0.089 ms | 125 | 0.036 ms | 310 |
+| Q8_0 | 32768 | 1 | 0.925 ms | 96 | 0.442 ms | 202 |
+| Q8_0 | 248320 | 1 | 7.215 ms | 94 | 3.113 ms | 217 |
+| Q8_0 | 248320 | 16 | 115.507 ms | 5.8 | 7.135 ms | 95 |
+
+The streaming form wins from 512 outputs for the K-quants and from 2048 for
+Q8_0; the dispatch rule therefore stops at 1024 outputs, where Q8_0 is level.
+The 521 MB Q6_K cell at 180 GB/s is 74% of the 244 GB/s a pure streaming read
+reaches on this device with the same matrix size, and the row count is nearly
+free: sixteen rows cost 2.6x one row instead of 16x. See
+[kernels.md](kernels.md#65-streaming-lm-head) for the kernel contract.
+
 ### Grouped MoE pipeline
 
 Synthetic single-layer shape: 128 experts, top-8, hidden 2048, expert FFN 768,
@@ -285,6 +345,8 @@ appear in the compiler's static figure.
 | Kernel | VGPR | SGPR | Static LDS |
 | --- | ---: | ---: | ---: |
 | `gemm_mmq_kernel<Q4_K>` / `<Q5_K>` / `<Q6_K>` | 176 / 177 / 162 | 48 / 48 / 52 | 0 (64512 B dynamic) |
+| `lm_head_kernel<*,1>` | 45-67 | 26-32 | 0 (dynamic `rows * 1024 B`) |
+| `lm_head_kernel<*,16>` | 97-127 | 42-44 | 0 (dynamic `rows * 1024 B`) |
 | `quantize_q8_1_kernel` | 20 | 27 | 0 |
 | `gemm_wmma_kernel<*,64,2>` | 84-89 | 28-48 | 16,384 B |
 | `gemm_wmma_k32_kernel<*>` | 42-58 | 25-46 | 14,336 B |

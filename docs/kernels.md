@@ -122,6 +122,7 @@ hard-coded from another GPU.
 | `gemm_fp16_wmma` | Prefill baseline | Tiling, WMMA, LDS, pipelining |
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
 | `gemm_q6_k_wmma` | Quantized prefill | Scale handling, tile reuse |
+| `lm_head_stream` | Prefill tail output projection | Stream each packed weight row once, reuse it across the row block |
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
 | `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
 | `paged_attention` | Decode | Block table, shared KV heads, long-context split |
@@ -469,6 +470,14 @@ baselines include the cast cost. A dispatch table entry
 is valid only for the recorded gfx1151 environment; the kernel is not selected
 from assumptions about other RDNA parts.
 
+The prefill tail (the output projection over the last chunk row, or over the
+candidate rows of a speculative block) is not on this table: it is a `N >> M`
+shape with `M <= 16`, where every route above wastes the tile on rows that do
+not exist. It runs `lm_head_stream` instead (6.5) whenever the dtype is
+supported, `n_in` is a multiple of 256, `M` is in `1..16`, and
+`N >= 1024`; anything else keeps one decode GEMV per row. The decode path itself
+is unaffected: it always uses the GEMV family.
+
 Weight reuse is a secondary effect, not the binding limit. A 32-row M tile
 makes a 512-row chunk read every weight tile 16 times, and the 64-row tile
 halves that, but halving it again with the measured 128-row tile only bought
@@ -483,10 +492,83 @@ prefill attention 19 ms at position 0 and 562 ms at position 7680; attention at
 position 7680 dropped from 2030 ms to 643 ms. The ordered optimization plan and
 per-workstream status are in [roadmap2.md](roadmap2.md).
 
+### 6.5 Streaming LM head
+
+`lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the prefill tail
+projection:
+
+```text
+out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16
+```
+
+`x` and `out` are row-major FP32 blocks, `W` is any packed dtype in the GEMV
+family, and `n_in` must be a multiple of 256 so that every K step is one
+quantization block. The kernel is not a tile GEMM: with `N` in the hundreds of
+thousands and `M = 1` every tile form wastes 15 of 16 accumulator rows, and the
+operator is pure weight bandwidth.
+
+Mapping:
+
+- One wave owns four output channels and walks the whole K axis itself. A lane
+owns four consecutive K values of each of its channels, so 32 lanes cover a
+128-value half without overlap and the packed reads of the wave are contiguous
+32-byte sectors of the four arrays a Q6_K half touches (`ql`, `qh`, `scales`,
+`d`).
+- The activation row block for the current 256-value K step is staged in
+dynamic shared memory once per workgroup, so the activations are read from L2
+once per 32 output channels instead of once per channel. The bytes are
+`rows * 256 * 4`, that is 1 KiB for the single-row tail and 16 KiB at the
+16-row cap.
+- `decode_span4` in `quant.cuh` decodes a lane's four packed values straight
+into registers, with the block base, nibble selection, and K-quant scale and
+minimum hoisted out of the four values. Each decoder restates the arithmetic of
+the per-value decoder of the same dtype, so both produce the same digits; the
+per-value form is 3.2x slower here because it recomputes the block arithmetic
+for every value.
+- `rows` is a compile-time bound, not a runtime loop bound: the single-row
+instantiation uses 45-67 VGPRs and the 16-row one 97-127, where a runtime bound
+indexes the accumulator array dynamically and spills 272 bytes per lane to
+scratch (measured 19.9 GB/s against 88 GB/s).
+- The reduction is one `shfl_xor` tree per channel per row, so a second
+identical submission is bitwise identical.
+
+Measured with the `LMHEAD` cells of `build/yuuka_prefill_sweep` (median of five
+timed submissions after two warmups) on the recorded gfx1151 device, `n_in`
+2560:
+
+| dtype | N | M | per-row GEMV | streaming LM head |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K | 248320 | 1 | 15.01 ms (24 GB/s) | 2.36 ms (152 GB/s) |
+| Q4_K | 248320 | 16 | 240.82 ms | 6.59 ms |
+| Q6_K | 248320 | 1 | 11.94 ms (44 GB/s) | 2.90 ms (180 GB/s) |
+| Q6_K | 248320 | 16 | 191.00 ms | 7.67 ms |
+| Q8_0 | 248320 | 1 | 7.22 ms (93 GB/s) | 3.11 ms (217 GB/s) |
+| Q8_0 | 248320 | 16 | 115.51 ms | 7.14 ms |
+
+In the 512-row prefill plan of `TestGPUProfilePrefill` the tail costs 2.84-2.92 ms
+of a 287 ms chunk, against 11.3 ms for the single-row GEMV tail before this
+kernel ([roadmap3.md](roadmap3.md#7-stage-s4-prefill-lm-head)). The kernel is
+bandwidth bound: the same 521 MB Q6_K matrix streams at 244 GB/s in a pure read
+loop on this device, so 2.90 ms is about 85% of that ceiling.
+
+Numerics. The per-element products are the same FP32 products the decode GEMV
+forms, including the K-quant scale-then-minimum order; only the summation order
+differs, because a lane accumulates four neighbours and the last five additions
+are a shuffle tree. `tests/hip/prefill_test.cpp` checks all eight dtypes against
+the independent host dot products for one, three, and sixteen rows and requires
+a repeated run to be bitwise identical; `TestPlanLMHeadMatchesDequant` checks
+Q6_K and Q8_0 against dequantized CPU dots (Q8_0 is bitwise equal), and the
+model-level gates are unchanged (`TestGPUMatchesCPU` 0.00309944,
+`TestGPUChunkedPrefillLongContext` top-1 `33075` with zero difference).
+
+A shape the kernel does not cover keeps the per-row GEMV tail; nothing silently
+changes numerically. The measured crossover is `N = 1024` at `n_in = 2560`,
+where Q8_0 is level with the GEMV and every other dtype is ahead; below that the
+staging of the activation tile costs more than it saves.
+
 ## 7. Attention
 
 ### 7.1 Prefill: Flash Attention
-
 `attention_prefill_f32_kernel` (and its paged counterpart) processes a prompt
 chunk with one wave per query row. A workgroup owns 16 query rows for one head
 with 512 threads.

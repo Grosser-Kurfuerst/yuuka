@@ -139,6 +139,15 @@ Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
   reference for this path: the measured difference reaches 0.04-0.14 on these
   shapes, which is quantization noise, not kernel error;
 - the rocBLAS FP16 baseline against a float reference;
+- the streaming prefill LM head for `F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`,
+  `Q4_K`, `Q5_K`, and `Q6_K` at one, three, and sixteen rows, with `N = 400` so
+  the last workgroup serves a partial channel tile, and at `K = 512` so the K
+  step count differs from the model shape. Each dtype is compared with the
+  independent host dot products and a repeated submission must be bitwise
+  identical; a plan that asks for more rows than the row cap or for a width
+  that is not a multiple of 256 must be rejected when the operation is added;
+  `backend/hip/lm_head_test.go` additionally compares Q6_K and Q8_0 against
+  dequantized CPU dots, where Q8_0 is bitwise equal;
 - row-batched and head-batched RMSNorm, batched RoPE, batch embedding, and
   batch KV writes;
 - legacy single-token embedding for Q4_0 and Q5_0, compared against the same

@@ -44,13 +44,14 @@ The repository contains an end-to-end single-node implementation:
 - HIP C ABI, plan executor, and kernels for the full `qwen35` decode and chunked
   prefill graphs. Native grouped MoE kernels remain tested, but no supported
   model runtime executes them.
-- rocWMMA/rocBLAS prefill GEMM, an int8 MMQ prefill GEMM for K-quant weights,
-  causal GQA Flash Attention, and chunked prefill.
+- rocWMMA/rocBLAS prefill GEMM, an int8 MMQ prefill GEMM for K-quant weights, a
+  streaming prefill LM head over a row block of up to 16 rows, causal GQA Flash
+  Attention, and chunked prefill.
 - Paged KV, iteration-level continuous scheduling, prefix caching, and opt-in
   HIP Graph replay.
 - `yuuka` CLI and OpenAI-compatible `yuuka-server`.
-- Native CTest coverage for the ABI, quantized GEMV, operators, GEMM, prefill,
-  paged KV/graph, embedding, and MoE kernels.
+- Native CTest coverage for the ABI, quantized GEMV, operators, GEMM, prefill
+  (including the LM head dtypes), paged KV/graph, embedding, and MoE kernels.
 
 Not yet implemented: HIP execution and IQ2/IQ3 kernels for `qwen35moe`, model
 architectures other than `qwen35` and `qwen35moe`, NPU execution (the probe is

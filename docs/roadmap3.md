@@ -42,10 +42,13 @@ document in the same change.
 | S1: MMQ GEMM layout, epilogue, and K-stage pipelining | Implemented (2026-11-18); gate missed, see 4.6 | Isolated Q4_K `2560 -> 9216` at `M=512` at 19 TF/s or more |
 | S2: gated delta-net chunked form | Implemented (2026-11-18); gate missed, see 5.1 | 512-row chunk at 15 ms or less for 24 layers |
 | S3: MMA prefill attention | Implemented (2026-11-18); gate met, see 6.1 | 512-token chunk at 6 ms or less; position 7680 at 150 ms or less |
-| S4: prefill LM head via batched GEMM | Not started | 4 ms or less per chunk |
+| S4: prefill LM head via batched GEMM | Implemented (2026-11-18); gate met, see 7.1 | 4 ms or less per chunk |
 
-S0-S3 are implemented; S1 misses its 19 TF/s gate (4.6), S2 its 15 ms gate
-(5.1), S3 meets both of its gates (6.1), and S4 is not started. The tables in section 2 are the decision summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
+S0-S4 are implemented; S1 misses its 19 TF/s gate (4.6), S2 its 15 ms gate
+(5.1), S3 meets both of its gates (6.1), and S4 meets its 4 ms gate (7.1) with
+a kernel that streams the output matrix once instead of reshaping the existing
+GEMM tiles. The tables in section 2 are the decision summary;
+[benchmarks.md](benchmarks.md) stays the authoritative record of
 measured throughput, and this document records the attribution that motivates
 the order.
 
@@ -618,6 +621,66 @@ Acceptance: 4 ms or less per chunk (from 11.3 ms), unchanged top-1 token for
 the 128/512/2048 prompt rows in [benchmarks.md](benchmarks.md), and no change
 to the decode-path GEMV dispatch.
 
+### 7.1 Implementation (2026-11-18)
+
+Both routes the stage proposed were measured first, and neither reaches the
+gate: the Stage S1 int8 MMQ kernel is MMA bound, so at one row it executes the
+same 128-row tile and costs 9.2 ms, and the WMMA kernel is 6.7 ms because 15 of
+its 16 accumulator rows are padding. The shape is `N >> M` with `M = 1`, which
+is a bandwidth question the tile forms cannot answer.
+
+`kernels/hip/gemm/lm_head.hip` therefore streams the output matrix instead:
+one wave owns four output channels, a lane decodes four consecutive K values
+of each channel into registers, and each packed weight row is read once and
+dotted against the whole activation row block, which is staged in 1-16 KiB of
+shared memory per K step. New primitives were added for it: `decode_span4` in
+`quant.cuh` (a hoisted four-value form of the existing per-value decoders for
+every dtype), `YUUKA_OP_LM_HEAD` with `yuuka_lm_head`, and
+`hip.SelectLMHeadPath`. The prefill tail selects it for 1..16 rows, a 256-wide
+K step, and `N >= 1024`; the speculative verification tail that previously ran
+one GEMV per candidate row now runs one streaming pass. Everything else,
+including the whole decode path, keeps the existing GEMV dispatch.
+
+Gates, `TestGPUProfilePrefill` at 512 rows, F32 KV, position 0, and the
+`LMHEAD` cells of `build/yuuka_prefill_sweep`:
+
+| Gate | Before | After | Target |
+| --- | ---: | ---: | ---: |
+| LM head per 512-row chunk (`lm_head` op) | 11.3 ms | 2.84-2.92 ms | 4 ms |
+| Q6_K `2560 -> 248320` at `M=1` | 11.94 ms | 2.90 ms | - |
+| Q6_K `2560 -> 248320` at `M=16` | 191.0 ms | 7.67 ms | - |
+| Q4_K `2560 -> 248320` at `M=1` | 15.01 ms | 2.36 ms | - |
+| Q8_0 `2560 -> 248320` at `M=1` | 7.22 ms | 3.11 ms | - |
+
+The tail now costs 2.9 ms of a 287 ms chunk. End to end, same-session A/B with
+`yuuka bench --decode-tokens 1 --chunk-size 512`, F32 KV, median of five: pp128
+1345.1 -> 1511.8 tok/s, pp512 1626.2 -> 1756.2, pp2048 1673.9 -> 1705.6, pp8192
+1409.2 -> 1437.9. The gain tracks the 8.4 ms the tail saves per chunk, so it is
+largest at the shortest prompt.
+
+Numerics are unchanged at the model level: `TestGPUMatchesCPU` reports the same
+`0.00309944` maximum logit difference, `TestGPUChunkedPrefillLongContext` keeps
+top-1 `33075` with zero difference at chunks 512 and 1024, and `yuuka run` at
+101, 501, and 2001 prompt tokens generates the same tokens before and after the
+change. Row reduction order differs from the GEMV tail, which is why the
+native tests gate the kernel on the host dot products rather than on bitwise
+identity with the GEMV.
+
+Rejected while building the stage, recorded here rather than kept behind a
+flag:
+
+- routing the tail through the Stage S1 MMQ GEMM: 9.2 ms at `M=1`, because the
+  128-row tile executes 128x the useful rows;
+- routing it through the custom WMMA GEMM: 6.7 ms at `M=1` and 10.6 ms at
+  `M=64`, for the same reason;
+- reusing the per-value decoders from `quant.cuh` in the streaming kernel
+  instead of the four-value form: 7.46 ms instead of 2.31 ms on Q6_K, because
+  the block arithmetic is recomputed per value;
+- a runtime row loop over one accumulator array instead of a compile-time row
+  bound: 272 bytes of scratch per lane and 19.9 GB/s instead of 88 GB/s;
+- two or eight output channels per wave instead of four: 209-218 GB/s against
+  226 GB/s on the Q6_K cell, and the two-channel form loses 0.4 ms.
+
 ## 8. Cross-cutting gates
 
 Every stage lands with:
@@ -660,6 +723,12 @@ Measured after S1 (section 4.6): a 512-token chunk takes 313 ms against the 385
 ms baseline and 287 ms projected, and pp512 is 1609-1640 tok/s against the 1784
 t/s projection, because the MMQ GEMM reached 17.3-18.5 TF/s instead of 19.
 
+Measured after S4 (section 7.1): a 512-token chunk takes 287 ms against the 236
+ms projection and pp512 is 1756 tok/s against 2174 t/s. The remaining
+difference is the two stages that missed their gates, not the LM head: S1 landed
+at 17.3-18.5 TF/s instead of 19 and S2 kept the per-token delta-net recurrence,
+whose 49-50 ms is still 34 ms above the 15 ms gate.
+
 ## 10. Rejected routes and open questions
 
 Rejected under this plan (record the measurement in the commit body if a
@@ -667,6 +736,10 @@ variant is tried again):
 
 - Adding warps or blocks before fixing the instruction mix: yuuka already
   keeps twice the reference's resident waves.
+- Running the prefill LM head through a tile GEMM (the Stage S1 MMQ kernel or
+  the custom WMMA kernel) at one row: both execute the whole tile and pay
+  9.2 ms and 6.7 ms respectively, against 2.9 ms for a kernel that streams the
+  weight rows once. The same operator is the reason the decode GEMV exists.
 - A double-buffered 128-value K stage at 60 KiB: one block per CU measured
   14.6 TF/s on the Q4_K cell against 17.1 for the 30 KiB single-buffer form
   that keeps two blocks resident.
