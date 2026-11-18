@@ -370,7 +370,9 @@ product on this device: lane `l`, element `e` holds output row
 column) and eight weight scales (its rows) per block.
 
 Both operands are staged in the fragment register order of the int8 WMMA, not in
-row-major tiles. A 16x16 int8 fragment is 256 bytes and `rocwmma` loads eight
+row-major tiles. The Q8_1 buffer itself stays row-major, so the public quantizer
+contract and the digit check in `tests/hip/prefill_test.cpp` are unchanged; the
+swizzle happens in the LDS copy of `stage_activations`. A 16x16 int8 fragment is 256 bytes and `rocwmma` loads eight
 bytes per lane, where lane `l` holds row `l%16` of the 8-value K half `l/16`.
 Staging therefore groups one 32-value K pair into a 512-byte region whose lane
 `l` slot holds 16 bytes: the first 16-value slice in bytes 0-7 and the second in

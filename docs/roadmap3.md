@@ -400,6 +400,13 @@ Changes at `8410e30` plus this stage:
 - the plan quantizes the normalized tile once per q/k/v and qkv/gate group
   (S1e).
 
+The Q8_1 buffer keeps its row-major layout, so `yuuka_quantize_q8_1`,
+`tests/hip/prefill_test.cpp`'s digit comparison, and the gate/up buffer reuse
+are unchanged; the swizzle into fragment order happens in the LDS copy inside
+`gemm_mmq_kernel`. Rewriting the quantizer to emit the staged order directly
+would save the 16-byte-to-two-8-byte split in `stage_activations`, which is
+about 0.3 instructions per MMA and would move the Q8_1 layout into the ABI.
+
 Measured with `scripts/prefill_counters.sh` on the section 2.4 cell and with
 `build/yuuka_prefill_sweep` at `M=512`:
 
