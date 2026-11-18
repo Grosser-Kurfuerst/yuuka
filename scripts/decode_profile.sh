@@ -9,7 +9,8 @@
 #    instruction counts. The sweep keeps every matrix resident, so its numbers
 #    are the hot-matrix upper bound.
 # 2. run the rows = 1 output-projection crossover sweep, the measurement behind
-#    lmHeadMinOutputs (roadmap4 section 4.2).
+#    lmHeadMinOutputs (roadmap4 section 4.2), and the int8 matvec comparison of
+#    section 6.5.
 # 3. run TestGPUProfileDecode, which attributes one real decode step per planned
 #    operation and per tensor (section 2.3).
 #
@@ -233,6 +234,12 @@ echo
 echo "== output projection crossover, rows = 1 (lmHeadMinOutputs)"
 if ! "$sweep" --threshold; then
     die "$sweep --threshold failed"
+fi
+
+echo
+echo "== int8 decode matvec against the FP32 streaming kernel"
+if ! "$sweep" --int8; then
+    die "$sweep --int8 failed"
 fi
 
 echo

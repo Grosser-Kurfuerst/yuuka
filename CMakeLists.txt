@@ -32,6 +32,7 @@ if(YUUKA_ENABLE_HIP)
         kernels/hip/attention/attention.hip
         kernels/hip/embedding/embedding.hip
         kernels/hip/gemv/gemv_quant.hip
+        kernels/hip/gemv/gemv_i8.hip
         kernels/hip/gemm/gemm.hip
         kernels/hip/gemm/wmma_gemm.hip
         kernels/hip/gemm/mmq_gemm.hip

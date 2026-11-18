@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 4
+const RequiredABI = 5
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -1046,6 +1046,91 @@ func (p *Plan) AddLMHeadAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *
 	op.n[1] = C.uint64_t(nOut)
 	op.n[2] = C.uint64_t(rows)
 	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddGemvQ8_1At appends an int8 decode matvec: out = W * x with x already
+// quantized to Q8_1 by AddQuantizeQ8_1At, which writes qs (the int8 digits) and
+// ds (the float2 block scales). Only one row is served: speculative verification
+// keeps the FP32 streaming kernel. Q4_K, Q5_K, Q6_K, and Q8_0 weights are
+// supported, nIn must be a multiple of 256, and any other shape fails here
+// rather than falling back silently.
+func (p *Plan) AddGemvQ8_1At(w *Buffer, wOff uint64, qs, ds, out *Buffer, nIn, nOut int64, dtype tensor.DType) error {
+	return p.addGemvQ8_1(w, wOff, qs, ds, out, nIn, nOut, dtype, false)
+}
+
+// AddGemvQ8_1FusedAt appends the same int8 decode matvec with the activation
+// quantized inside the matvec block: x is the FP32 activation row, the block
+// stages its digits in shared memory, and no separate quantization operation is
+// submitted for the group. It computes the same product as AddGemvQ8_1At with the
+// same quantizer contract, so the two are interchangeable per shape.
+func (p *Plan) AddGemvQ8_1FusedAt(w *Buffer, wOff uint64, x, out *Buffer, nIn, nOut int64, dtype tensor.DType) error {
+	return p.addGemvQ8_1(w, wOff, x, nil, out, nIn, nOut, dtype, true)
+}
+
+func (p *Plan) addGemvQ8_1(w *Buffer, wOff uint64, x, ds, out *Buffer, nIn, nOut int64, dtype tensor.DType, fused bool) error {
+	if nIn <= 0 || nOut <= 0 {
+		return errors.New("hip: int8 GEMV dimensions must be positive")
+	}
+	if nIn%256 != 0 {
+		return fmt.Errorf("hip: int8 GEMV width %d is not a multiple of 256", nIn)
+	}
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K, tensor.Q8_0:
+	default:
+		return fmt.Errorf("%w: hip: int8 GEMV dtype %s", ErrUnsupported, dtype)
+	}
+	rowBytes, err := dtype.RowBytes(nIn)
+	if err != nil {
+		return fmt.Errorf("hip: int8 GEMV shape: %w", err)
+	}
+	buffers := []*Buffer{w, x, out}
+	if !fused {
+		buffers = []*Buffer{w, x, ds, out}
+	}
+	if err := p.check(buffers...); err != nil {
+		return err
+	}
+	if wOff%16 != 0 {
+		return fmt.Errorf("hip: int8 GEMV weight offset %d is not 16-byte aligned", wOff)
+	}
+	if wOff > w.bytes || int64(rowBytes)*nOut > int64(w.bytes-wOff) {
+		return fmt.Errorf("hip: int8 GEMV weight buffer holds %d bytes, want %d",
+			w.bytes-wOff, int64(rowBytes)*nOut)
+	}
+	if fused {
+		if int64(x.bytes) < nIn*4 {
+			return fmt.Errorf("hip: int8 GEMV activation buffer holds %d bytes, want %d",
+				x.bytes, nIn*4)
+		}
+	} else {
+		if int64(x.bytes) < nIn {
+			return fmt.Errorf("hip: int8 GEMV digit buffer holds %d bytes, want %d",
+				x.bytes, nIn)
+		}
+		if int64(ds.bytes) < (nIn/32)*8 {
+			return fmt.Errorf("hip: int8 GEMV scale buffer holds %d bytes, want %d",
+				ds.bytes, (nIn/32)*8)
+		}
+	}
+	if int64(out.bytes) < nOut*4 {
+		return fmt.Errorf("hip: int8 GEMV output buffer holds %d bytes, want %d",
+			out.bytes, nOut*4)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_Q8_1}
+	op.off[0] = C.uint64_t(wOff)
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	if !fused {
+		op.buf[2] = ds.ptr
+	}
+	op.buf[3] = out.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.u[0] = C.uint32_t(dtype)
+	if fused {
+		op.u[1] = 1
+	}
 	return p.add(op)
 }
 

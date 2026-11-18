@@ -7,6 +7,7 @@ import (
 	"math"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
+	"github.com/yuuka-ai/yuuka/tensor"
 )
 
 // prefillMatmul appends the measured implementation for one prefill matmul.
@@ -29,19 +30,69 @@ func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint
 	}
 }
 
-// decodeMatmul appends one decode matmul. The streaming channel-parallel kernel
-// serves every shape the decode graph dispatches except the 32-output recurrent
-// projections, and the per-row GEMV stays for those and for any shape the
-// streaming kernel cannot serve (docs/roadmap4.md section 5, docs/kernels.md
-// section 5.3). Both routes compute the same products; only the summation order
-// differs.
+// decodeMatmul appends one decode matvec. The channel-parallel kernel serves
+// every shape the decode graph dispatches except the 32-output recurrent
+// projections, where the per-row GEMV stays; within that set the K-quants and
+// Q8_0 dot the Q8_1 activation with int8 v_dot4 and the other dtypes keep FP32
+// (docs/roadmap4.md section 6, docs/kernels.md section 5.3).
+//
+// The int8 route reads digits that decodeActGroup quantized for this group of
+// matvecs, so a matvec on a row that was not prepared is a planning error and
+// fails here rather than reading stale activations.
 func (m *Model) decodeMatmul(plan *hip.Plan, w weight, x, out *hip.Buffer,
 	nIn, nOut int64) error {
-	if !m.forceDecodeGemv &&
-		hip.SelectDecodeGemvPath(w.dtype, nIn, nOut) == hip.DecodeGemvStreaming {
-		return plan.AddLMHeadAt(w.buf, 0, x, 0, out, 0, nIn, nOut, 1, w.dtype)
+	path := hip.DecodeGemvPerRow
+	if !m.forceDecodeGemv {
+		path = hip.SelectDecodeGemvPath(w.dtype, nIn, nOut, m.int8Matvec)
 	}
-	return plan.AddGemv(w.buf, x, out, nIn, nOut, w.dtype)
+	switch path {
+	case hip.DecodeGemvInt8:
+		if !m.prequantizedInt8 {
+			// The block quantizes the row it reads, so no quantization
+			// operation is submitted for the group.
+			return plan.AddGemvQ8_1FusedAt(w.buf, 0, x, out, nIn, nOut, w.dtype)
+		}
+		if m.int8Act != x || m.int8ActWidth != nIn {
+			return fmt.Errorf("gpu: %s matvec on an activation row that was not"+
+				" quantized for the group", hip.DecodeGemvInt8)
+		}
+		return plan.AddGemvQ8_1At(w.buf, 0, m.act8.qs, m.act8.ds, out, nIn, nOut, w.dtype)
+	case hip.DecodeGemvStreaming:
+		return plan.AddLMHeadAt(w.buf, 0, x, 0, out, 0, nIn, nOut, 1, w.dtype)
+	default:
+		return plan.AddGemv(w.buf, x, out, nIn, nOut, w.dtype)
+	}
+}
+
+// decodeActGroup prepares the Q8_1 digits of one decode activation row for the
+// matvecs that read it. It emits one quantization operation for the group, which
+// is what keeps the activation from being re-quantized per projection, and skips
+// it when no consumer takes the int8 route so a model whose weights are all FP32
+// pays nothing. The plan is sequential, so the digits stay valid until the next
+// group.
+func (m *Model) decodeActGroup(plan *hip.Plan, x *hip.Buffer, nIn int64,
+	consumers ...tensor.DType) error {
+	m.int8Act = nil
+	m.int8ActWidth = 0
+	if m.forceDecodeGemv || !m.int8Matvec || !m.prequantizedInt8 {
+		return nil
+	}
+	needed := false
+	for _, dtype := range consumers {
+		if hip.IsInt8DecodeDType(dtype) {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return nil
+	}
+	if err := plan.AddQuantizeQ8_1At(x, 0, m.act8.qs, m.act8.ds, nIn, 1); err != nil {
+		return err
+	}
+	m.int8Act = x
+	m.int8ActWidth = nIn
+	return nil
 }
 
 // prefillProjection is one prefill matmul that reads the shared activation
@@ -161,6 +212,9 @@ func (m *Model) buildDecodePlan(s *Session, trace bool) (*hip.Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := m.decodeActGroup(plan, m.act.norm, int64(cfg.HiddenSize), output.dtype); err != nil {
+		return nil, err
+	}
 	if err := m.decodeMatmul(plan, output, m.act.norm, m.act.logits,
 		int64(cfg.HiddenSize), int64(cfg.VocabSize)); err != nil {
 		return nil, err
@@ -203,6 +257,11 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := plan.AddRMSNorm(m.act.x, attnNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
+	// q, k, and v read the same normalized row, so its Q8_1 digits are produced
+	// once for the group.
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, q.dtype, k.dtype, v.dtype); err != nil {
+		return err
+	}
 	if err := m.decodeMatmul(plan, q, m.act.norm, m.act.q, hidden, qDim); err != nil {
 		return err
 	}
@@ -235,6 +294,9 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 		m.act.attn, m.act.scores, s.tableBuf,
 		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim),
 		m.capacity, s.capacity, m.blockSize, scale, m.kvType); err != nil {
+		return err
+	}
+	if err := m.decodeActGroup(plan, m.act.attn, oDim, o.dtype); err != nil {
 		return err
 	}
 	if err := m.decodeMatmul(plan, o, m.act.attn, m.act.tmp, oDim, hidden); err != nil {
@@ -291,6 +353,11 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	if err := plan.AddRMSNorm(m.act.x, attnNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
+	// The qkv, gate, alpha, and beta projections all read the normalized row.
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, qkv.dtype, gate.dtype,
+		alpha.dtype, beta.dtype); err != nil {
+		return err
+	}
 	if err := m.decodeMatmul(plan, qkv, m.act.norm, m.act.qkv, hidden, convDim); err != nil {
 		return err
 	}
@@ -327,6 +394,9 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 		rank, stateSize, cfg.RMSNormEps); err != nil {
 		return err
 	}
+	if err := m.decodeActGroup(plan, m.act.gdnNorm, inner, out.dtype); err != nil {
+		return err
+	}
 	if err := m.decodeMatmul(plan, out, m.act.gdnNorm, m.act.tmp, inner, hidden); err != nil {
 		return err
 	}
@@ -352,6 +422,10 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	if err := plan.AddRMSNorm(m.act.x, postNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
+	// Gate and up read the same normalized row.
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, gate.dtype, up.dtype); err != nil {
+		return err
+	}
 	if err := m.decodeMatmul(plan, gate, m.act.norm, m.act.ffnGate, hidden, ffn); err != nil {
 		return err
 	}
@@ -359,6 +433,9 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 		return err
 	}
 	if err := plan.AddSiluMul(m.act.ffnGate, m.act.ffnUp, m.act.ffnGate, ffn); err != nil {
+		return err
+	}
+	if err := m.decodeActGroup(plan, m.act.ffnGate, ffn, down.dtype); err != nil {
 		return err
 	}
 	if err := m.decodeMatmul(plan, down, m.act.ffnGate, m.act.tmp, ffn, hidden); err != nil {

@@ -12,8 +12,8 @@ import (
 // a name and a recorded first-slot role. A new code without an entry would make
 // the attribution tables silent about it, so this fails instead.
 func TestOpNameAndRolesCoverABI(t *testing.T) {
-	if MaxOpCode < 37 {
-		t.Fatalf("shadow covers op codes up to %d, want at least 37", MaxOpCode)
+	if MaxOpCode < 38 {
+		t.Fatalf("shadow covers op codes up to %d, want at least 38", MaxOpCode)
 	}
 	names := make(map[string]uint32, MaxOpCode)
 	for code := uint32(1); code <= MaxOpCode; code++ {

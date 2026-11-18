@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -40,10 +41,29 @@ const (
 // a release measurement; see docs/testing.md section 6.3.
 func TestGPUProfileDecode(t *testing.T) {
 	reader, _, model, prompt := goldenPrompt(t)
-	rt, err := New(reader, model, 64)
+	// YUUKA_TEST_DECODE_INT8 selects the int8 decode matvec of roadmap4 D3 so the
+	// same attribution can be produced for each variant: "fused" quantizes inside
+	// the matvec block, "prequantized" submits one quantization operation per
+	// activation group. Unset keeps the default FP32 streaming route.
+	opts := Options{}
+	route := "fp32 streaming"
+	switch route8 := os.Getenv("YUUKA_TEST_DECODE_INT8"); route8 {
+	case "":
+	case "fused":
+		opts.Int8Matvec = true
+		route = "int8 fused"
+	case "prequantized":
+		opts.Int8Matvec = true
+		opts.PrequantizedInt8 = true
+		route = "int8 prequantized"
+	default:
+		t.Fatalf("YUUKA_TEST_DECODE_INT8=%q is not 'fused' or 'prequantized'", route8)
+	}
+	rt, err := newRuntime(reader, model, 64, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
+	t.Logf("decode matvec route: %s", route)
 	defer rt.Close()
 	logits, err := rt.Forward(prompt)
 	if err != nil {
@@ -136,7 +156,7 @@ func decodeSamples(shadow []hip.OpInfo, times []hip.OpTime, names map[uintptr]st
 		s.tensor, s.role = resolveOperationNames(info, names)
 		s.moved, s.matmul, s.rows = operationTraffic(info)
 		switch info.Code {
-		case hip.OpGemv, hip.OpGemvBatch, hip.OpGemm, hip.OpLMHead,
+		case hip.OpGemv, hip.OpGemvBatch, hip.OpGemm, hip.OpLMHead, hip.OpGemvQ8_1,
 			hip.OpGemmSwiglu, hip.OpQuantQ8_1:
 			s.dtype = tensor.DType(info.U[0])
 			s.hasDType = true
@@ -197,7 +217,7 @@ func operationTraffic(info hip.OpInfo) (moved uint64, matmul bool, rows int64) {
 		batch = 1
 	}
 	switch info.Code {
-	case hip.OpGemv, hip.OpLMHead:
+	case hip.OpGemv, hip.OpLMHead, hip.OpGemvQ8_1:
 		dtype := tensor.DType(info.U[0])
 		rowBytes, err := dtype.RowBytes(info.N[0])
 		if err != nil {
@@ -285,7 +305,8 @@ func newDecodeReport(samples []decodeSample) *decodeReport {
 	for _, s := range samples {
 		r.total += s.ms
 		if s.info.Code == hip.OpGemv || s.info.Code == hip.OpLMHead ||
-			s.info.Code == hip.OpGemvBatch || s.info.Code == hip.OpGemm {
+			s.info.Code == hip.OpGemvBatch || s.info.Code == hip.OpGemm ||
+			s.info.Code == hip.OpGemvQ8_1 {
 			r.matmul += s.ms
 		}
 		if row, ok := codes[s.info.Code]; ok {

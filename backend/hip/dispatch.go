@@ -144,7 +144,26 @@ const (
 	// shared memory once per block, and the only reduction is one wave shuffle
 	// per channel.
 	DecodeGemvStreaming
+	// DecodeGemvInt8 is the same mapping over an int8 activation: the four
+	// packed digits of a lane are dotted against the Q8_1 activation word with
+	// one v_dot4 instead of being decoded to FP32 first, and the block scale
+	// and minimum are applied once per sub-block.
+	DecodeGemvInt8
 )
+
+// IsInt8DecodeDType reports whether the int8 decode matvec serves a weight
+// dtype. The route decodes the packed digits straight to int8, so it exists
+// only for the dtypes whose per-value form is an integer plus an affine block
+// scale: the K-quants and Q8_0. F32, F16, Q4_0, and Q5_0 keep the FP32
+// streaming kernel.
+func IsInt8DecodeDType(dtype tensor.DType) bool {
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K, tensor.Q8_0:
+		return true
+	default:
+		return false
+	}
+}
 
 // String returns the diagnostic name of a decode matvec path.
 func (p DecodeGemvPath) String() string {
@@ -153,29 +172,42 @@ func (p DecodeGemvPath) String() string {
 		return "per-row"
 	case DecodeGemvStreaming:
 		return "streaming"
+	case DecodeGemvInt8:
+		return "int8"
 	default:
 		return "unknown"
 	}
 }
 
 // SelectDecodeGemvPath returns the measured decode matvec choice for a weight
-// dtype and shape. It is the same kernel and the same rule as the output
-// projection: the streaming mapping is bandwidth bound on every shape the
-// decode graph dispatches (measured 64-199 GB/s against 25-76 GB/s for the
-// per-row form), and it keeps the per-row GEMV below the crossover and for the
-// shapes it cannot serve (a K step that is not 256 values, or an unsupported
-// dtype). Sharing one predicate keeps the two tails and the layer matvecs from
-// drifting apart; the crossover measurement is in docs/benchmarks.md.
+// dtype and shape. It shares the output projection's shape predicate: the
+// streaming mapping is bandwidth bound on every shape the decode graph
+// dispatches (measured 64-199 GB/s against 25-76 GB/s for the per-row form), and
+// the per-row GEMV stays below the crossover and for the shapes it cannot serve
+// (a K step that is not 256 values, or an unsupported dtype). Sharing one
+// predicate keeps the two tails and the layer matvecs from drifting apart; the
+// crossover measurement is in docs/benchmarks.md.
+//
+// The FP32 streaming kernel is the selected route for every dtype. The int8
+// route is implemented and reachable through int8Matvec, and it is measured
+// slower end to end on gfx1151: the decode step reads one row of weights per
+// matvec and is not instruction bound, so the ALU saving does not pay for the
+// activation quantization the route needs (docs/benchmarks.md, roadmap4 6.5).
+// It stays available so that measurement is reproducible and so a device or a
+// later fusion can be re-evaluated against it.
 //
 // The narrow recurrent projections (ssm_alpha and ssm_beta, 32 outputs) stay on
 // the per-row form because the streaming kernel needs 32 blocks to fill the
 // device: at 32 outputs it runs one block and measures 3.7 GB/s against 9.5.
 // Merging those launches is a launch-count change, owned by roadmap4 D5.
-func SelectDecodeGemvPath(dtype tensor.DType, nIn, nOut int64) DecodeGemvPath {
-	if SelectLMHeadPath(dtype, 1, nIn, nOut) {
-		return DecodeGemvStreaming
+func SelectDecodeGemvPath(dtype tensor.DType, nIn, nOut int64, int8Matvec bool) DecodeGemvPath {
+	if !SelectLMHeadPath(dtype, 1, nIn, nOut) {
+		return DecodeGemvPerRow
 	}
-	return DecodeGemvPerRow
+	if int8Matvec && IsInt8DecodeDType(dtype) {
+		return DecodeGemvInt8
+	}
+	return DecodeGemvStreaming
 }
 
 // PrefillAttentionMMA reports whether the FP16 MMA paged prefill attention

@@ -116,6 +116,7 @@ hard-coded from another GPU.
 | Kernel family | Main scenario | Optimization focus |
 | --- | --- | --- |
 | `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
+| `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
 | `gemv_q4_k` / `gemv_q6_k` / `gemv_q8_0` / `gemv_q4_0` / `gemv_q5_0` | Decode fallback, narrow projections, kernel reference | Packed reads, fused dequantization, block reduction |
 | `gemm_fp16_wmma` | Prefill baseline | Tiling, WMMA, LDS, pipelining |
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
@@ -187,6 +188,18 @@ from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1), so the
 selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
 family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
 recurrent projections are the only decode shapes that land on the fallback.
+
+**Int8 variant, implemented and not selected.** `gemv_i8_kernel` keeps the same
+mapping but dots the four packed digits of a lane against the Q8_1 activation
+word with one `v_dot4`, applying the block scale and the Q4_K/Q5_K minimum once
+per sub-block instead of once per weight. It is reachable through
+`Options.Int8Matvec` and is measured slower end to end than the FP32 streaming
+kernel: 20.07 ms of matvec against 21.39 ms, plus 1.09 ms for the separate
+activation quantization, in a step where the fused variant costs 21.9 ms because
+every block re-quantizes the row. The decode step is not instruction bound at
+127 GB/s of a 244 GB/s read ceiling, so halving the arithmetic moves 6%. The
+arithmetic contract and tolerances are in roadmap4 6.5; the numbers are in
+[benchmarks.md](benchmarks.md#int8-decode-matvec-d3).
 
 Numerics. The per-row kernel sums a strided set of K values per thread and
 reduces over the block; the streaming kernel sums four neighbours per lane and
@@ -614,7 +627,11 @@ step of `TestGPUProfileDecode` it costs 2.79 ms at 187 GB/s against 11.23 ms at
 Numerics. The per-element products are the same FP32 products the decode GEMV
 forms, including the K-quant scale-then-minimum order; only the summation order
 differs, because a lane accumulates four neighbours and the last five additions
-are a shuffle tree. `tests/hip/prefill_test.cpp` checks all eight dtypes against
+are a shuffle tree. The opt-in int8 variant of the same kernel replaces the FP32
+products with a `v_dot4` over Q8_1 digits: it moves decode logits by up to 0.2656
+over eight greedy steps with identical tokens, against the 0.0031-0.264 band the
+prefill int8 route records, and its kernel output matches a host reference that
+uses the same digits to 5.7e-4 relative. `tests/hip/prefill_test.cpp` checks all eight dtypes against
 the independent host dot products for one, three, and sixteen rows and requires
 a repeated run to be bitwise identical; `TestPlanLMHeadMatchesDequant` checks
 Q6_K and Q8_0 against dequantized CPU dots (Q8_0 is bitwise equal), and the
@@ -1002,8 +1019,9 @@ Dispatch is recorded in one explicit Go selector:
 rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
 Single-token decode submits one matvec per matrix. `SelectDecodeGemvPath`
 chooses between the per-row GEMV and the streaming kernel per operation
-(section 5.3), and the output projection takes the same rule; there is no
-separate runtime GEMV batch selector.
+(section 5.3), and the output projection takes the same rule; the int8 variant is
+reachable through the same selector behind a flag that defaults to off. There is
+no separate runtime GEMV batch selector.
 
 Each plan addition validates the dtype, quantization row layout, shape
 constraints, and buffer ranges. Unsupported combinations fail during planning;

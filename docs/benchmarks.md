@@ -60,9 +60,11 @@ Protocol:
   process, as recorded in [testing.md](testing.md#63-what-to-measure-separately).
 - `scripts/decode_profile.sh` reproduces the [decode matvec](#decode-matvec)
   table in one command: it runs `build/yuuka_gemv_decode_sweep` unprofiled and
-  under `rocprofv3`, then runs `TestGPUProfileDecode` for the per-operation
-  attribution of one real decode step. The sweep keeps every matrix resident, so
-  its GB/s figures are the hot-matrix upper bound of the real step.
+  under `rocprofv3`, runs its `--threshold` and `--int8` modes for the output
+  projection crossover and the [int8 comparison](#int8-decode-matvec-d3), then
+  runs `TestGPUProfileDecode` for the per-operation attribution of one real
+  decode step. The sweep keeps every matrix resident, so its GB/s figures are the
+  hot-matrix upper bound of the real step.
 - Only one benchmark process may use the GPU at a time; two processes sharing
   the device invalidate both results.
 - The llama.cpp reference is `strix-llama.cpp` commit `c8912d7f5` (build 12216,
@@ -140,6 +142,10 @@ about half of what the same weights stream at in llama.cpp
 ([llama.cpp comparison](#llamacpp-comparison)). The matvec family is still the
 limiter, not attention ([isolated kernels](#isolated-kernels)).
 
+The decode rows measure the selected route, which is the FP32 streaming matvec
+(the int8 route of roadmap4 D3 is measured slower and stays opt-in; see
+[int8 decode matvec](#int8-decode-matvec-d3)).
+
 The table was re-measured twice: when the decode output projection moved to the
 streaming LM head kernel
 ([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)) and when the rest of
@@ -149,6 +155,46 @@ session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s. The profiled
 step went 97.4, 89.4, 31.6 ms with the matvec family at 87.6, 79.2, 21.6 ms, so
 the matvec share fell from 90% to 68% and the gated delta-net became the second
 largest term at 24%. Prefill is unaffected across all three: 0.085-0.088 s.
+
+### Int8 decode matvec (D3)
+
+`build/yuuka_gemv_decode_sweep --int8`, the same protocol as the decode matvec
+table, one row per submission with the matrix resident. The int8 forms run the
+roadmap4 D3 route: the pre-quantized form reads the Q8_1 digits of the activation
+(`YUUKA_OP_QUANT_Q8_1`), the fused form quantizes the row inside the matvec block.
+
+| Shape | dtype | FP32 stream | int8 pre-quantized | int8 fused |
+| --- | --- | ---: | ---: | ---: |
+| `ffn_gate` 2560 -> 9216 | Q4_K | 198.8 | 210.6 | 194.2 |
+| `ffn_up` 2560 -> 9216 | Q4_K | 197.4 | 209.9 | 184.2 |
+| `ffn_down` 9216 -> 2560 | Q6_K | 204.5 | 196.1 | 175.2 |
+| `ffn_down` 9216 -> 2560 | Q4_K | 141.6 | 159.2 | 133.6 |
+| `attn_q` 2560 -> 8192 | Q4_K | 177.7 | 190.3 | 168.7 |
+| `attn_k` 2560 -> 1024 | Q4_K | 64.3 | 66.1 | 57.3 |
+| `attn_v` 2560 -> 1024 | Q6_K | 95.8 | 97.2 | 86.8 |
+| `attn_output` 4096 -> 2560 | Q4_K | 109.6 | 146.7 | 108.0 |
+| `attn_gate` 2560 -> 4096 | Q4_K | 165.3 | 166.8 | 162.8 |
+| `attn_qkv` 2560 -> 8192 | Q5_K | 183.5 | 224.2 | 199.0 |
+| `ssm_out` 4096 -> 2560 | Q5_K | 126.8 | 133.8 | 130.3 |
+| `lm_head` 2560 -> 248320 | Q6_K | 182.6 | 194.9 | 183.4 |
+
+In the decode step (`TestGPUProfileDecode` with
+`YUUKA_TEST_DECODE_INT8=fused|prequantized`), and end to end on the 128-token
+prompt:
+
+| Route | Matvec | Quantization | Profiled step | Decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| FP32 streaming, selected | 21.39 ms | - | 31.57 ms | 29.91 |
+| int8 pre-quantized | 20.07 ms | 1.09 ms | 31.78 ms | 30.64 |
+| int8 fused | 21.9 ms | - | 32.27 ms | 29.75 |
+
+The int8 arithmetic is 6% faster in step, the quantization pass costs 5% back,
+and the fused form costs more than the launch it removes. Decode stays on the
+FP32 streaming kernel: the step reads 2,726 MB of weights at 127 GB/s against a
+244 GB/s read ceiling, so it is not instruction bound, and the roadmap4 D3 gate
+of 31 tokens/s is missed. Numerics: identical tokens over eight greedy steps with
+0.2656 maximum logit difference against the FP32 route, and 5.7e-4 relative
+against the quantized host reference in `tests/hip/gemv_test.cpp`.
 
 ## Speculative decoding
 

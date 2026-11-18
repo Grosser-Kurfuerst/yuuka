@@ -51,15 +51,16 @@ document in the same change.
 | D0: reproducible decode attribution tooling | **Done** (2026-11-18) | One command reproduces 2.3 and 2.4 within noise |
 | D1: decode output projection on the streaming kernel | **Done** (2026-11-18) | Decode p50 13.21 s -> 12.2 s or less; tokens unchanged |
 | D2: channel-parallel decode GEMV | **Done** (2026-11-18); isolated-width gate partly met, see 5.5 | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
-| D3: Q8_1 activations with `dp4a` | Not started | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
+| D3: Q8_1 activations with `dp4a` | **Implemented** (2026-11-18); gate missed, not selected, see 6.5 | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
 | D4: gated delta-net per-token kernel | Not started | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
 | D5: launch gaps and operator fusion | Not started | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
 
 D0 is implemented; its record is 3.4 and its measurements are in
 [benchmarks.md](benchmarks.md#decode-matvec). D1 is implemented and meets its
 gate; its record is 4.5. D2 is implemented and meets the throughput gate, with
-the isolated-width gate met on nine of twelve shapes; its record is 5.5. D3-D5
-are not started. The measurements in section 2 describe the tree at commit
+the isolated-width gate met on nine of twelve shapes; its record is 5.5. D3 is
+implemented and measured, misses both gates, and is not the selected route; its
+record is 6.5. D4-D5 are not started. The measurements in section 2 describe the tree at commit
 `bfd36c0` and are the baseline each gate is compared against; each stage record
 states what that stage moved.
 
@@ -694,6 +695,106 @@ order. Requirements:
 - No prefill regression: the two paths share the Q8_1 layout, so the MMQ
   correctness gates remain green.
 
+### 6.5 Implementation (2026-11-18)
+
+Both activation sources of 6.2 item 3 are implemented and measured. Neither is
+selected: the FP32 streaming kernel of D2 remains the decode matvec for every
+dtype, because on this device the decode step is not instruction bound and the
+int8 route costs more in activation quantization than it saves in arithmetic.
+
+Added:
+
+- `kernels/hip/gemv/gemv_i8.hip`: `gemv_i8_kernel` (same wave/channel mapping as
+  the streaming kernel, one `v_dot4` per four weights, no shared memory) and
+  `gemv_i8_fused_kernel` (the same, with the Q8_1 quantization of the row staged
+  in shared memory inside the block).
+- `decode_span4_i8` in `quant.cuh`: the int8 form of `decode_span4`. It returns
+  four packed digits plus the affine `(scale, bias)` of the sub-block that
+  contains them, so `value = scale * q + bias` reproduces the FP32 decoder's
+  value for Q4_K, Q5_K (unsigned digit plus a minimum), Q6_K (signed 6-bit), and
+  Q8_0 (int8).
+- ABI 5: `YUUKA_OP_GEMV_Q8_1`, where `u[1]` selects the pre-quantized form
+  (`buf[1]` digits, `buf[2]` block scales, both written by
+  `YUUKA_OP_QUANT_Q8_1`) or the fused form (`buf[1]` the FP32 row). Go exposes
+  `AddGemvQ8_1At` and `AddGemvQ8_1FusedAt`; `SelectDecodeGemvPath` takes an
+  `int8Matvec` flag, `Model.decodeActGroup` emits one quantization operation per
+  activation group, and `Options.Int8Matvec` / `Options.PrequantizedInt8` select
+  the route for measurement and for the differential test.
+
+Measured, one submission per plan with the matrix resident, median of 25
+submissions (`build/yuuka_gemv_decode_sweep --int8`), GB/s:
+
+| Shape | dtype | FP32 stream | int8 pre-quantized | int8 fused |
+| --- | --- | ---: | ---: | ---: |
+| `ffn_gate` 2560 -> 9216 | Q4_K | 198.8 | 210.6 | 194.2 |
+| `ffn_up` 2560 -> 9216 | Q4_K | 197.4 | 209.9 | 184.2 |
+| `ffn_down` 9216 -> 2560 | Q6_K | 204.5 | 196.1 | 175.2 |
+| `ffn_down` 9216 -> 2560 | Q4_K | 141.6 | 159.2 | 133.6 |
+| `attn_q` 2560 -> 8192 | Q4_K | 177.7 | 190.3 | 168.7 |
+| `attn_k` 2560 -> 1024 | Q4_K | 64.3 | 66.1 | 57.3 |
+| `attn_v` 2560 -> 1024 | Q6_K | 95.8 | 97.2 | 86.8 |
+| `attn_output` 4096 -> 2560 | Q4_K | 109.6 | 146.7 | 108.0 |
+| `attn_gate` 2560 -> 4096 | Q4_K | 165.3 | 166.8 | 162.8 |
+| `attn_qkv` 2560 -> 8192 | Q5_K | 183.5 | 224.2 | 199.0 |
+| `ssm_out` 4096 -> 2560 | Q5_K | 126.8 | 133.8 | 130.3 |
+| `lm_head` 2560 -> 248320 | Q6_K | 182.6 | 194.9 | 183.4 |
+
+Gate 1 is therefore met on the large shapes (190-224 GB/s) and missed on the
+1024-output cells and on `attn_output`/`ssm_out`/`ffn_down` Q4_K (64-159), for
+the reasons 5.5 records: a 32-block grid cannot fill the device and those cells
+are launch bound.
+
+Inside the decode step, `TestGPUProfileDecode` with
+`YUUKA_TEST_DECODE_INT8=fused|prequantized`:
+
+| Route | Matvec | Quantization | Step | Decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| FP32 streaming (selected) | 21.39 ms | - | 31.57 ms | 29.91 |
+| int8 pre-quantized | 20.07 ms | 1.09 ms | 31.78 ms | 30.64 |
+| int8 fused | 21.9 ms | - | 32.27 ms | 29.75 |
+
+So the int8 arithmetic is 6% faster than the FP32 route in step, the activation
+quantization pass costs 5% back, and the fused form costs more than the launch it
+removes because every block re-quantizes the whole row. Gate 2 is missed: the
+best variant reaches 30.64 tokens/s against 31, and the selected route is
+unchanged at 29.91.
+
+Why the arithmetic does not pay. The decode step reads 2,726 MB of weights once
+per token, at 127 GB/s inside the step against a 244 GB/s streaming read
+ceiling. The kernel is not instruction bound there: D2's per-row to streaming
+change moved 4x with the same instruction count, and this stage's 2x instruction
+reduction moved 6%. The remaining loss is memory-level parallelism per lane and
+the cold-weight behaviour D0 recorded, which is D5's subject, not arithmetic.
+
+Numerics, recorded:
+
+- `tests/hip/gemv_test.cpp` covers the int8 op for Q4_K, Q5_K, Q6_K, and Q8_0 at
+  widths 256/512/2560 and 1/33/129 outputs. It downloads the Q8_1 digits and
+  block scales, rebuilds the quantized row, and dots it with the dequantized
+  weights through the same host reference as the other cells: the worst
+  difference is 5.7e-4 relative, which is the association order of the per-block
+  scale application.
+- `TestGPUInt8MatvecMatchesFp32` compares the whole decode plan against the FP32
+  streaming route over eight greedy decode steps: 0.2656 maximum absolute logit
+  difference with identical tokens, against logits that reach about 30. The
+  prefill int8 route records 0.0031 at a short prompt and 0.264 at 2048 tokens,
+  so this is the same band: the error is the 8-bit activation, not the kernel.
+- `TestGPUStreamingDecodeMatchesGemv` keeps bounding the D2 mapping change alone
+  (FP32 streaming against per-row): 8.34e-06 with identical tokens.
+- The route is not selected, and the prefill MMQ gates are untouched because that
+  path was not modified.
+
+One defect was found and fixed by this stage: the int8 four-value decoder
+initially read the wrong `ql` base for the second 32-value group of a Q6_K
+128-value slice, which the FP32 decoders in the tree do not share. The int8
+kernel now agrees with the reference to 5.7e-4, and the four-value FP32 decoder,
+the per-value decoder, the per-row GEMV kernel, and the MMQ span decoder were
+checked against the CPU layout and are correct.
+
+What this means for the remaining stages: the matvec family is 68% of the step
+at 127 GB/s in step, and D4 (the gated delta-net, now 24% of the step) plus D5
+(fusion and submission gaps) are the levers that remain.
+
 ## 7. Stage D4: gated delta-net per-token kernel
 
 ### 7.1 Problem
@@ -778,9 +879,9 @@ The stage gates are individually necessary; the plan is done when the whole
 matrix holds on the reference device, measured under
 [testing.md](testing.md)'s protocol with the metadata of 2.1:
 
-| Test | Current | After D1 (measured) | After D2 (measured) | After D3 | After D4 | After D5 | llama.cpp |
+| Test | Current | After D1 (measured) | After D2 (measured) | After D3 (measured) | After D4 | After D5 | llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | 31 | 37 | 45 | 62.39 |
+| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | **29.91** (gate missed) | 37 | 45 | 62.39 |
 | Step time, release | 104.1 ms | **95.1 ms** | **33.4 ms** | 31 ms | 26 ms | 19 ms | 16.03 ms |
 | Step time, profiled | 97.6 ms | **89.0 ms** | **31.6 ms** | - | - | - | - |
 | Decode p50, 128 tokens | 13.21 s | **12.08 s** | **4.25 s** | - | - | - | 2.05 s |
@@ -788,10 +889,10 @@ matrix holds on the reference device, measured under
 | Matvec bandwidth, isolated | 46 GB/s | **186** | **184-287** | 185 | 185 | 190 | about 170 |
 | Prefill pp128 tok/s | 1359.9 | **1465** | **1484** | unchanged | unchanged | unchanged | 1766.6 |
 
-The After-D1 and After-D2 columns are measured (4.5, 5.5); the D3-D5 columns are
-arithmetic from the traffic floors of 2.8 and the gates of sections 6 to 8, not
-measurements, and every cell must be replaced by a measured value before this
-document claims it. The tg128 columns after D2 carry the gate value, which is
+The After-D1, After-D2, and After-D3 columns are measured (4.5, 5.5, 6.5); the
+D4 and D5 columns are arithmetic from the traffic floors of 2.8 and the gates of
+sections 7 and 8, not measurements, and every cell must be replaced by a measured
+value before this document claims it. The tg128 columns after D2 carry the gate value, which is
 deliberately below the projection: section 8.3 projects 52 tok/s from a 19 ms
 step and gates at 45. The reference column is measured.
 

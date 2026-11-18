@@ -10,12 +10,12 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
-// TestGPUStreamingDecodeMatchesGemv compares the two decode matvec families on
-// the real model. The default session runs the streaming channel-parallel kernel
-// for every matvec the dispatch rule covers (roadmap4 D2); a session opened with
-// ForceDecodeGemv runs the per-row GEMV the earlier tree used for all of them.
-// Both plans read the same weights and the same activations, so the only
-// difference is the summation order inside each projection.
+// TestGPUStreamingDecodeMatchesGemv compares the two decode matvec mappings on
+// the real model. Both sessions run FP32 arithmetic, so the measured difference
+// is the D2 mapping change alone: the channel-parallel streaming kernel with
+// DisableInt8Matvec against the per-row GEMV the original tree used. The int8
+// arithmetic of roadmap4 D3 is bounded separately by
+// TestGPUInt8MatvecMatchesFp32.
 //
 // The tolerance is absolute because the comparison is over the logits of one
 // vocabulary: the streaming kernel sums four K values per lane and reduces
@@ -24,7 +24,7 @@ import (
 // reassociation and nothing else.
 func TestGPUStreamingDecodeMatchesGemv(t *testing.T) {
 	reader, _, model, prompt := goldenPrompt(t)
-	streaming, err := New(reader, model, 64)
+	streaming, err := newRuntime(reader, model, 64, Options{})
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
@@ -35,22 +35,25 @@ func TestGPUStreamingDecodeMatchesGemv(t *testing.T) {
 	}
 	defer perRow.Close()
 
-	// The two plans must actually differ, and every matvec in each must follow
-	// the dispatch rule rather than a per-call choice.
-	streamingOps := streaming.session.plan.Ops()
+	// The two plans must actually differ, and every matvec in the default plan
+	// must follow the dispatch rule rather than a per-call choice.
+	defaultOps := streaming.session.plan.Ops()
 	perRowOps := perRow.session.plan.Ops()
-	streamingLMHead, streamingGemv := countMatvec(streamingOps)
-	perRowLMHead, perRowGemv := countMatvec(perRowOps)
-	checkDecodeRule(t, streamingOps)
-	t.Logf("streaming plan: %d streaming, %d per-row matvecs; per-row plan: %d, %d",
-		streamingLMHead, streamingGemv, perRowLMHead, perRowGemv)
-	if perRowLMHead != 0 || perRowGemv == 0 {
-		t.Fatalf("the forced plan runs %d streaming and %d per-row matvecs, want only"+
-			" per-row", perRowLMHead, perRowGemv)
+	checkDecodeRule(t, defaultOps, false)
+	defaultCounts := countMatvec(defaultOps)
+	perRowCounts := countMatvec(perRowOps)
+	t.Logf("default plan: %d int8, %d fp32 streaming, %d per-row matvecs;"+
+		" per-row plan: %d, %d, %d", defaultCounts.int8, defaultCounts.streaming,
+		defaultCounts.perRow, perRowCounts.int8, perRowCounts.streaming,
+		perRowCounts.perRow)
+	if perRowCounts.int8 != 0 || perRowCounts.streaming != 0 || perRowCounts.perRow == 0 {
+		t.Fatalf("the forced plan runs %d int8, %d streaming, %d per-row matvecs,"+
+			" want only per-row", perRowCounts.int8, perRowCounts.streaming,
+			perRowCounts.perRow)
 	}
-	if streamingLMHead <= model.Config.BlockCount {
-		t.Fatalf("the default plan runs %d streaming matvecs, want at least one per"+
-			" layer plus the output projection", streamingLMHead)
+	if defaultCounts.streaming <= model.Config.BlockCount {
+		t.Fatalf("the fp32 streaming plan runs %d streaming matvecs, want at least one"+
+			" per layer plus the output projection", defaultCounts.streaming)
 	}
 
 	streamLogits, err := streaming.Forward(prompt)
@@ -102,37 +105,58 @@ func TestGPUStreamingDecodeMatchesGemv(t *testing.T) {
 		streamTokens, steps, maxDiff, tolerance)
 }
 
-// countMatvec returns how many streaming and how many per-row matvecs a decode
-// plan holds.
-func countMatvec(ops []hip.OpInfo) (streaming, perRow int) {
+// matvecCounts is the number of matvecs a decode plan holds per route.
+type matvecCounts struct {
+	int8      int
+	streaming int
+	perRow    int
+}
+
+// countMatvec counts the matvec operations of a decode plan by route.
+func countMatvec(ops []hip.OpInfo) matvecCounts {
+	var counts matvecCounts
 	for _, op := range ops {
 		switch op.Code {
+		case hip.OpGemvQ8_1:
+			counts.int8++
 		case hip.OpLMHead:
-			streaming++
+			counts.streaming++
 		case hip.OpGemv:
-			perRow++
+			counts.perRow++
 		}
 	}
-	return streaming, perRow
+	return counts
+}
+
+// opMatvecPath maps a matvec op code to the route it runs, and reports false for
+// the non-matvec operations.
+func opMatvecPath(op hip.OpInfo) (hip.DecodeGemvPath, bool) {
+	switch op.Code {
+	case hip.OpGemvQ8_1:
+		return hip.DecodeGemvInt8, true
+	case hip.OpLMHead:
+		return hip.DecodeGemvStreaming, true
+	case hip.OpGemv:
+		return hip.DecodeGemvPerRow, true
+	default:
+		return hip.DecodeGemvPerRow, false
+	}
 }
 
 // checkDecodeRule verifies that a default decode plan follows the dispatch rule
-// operation by operation: every matvec the rule covers streams, and the only
-// per-row matvecs left are the shapes it does not cover.
-func checkDecodeRule(t *testing.T, ops []hip.OpInfo) {
+// operation by operation: every matvec the rule covers runs the route it
+// selects, and the per-row operations are exactly the shapes it does not cover.
+func checkDecodeRule(t *testing.T, ops []hip.OpInfo, fp32Streaming bool) {
 	t.Helper()
 	for _, op := range ops {
-		switch op.Code {
-		case hip.OpLMHead:
-			if got := hip.SelectDecodeGemvPath(opDType(op), op.N[0], op.N[1]); got != hip.DecodeGemvStreaming {
-				t.Fatalf("plan streams %s/%dx%d, but the rule says %s", op.Name(),
-					op.N[0], op.N[1], got)
-			}
-		case hip.OpGemv:
-			if got := hip.SelectDecodeGemvPath(opDType(op), op.N[0], op.N[1]); got != hip.DecodeGemvPerRow {
-				t.Fatalf("plan runs %s/%dx%d per-row, but the rule says %s", op.Name(),
-					op.N[0], op.N[1], got)
-			}
+		got, isMatvec := opMatvecPath(op)
+		if !isMatvec {
+			continue
+		}
+		want := hip.SelectDecodeGemvPath(opDType(op), op.N[0], op.N[1], fp32Streaming)
+		if got != want {
+			t.Fatalf("plan runs %s/%dx%d on the %s route, but the rule selects %s",
+				op.Name(), op.N[0], op.N[1], got, want)
 		}
 	}
 }
@@ -158,3 +182,87 @@ func logitDiff(a, b []float32) (float64, int) {
 
 // opDType returns the weight dtype an op carries in u[0].
 func opDType(op hip.OpInfo) tensor.DType { return tensor.DType(op.U[0]) }
+
+// TestGPUInt8MatvecMatchesFp32 isolates the arithmetic change of roadmap4 D3.
+// The int8 session dots the Q8_1 activation with the int8 digits of each packed
+// weight; the default session runs the FP32 streaming kernel on the same shape,
+// so both plans have the same operations in the same order and differ only in
+// how each product is formed. The int8 route is not the default because it is
+// measured slower end to end (roadmap4 6.5); this test is what pins its
+// arithmetic while it stays available for measurement.
+//
+// The recorded bound is wider than the FP32 route's own agreement because the
+// activation is quantized to 8 bits: each digit carries up to 1/254 of the
+// block's amax, which is the error the prefill int8 route already carries.
+func TestGPUInt8MatvecMatchesFp32(t *testing.T) {
+	reader, _, model, prompt := goldenPrompt(t)
+	int8RT, err := newRuntime(reader, model, 64, Options{Int8Matvec: true})
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	defer int8RT.Close()
+	fp32RT, err := New(reader, model, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fp32RT.Close()
+
+	int8Ops := int8RT.session.plan.Ops()
+	if counts := countMatvec(int8Ops); counts.int8 == 0 {
+		t.Fatal("the default plan runs no int8 matvec")
+	}
+	checkDecodeRule(t, int8Ops, true)
+	if counts := countMatvec(fp32RT.session.plan.Ops()); counts.int8 != 0 {
+		t.Fatalf("the fp32 reference plan runs %d int8 matvecs", counts.int8)
+	}
+
+	logits, err := int8RT.Forward(prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refLogits, err := fp32RT.Forward(prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const steps = 8
+	tokens := make([]int32, 0, steps)
+	refTokens := make([]int32, 0, steps)
+	maxDiff := 0.0
+	for step := range steps {
+		token, refToken := argmax(logits), argmax(refLogits)
+		tokens = append(tokens, token)
+		refTokens = append(refTokens, refToken)
+		if logits, err = int8RT.Step(token); err != nil {
+			t.Fatal(err)
+		}
+		if refLogits, err = fp32RT.Step(refToken); err != nil {
+			t.Fatal(err)
+		}
+		diff, _ := logitDiff(logits, refLogits)
+		t.Logf("step %d: max abs logit diff %.6g", step+1, diff)
+		if diff > maxDiff {
+			maxDiff = diff
+		}
+	}
+	t.Logf("tokens %v, max abs logit diff over %d steps %.6g", tokens, steps, maxDiff)
+	for i := range tokens {
+		if tokens[i] != refTokens[i] {
+			t.Fatalf("token %d: int8 route %d, fp32 route %d", i, tokens[i], refTokens[i])
+		}
+	}
+	// Recorded for this prompt: 0.2656 maximum absolute logit difference over
+	// eight greedy decode steps with identical tokens, against logits that reach
+	// about 30. The prefill int8 route records 0.0031 at a short prompt and
+	// 0.264 at 2048 tokens, so the decode route sits at the top of that band:
+	// both quantize the activation to 8 bits per 32 values, and a decode step
+	// feeds each step's logits into the next token, so the difference can
+	// accumulate. The gate is the recorded value with margin; the invariant the
+	// stage requires is the identical token sequence above.
+	const tolerance = 0.6
+	if maxDiff > tolerance {
+		t.Fatalf("the int8 and fp32 routes differ by %.6g, tolerance %.6g", maxDiff,
+			tolerance)
+	}
+	t.Logf("tokens %v, max abs logit diff over %d steps %.6g (tolerance %.6g)",
+		tokens, steps, maxDiff, tolerance)
+}

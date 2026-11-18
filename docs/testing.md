@@ -404,6 +404,11 @@ rather than pass silently. Section 5.5 of roadmap4 keeps the per-stage history. 
 adds a submission gap per operation, so the totals exceed a release run and are
 a diagnosis, not a benchmark result.
 
+`YUUKA_TEST_DECODE_INT8=fused` or `=prequantized` runs the same attribution with
+the opt-in int8 decode matvec instead of the FP32 streaming kernel, which is how
+roadmap4 D3 measured the two activation sources; the default is the selected
+route.
+
 `scripts/decode_profile.sh` is the reproducible procedure for the isolated
 decode matvec table. It verifies the recorded GGUF SHA-256 when a model is
 supplied, fails when the device is not `gfx1151`, runs

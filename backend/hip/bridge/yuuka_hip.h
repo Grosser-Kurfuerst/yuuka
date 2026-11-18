@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 4
+#define YUUKA_HIP_ABI_VERSION 5
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -138,7 +138,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_GEMM_SWIGLU = 34,
     YUUKA_OP_DEQUANT_F16 = 35,
     YUUKA_OP_QUANT_Q8_1 = 36,
-    YUUKA_OP_LM_HEAD = 37
+    YUUKA_OP_LM_HEAD = 37,
+    YUUKA_OP_GEMV_Q8_1 = 38
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -160,6 +161,17 @@ typedef enum yuuka_op_code {
 #define YUUKA_GEMM_PATH_WMMA 2u
 #define YUUKA_GEMM_PATH_MMQ 3u
 
+/* Int8 decode matvec: out[n_out] = W[n_out, n_in] * x. buf[0] holds the packed
+ * weights, buf[3] the FP32 output, n[0] = n_in, n[1] = n_out, u[0] = dtype.
+ * u[1] selects where the Q8_1 activation comes from:
+ *
+ *   0  buf[1] holds the int8 digits and buf[2] their float2 block scales, both
+ *      written by YUUKA_OP_QUANT_Q8_1;
+ *   1  buf[1] holds the FP32 activation row and the block quantizes it into
+ *      shared memory itself, so no quantization operation is submitted.
+ *
+ * Q4_K, Q5_K, Q6_K, and Q8_0 are supported; rows are not, because speculative
+ * verification keeps the FP32 streaming kernel. */
 typedef struct yuuka_op {
     uint32_t code;
     uint32_t flags;

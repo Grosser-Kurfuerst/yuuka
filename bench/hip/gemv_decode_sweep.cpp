@@ -14,6 +14,10 @@
 // per-row GEMV against the streaming kernel for a range of output counts, which
 // is the measurement behind the lmHeadMinOutputs crossover. It prints its own
 // schema and is not traced.
+//
+// --int8 measures the int8 decode matvec of roadmap4 D3 against the FP32
+// streaming kernel on the same matrix, both with a pre-quantized activation and
+// with the block-fused quantizer. It prints its own schema and is not traced.
 
 #include "yuuka_hip.h"
 
@@ -293,15 +297,19 @@ double submit(yuuka_device * device, yuuka_stream * stream, yuuka_event * comple
 
 int main(int argc, char ** argv) {
     bool threshold = false;
+    bool int8 = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--threshold") {
             threshold = true;
+        } else if (arg == "--int8") {
+            int8 = true;
         } else if (arg == "-h" || arg == "--help") {
-            std::printf("usage: %s [--threshold]\n"
+            std::printf("usage: %s [--threshold|--int8]\n"
                         "  (no option)  the twelve decode shapes in the per-row, batched,\n"
                         "               and streaming forms, traced by scripts/decode_profile.sh\n"
-                        "  --threshold  the rows = 1 output projection crossover per dtype\n",
+                        "  --threshold  the rows = 1 output projection crossover per dtype\n"
+                        "  --int8       the int8 decode matvec against the FP32 streaming kernel\n",
                         argv[0]);
             return 0;
         } else {
@@ -322,6 +330,143 @@ int main(int argc, char ** argv) {
     }
     std::mt19937 rng(1234);
     int status = 0;
+
+    if (int8) {
+        // The int8 route of roadmap4 D3 at the twelve decode shapes: the FP32
+        // streaming kernel, the same matvec over a pre-quantized activation, and
+        // the fused variant that quantizes inside the block.
+        const Shape shapes[] = {
+            {"ffn_gate", 2560, 9216, YUUKA_DTYPE_Q4_K},
+            {"ffn_up", 2560, 9216, YUUKA_DTYPE_Q4_K},
+            {"ffn_down", 9216, 2560, YUUKA_DTYPE_Q6_K},
+            {"ffn_down_q4k", 9216, 2560, YUUKA_DTYPE_Q4_K},
+            {"attn_q", 2560, 8192, YUUKA_DTYPE_Q4_K},
+            {"attn_k", 2560, 1024, YUUKA_DTYPE_Q4_K},
+            {"attn_v", 2560, 1024, YUUKA_DTYPE_Q6_K},
+            {"attn_v_q4k", 2560, 1024, YUUKA_DTYPE_Q4_K},
+            {"attn_output", 4096, 2560, YUUKA_DTYPE_Q4_K},
+            {"attn_gate", 2560, 4096, YUUKA_DTYPE_Q4_K},
+            {"attn_qkv", 2560, 8192, YUUKA_DTYPE_Q5_K},
+            {"ssm_out", 4096, 2560, YUUKA_DTYPE_Q5_K},
+            {"ssm_beta", 2560, 32, YUUKA_DTYPE_Q8_0},
+            {"lm_head", 2560, 248320, YUUKA_DTYPE_Q6_K},
+        };
+        std::printf("name,dtype,n_in,n_out,fp32_ms,fp32_GB/s,prequant_ms,"
+                    "prequant_GB/s,fused_ms,fused_GB/s\n");
+        for (const Shape & shape : shapes) {
+            const uint64_t bytes_per_row = row_bytes(shape.dtype, shape.n_in);
+            if (bytes_per_row == 0) {
+                std::fprintf(stderr, "SKIP shape %s: unsupported dtype %u\n", shape.name,
+                             shape.dtype);
+                continue;
+            }
+            if (!(shape.dtype == YUUKA_DTYPE_Q4_K || shape.dtype == YUUKA_DTYPE_Q5_K ||
+                  shape.dtype == YUUKA_DTYPE_Q6_K || shape.dtype == YUUKA_DTYPE_Q8_0)) {
+                // Only these four have an int8 row decoder.
+                continue;
+            }
+            Cell cell;
+            if (!alloc_cell(device, shape, 1, rng, cell)) {
+                free_cell(cell);
+                status = 1;
+                break;
+            }
+            // The digits the pre-quantized form reads, produced once like the
+            // plan does for a group of matvecs.
+            yuuka_buffer * qs = nullptr;
+            yuuka_buffer * ds = nullptr;
+            if (!check(yuuka_buffer_alloc(device, uint64_t(shape.n_in), &qs), "alloc q8") ||
+                !check(yuuka_buffer_alloc(device, uint64_t(shape.n_in / 32) * 8, &ds),
+                       "alloc q8 scales")) {
+                status = 1;
+            }
+            yuuka_plan * quant = nullptr;
+            if (status == 0 && check(yuuka_plan_create(device, &quant), "quant plan")) {
+                yuuka_op op{};
+                op.code = YUUKA_OP_QUANT_Q8_1;
+                op.buf[0] = cell.x;
+                op.buf[1] = qs;
+                op.buf[2] = ds;
+                op.n[0] = uint64_t(shape.n_in);
+                op.n[1] = 1;
+                if (!check(yuuka_plan_add(quant, &op), "add quantize") ||
+                    !check(yuuka_plan_execute(quant, stream, 0, 0, 1, completion),
+                           "execute quantize") ||
+                    !check(yuuka_event_wait(completion), "quantize wait")) {
+                    status = 1;
+                }
+                yuuka_plan_destroy(quant);
+            }
+            const double bytes = double(bytes_per_row) * double(shape.n_out);
+            const double fp32_ms = status == 0
+                ? submit(device, stream, completion, cell, shape, YUUKA_OP_LM_HEAD, 1) : 0;
+            double pre_ms = 0;
+            double fused_ms = 0;
+            if (status == 0) {
+                yuuka_plan * plan = nullptr;
+                if (check(yuuka_plan_create(device, &plan), "int8 plan")) {
+                    yuuka_op op{};
+                    op.code = YUUKA_OP_GEMV_Q8_1;
+                    op.buf[0] = cell.weights;
+                    op.buf[1] = qs;
+                    op.buf[2] = ds;
+                    op.buf[3] = cell.out;
+                    op.n[0] = uint64_t(shape.n_in);
+                    op.n[1] = uint64_t(shape.n_out);
+                    op.u[0] = shape.dtype;
+                    op.u[1] = 0;
+                    if (check(yuuka_plan_add(plan, &op), "add int8")) {
+                        pre_ms = time_plan(plan, stream, completion);
+                    } else {
+                        status = 1;
+                    }
+                    yuuka_plan_destroy(plan);
+                }
+            }
+            if (status == 0) {
+                yuuka_plan * plan = nullptr;
+                if (check(yuuka_plan_create(device, &plan), "fused plan")) {
+                    yuuka_op op{};
+                    op.code = YUUKA_OP_GEMV_Q8_1;
+                    op.buf[0] = cell.weights;
+                    op.buf[1] = cell.x;
+                    op.buf[3] = cell.out;
+                    op.n[0] = uint64_t(shape.n_in);
+                    op.n[1] = uint64_t(shape.n_out);
+                    op.u[0] = shape.dtype;
+                    op.u[1] = 1;
+                    if (check(yuuka_plan_add(plan, &op), "add fused")) {
+                        fused_ms = time_plan(plan, stream, completion);
+                    } else {
+                        status = 1;
+                    }
+                    yuuka_plan_destroy(plan);
+                }
+            }
+            if (status == 0 && (fp32_ms <= 0 || pre_ms <= 0 || fused_ms <= 0)) {
+                status = 1;
+            }
+            if (status == 0) {
+                std::printf("%s,%s,%lld,%lld,%.4f,%.1f,%.4f,%.1f,%.4f,%.1f\n", shape.name,
+                            dtype_name(shape.dtype),
+                            static_cast<long long>(shape.n_in),
+                            static_cast<long long>(shape.n_out), fp32_ms,
+                            bytes / (fp32_ms * 1e6), pre_ms, bytes / (pre_ms * 1e6),
+                            fused_ms, bytes / (fused_ms * 1e6));
+                std::fflush(stdout);
+            }
+            if (ds != nullptr) yuuka_buffer_free(ds);
+            if (qs != nullptr) yuuka_buffer_free(qs);
+            free_cell(cell);
+            if (status != 0) {
+                break;
+            }
+        }
+        yuuka_event_destroy(completion);
+        yuuka_stream_destroy(stream);
+        yuuka_device_close(device);
+        return status;
+    }
 
     if (threshold) {
         // The crossover behind lmHeadMinOutputs, at the decode width of

@@ -318,6 +318,69 @@ yuuka_status validate_lm_head_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// validate_gemv_i8_plan_op checks an int8 decode matvec: weights, the Q8_1
+// digits and block scales of the activation, and one FP32 output row.
+yuuka_status validate_gemv_i8_plan_op(const yuuka_op & op) {
+    const uint32_t source = op.u[1];
+    if (source > 1) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "unknown int8 gemv activation source %u",
+                    source);
+    }
+    // The output always lives in buf[3]; the fused form leaves buf[2] unused.
+    for (int i = 0; i < 4; ++i) {
+        if (i == 2 && source == 1) {
+            continue;
+        }
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv buffer %d is null", i);
+        }
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint32_t dtype = op.u[0];
+    if (n_in == 0 || n_out == 0 || n_in % 256 != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid int8 gemv shape %llu -> %llu",
+                    static_cast<unsigned long long>(n_in),
+                    static_cast<unsigned long long>(n_out));
+    }
+    const bool k_quant = dtype == YUUKA_DTYPE_Q4_K || dtype == YUUKA_DTYPE_Q5_K ||
+                         dtype == YUUKA_DTYPE_Q6_K;
+    if (!k_quant && dtype != YUUKA_DTYPE_Q8_0) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported int8 gemv dtype %u", dtype);
+    }
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t digit_bytes = 0;
+    uint64_t scale_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (!checked_row_bytes(n_in, dtype, &row_bytes) ||
+        __builtin_mul_overflow(row_bytes, n_out, &weight_bytes) ||
+        __builtin_mul_overflow(n_in, uint64_t(1), &digit_bytes) ||
+        __builtin_mul_overflow(n_in / 32, uint64_t(2 * sizeof(float)), &scale_bytes) ||
+        __builtin_mul_overflow(n_out, uint64_t(sizeof(float)), &out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv weight buffer is too small");
+    }
+    if (source == 0) {
+        if (!buffer_range_ok(op.buf[1], op.off[1], digit_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv digit buffer is too small");
+        }
+        if (!buffer_range_ok(op.buf[2], op.off[2], scale_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv scale buffer is too small");
+        }
+    } else if (!buffer_range_ok(op.buf[1], op.off[1], n_in * sizeof(float))) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "int8 gemv activation buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[3], op.off[3], out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv output buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 // validate_gemm_plan_op checks a prefill GEMM operation. Path AUTO and WMMA
 // read FP32 activations and accept every supported weight dtype. Path BLAS is
 // the rocBLAS FP16 baseline and therefore requires FP16 activations.
@@ -1681,6 +1744,19 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             yuuka_status status = launch_lm_head_dispatch(op, stream);
             if (status != YUUKA_OK) {
                 return status;
+            }
+            break;
+        }
+        case YUUKA_OP_GEMV_Q8_1: {
+            if (op.u[1] == 0) {
+                yuuka::launch_gemv_i8_f32out(
+                    op_ptr<float>(op, 3), op_ptr<const void>(op, 1),
+                    op_ptr<const void>(op, 2), op_ptr<const void>(op, 0), op.n[0],
+                    op.n[1], op.u[0], stream);
+            } else {
+                yuuka::launch_gemv_i8_fused_f32out(
+                    op_ptr<float>(op, 3), op_ptr<const float>(op, 1),
+                    op_ptr<const void>(op, 0), op.n[0], op.n[1], op.u[0], stream);
             }
             break;
         }
@@ -3091,7 +3167,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_LM_HEAD) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMV_Q8_1) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3143,6 +3219,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_LM_HEAD:
                 status = validate_lm_head_plan_op(*op);
+                break;
+            case YUUKA_OP_GEMV_Q8_1:
+                status = validate_gemv_i8_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

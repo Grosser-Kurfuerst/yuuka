@@ -111,6 +111,27 @@ void launch_lm_head_f32out(float * out, const float * x, const void * w,
                            uint64_t n_in, uint64_t n_out, uint64_t rows,
                            uint32_t dtype, hipStream_t stream);
 
+/* Int8 decode matvec.
+ *
+ * out[n_out] = W[n_out, n_in] * x, with x quantized to Q8_1 by
+ * launch_quantize_q8_1 (qs holds n_in int8 digits, ds its float2 block scales,
+ * which this kernel does not need because it sums the digits per sub-block
+ * itself). Q4_K, Q5_K, Q6_K, and Q8_0 weights are decoded straight to int8 and
+ * dotted with one v_dot4 per four weights. One row only; n_in must be a multiple
+ * of 256. An unknown dtype or a width outside that rule launches nothing, which
+ * leaves the caller on the FP32 streaming or per-row route. */
+void launch_gemv_i8_f32out(float * out, const void * qs, const void * ds,
+                           const void * w, uint64_t n_in, uint64_t n_out,
+                           uint32_t dtype, hipStream_t stream);
+
+/* Fused int8 decode matvec: the same product as launch_gemv_i8_f32out, but the
+ * activation row is quantized inside the block from the FP32 row instead of
+ * reading a separately quantized copy. Q4_K, Q5_K, Q6_K, and Q8_0 weights, one
+ * row, n_in a multiple of 256. */
+void launch_gemv_i8_fused_f32out(float * out, const float * x, const void * w,
+                                 uint64_t n_in, uint64_t n_out, uint32_t dtype,
+                                 hipStream_t stream);
+
 /* Dequantizes a packed K-quant weight matrix into FP16.
  *
  * dst holds n_in*n_out FP16 elements. src holds the packed [n_out, n_in] matrix
