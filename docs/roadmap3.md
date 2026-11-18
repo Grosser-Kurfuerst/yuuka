@@ -39,13 +39,13 @@ document in the same change.
 | Stage | Status | Gate |
 | --- | --- | --- |
 | S0: counter and attribution tooling in `scripts/` | Implemented (2026-11-18), see 3.1 | Reproducible counters for both engines |
-| S1: MMQ GEMM layout, epilogue, and K-stage pipelining | Not started | Isolated Q4_K `2560 -> 9216` at `M=512` at 19 TF/s or more |
+| S1: MMQ GEMM layout, epilogue, and K-stage pipelining | Implemented (2026-11-18); gate missed, see 4.6 | Isolated Q4_K `2560 -> 9216` at `M=512` at 19 TF/s or more |
 | S2: gated delta-net chunked form | Not started | 512-row chunk at 15 ms or less for 24 layers |
 | S3: MMA prefill attention | Not started | 512-token chunk at 6 ms or less; position 7680 at 150 ms or less |
 | S4: prefill LM head via batched GEMM | Not started | 4 ms or less per chunk |
 
-Only S0 is implemented; S1-S4 are not. The tables in section 2 are the decision
-summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
+S0 and S1 are implemented; S1 misses its 19 TF/s gate (4.6) and S2-S4 are not
+started. The tables in section 2 are the decision summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
 measured throughput, and this document records the attribution that motivates
 the order.
 
@@ -383,6 +383,78 @@ Acceptance: `quant_q8_1` operation time for a 512-row chunk drops by at least
 25% and the chunk total improves by at least 1 ms, with `dispatch_test.go`
 updated for the new selection.
 
+### 4.6 Implementation results (2026-11-18)
+
+Changes at `8410e30` plus this stage:
+
+- both operands are staged in WMMA fragment register order, one 32-value K pair
+  per 512-byte region with a 16-byte slot per lane, so one `ds_read_b128` feeds
+  two MMAs (S1a);
+- staging is assigned per warp with whole 512-byte regions and 16-byte lane
+  stores, which removes the bank conflicts (S1a);
+- Q4_K/Q5_K spans decode with a word-wide nibble expansion instead of per-value
+  shifts (S1b);
+- the K step is 128 values, which keeps the staged operands at 30 KiB and two
+  blocks resident per CU (S1d, third variant of section 4.4);
+- the epilogue writes accumulators directly to global memory (S1c restructure);
+- the plan quantizes the normalized tile once per q/k/v and qkv/gate group
+  (S1e).
+
+Measured with `scripts/prefill_counters.sh` on the section 2.4 cell and with
+`build/yuuka_prefill_sweep` at `M=512`:
+
+| Gate | Before | After | Target |
+| --- | ---: | ---: | ---: |
+| `LDSBankConflict` (S1a) | 35.94% | 0.00% | at most 15% |
+| LDS per MMA (S1a) | 4.89 | 4.75 | at most 2.5 |
+| VALU per MMA (S1b/S1c) | 24.77 | 22.19 | at most 20 |
+| `OccupancyPercent` | 23.9% | 45.6% | - |
+| Q4_K `2560 -> 9216` `M=512` | 13.8 TF/s | 17.3-18.5 TF/s | 19 TF/s |
+| Q5_K `2560 -> 9216` `M=512` | 12.8 TF/s | 17.6-18.1 TF/s | - |
+| Q6_K `2560 -> 9216` `M=512` | 11.3 TF/s | 13.1-14.4 TF/s | - |
+
+The layout and occupancy changes are adopted; the stage gate is missed by 3-9%
+depending on clock state. The remaining costs are measured, not assumed:
+
+1. LDS per MMA cannot reach 2.5 through the rocWMMA path. `mma_sync` expands
+   each gfx11 wave32 operand by duplicating it in registers, which costs 2.5
+   `ds_swizzle_b32` per MMA on the LDS pipe (160 per 64-MMA step). Feeding the
+   builtin directly requires the duplicated 16-byte operands, which raises the
+   staged operands from 30 KiB to 51 KiB, drops the CU to one resident block,
+   and measured 14.6 TF/s in the equivalent one-block configuration. Rebuilding
+   the duplicate in registers moves the same 2.5 operations per MMA onto the
+   VALU pipe, which is the limiter.
+2. The scale application is four VALU per accumulator element per block
+   (convert, scale product, main FMA, minimum FMA). Each block updates eight
+   elements per accumulator fragment while issuing two MMAs per fragment, so
+   this is 16 VALU per MMA by construction. Section 4.3's "two FMA per element"
+   is not reachable: `wd[e] * dsb.x` depends on the accumulator tile through
+   `dsb.x`, so it cannot be hoisted out of the tile loop, and
+   `v_fma_mix_f32` does not convert an integer operand on gfx1151 (measured).
+   The stage therefore lands at 22.2 rather than 16.8 VALU per MMA.
+
+S1e measurements: the quantized-tile sharing removes 40 of 168 `quant_q8_1`
+operations in a 512-row chunk (168 -> 128, each remaining pass covers a distinct
+tile), and `quant_q8_1` time drops from 4.0 to 3.05 ms per chunk (-24%, just
+short of the 25% gate). The chunk total improves by 14 ms (327 -> 313 ms at
+`prompt=512`), which clears the 1 ms gate. Routing `ssm_beta`/`ssm_alpha`
+(`nOut = 32`, Q8_0) through batched GEMV was measured and rejected: 1.19 ms for
+32 batch-16 submissions against 0.12 ms for the WMMA tile at 512 rows, and the
+tile time is activation-bound (0.12 ms at `nOut` 32, 64, and 256), so a
+narrow-N tile could recover at most 2% of that call. The dispatch table is
+unchanged.
+
+Numerics are unchanged: `tests/hip/prefill_test.cpp` reports the same maximum
+absolute differences (Q4_K 6.87e-5, Q5_K 1.53e-4) and identical Q8_1 digits,
+`TestGPUMatchesCPU` reports the same 0.00309944 maximum logit difference, and
+`TestGPUChunkedPrefillLongContext` keeps top-1 33075 with a maximum difference of
+0 at chunks 512 and 1024. End-to-end prefill with F32 KV moved from 1062 to 1354
+tok/s at 128 tokens, 1324 to 1612 at 512, 1176 to 1424 at 2048, and 788 to 875
+at 8192.
+
+Resources: 133 VGPRs, 38-40 SGPRs, no spills, no scratch, dynamic LDS 30720
+(`scripts/kernel_resources.sh`), against 163-178 VGPRs before.
+
 ## 5. Stage S2: gated delta-net chunked form
 
 Implement the chunkwise gated delta rule described in roadmap2 section 3.5,
@@ -474,6 +546,10 @@ values, not measurements. They assume every stage reaches its gate and nothing
 regresses. The long-context gain is larger because S3 removes the term that
 dominates at 8192 tokens.
 
+Measured after S1 (section 4.6): a 512-token chunk takes 313 ms against the 385
+ms baseline and 287 ms projected, and pp512 is 1609-1640 tok/s against the 1784
+t/s projection, because the MMQ GEMM reached 17.3-18.5 TF/s instead of 19.
+
 ## 10. Rejected routes and open questions
 
 Rejected under this plan (record the measurement in the commit body if a
@@ -481,6 +557,25 @@ variant is tried again):
 
 - Adding warps or blocks before fixing the instruction mix: yuuka already
   keeps twice the reference's resident waves.
+- A double-buffered 128-value K stage at 60 KiB: one block per CU measured
+  14.6 TF/s on the Q4_K cell against 17.1 for the 30 KiB single-buffer form
+  that keeps two blocks resident.
+- Register prefetch of the next step's weight spans: 192 VGPRs with 161-195
+  spill slots and 512-544 bytes of scratch per lane, 6.4 TF/s.
+- A 64-value K step at 15 KiB: four blocks per CU but twice the barriers, 16.4
+  TF/s on the wide shapes and 13.7 on the tall shape against 17.3-18.3.
+- Rebuilding the gfx11 WMMA operand duplication to drop `mma_sync`'s
+  `ds_swizzle_b32`: doubling the staged operands costs the second resident
+  block, and duplicating in registers costs the same operation count on the VALU
+  pipe.
+- `v_fma_mix_f32` for the int32-to-float conversion: no operand
+  `op_sel`/`op_sel_hi` combination converts an integer operand on gfx1151.
+- `__builtin_amdgcn_perm` (V_PERM_B32) nibble expansion: the instruction did not
+  produce a nibble gather on this part under any selector encoding, so the
+  word-wide mask expansion is used.
+- Batched GEMV for the narrow `ssm_beta`/`ssm_alpha` projections: 1.19 ms
+  against 0.12 ms for the WMMA tile at 512 rows, because the batched kernel caps
+  the batch at 16 and the tile is activation-bound rather than output-bound.
 - Keeping the 272-byte-stride tile and only changing the padding: the conflict
   pattern is a consequence of the layout, not of the pad width.
 - Moving the delta-net recurrence to more workgroups without changing the

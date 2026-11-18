@@ -29,6 +29,48 @@ func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint
 	}
 }
 
+// prefillProjection is one prefill matmul that reads the shared activation
+// tile at offset zero.
+type prefillProjection struct {
+	w    weight
+	out  *hip.Buffer
+	nOut int64
+}
+
+// prefillProjections runs several projections that read the same activation
+// tile. When two or more of them select the MMQ route, the Q8_1 quantization of
+// that tile runs once for the group instead of once per projection; the q/k/v
+// and qkv/gate groups are the measured case. Projections on other routes keep
+// their own implementation and their own input handling.
+func (m *Model) prefillProjections(plan *hip.Plan, x *hip.Buffer, nIn, rows int64,
+	projections []prefillProjection) error {
+	mmq := 0
+	for _, projection := range projections {
+		if hip.SelectPrefillPath(projection.w.dtype, rows, nIn, projection.nOut) == hip.PrefillMMQ {
+			mmq++
+		}
+	}
+	if mmq > 1 {
+		if err := plan.AddQuantizeQ8_1At(x, 0, m.prefill.xQ8, m.prefill.xDS, nIn, rows); err != nil {
+			return err
+		}
+	}
+	for _, projection := range projections {
+		if mmq > 1 && hip.SelectPrefillPath(projection.w.dtype, rows, nIn, projection.nOut) == hip.PrefillMMQ {
+			if err := plan.AddGemmMmqAt(projection.w.buf, 0, m.prefill.xQ8, m.prefill.xDS,
+				projection.out, 0, nIn, projection.nOut, rows, projection.w.dtype); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := m.prefillMatmul(plan, projection.w, x, 0, projection.out, 0, nIn,
+			projection.nOut, rows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // prefillMMQPrepared quantizes the activation tile to Q8_1 and runs the int8
 // GEMM. The quantization is a separate plan operation so a gate/up pair that
 // reads the same normalized tile can share it.
@@ -435,13 +477,11 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillMatmul(plan, q, p.norm, 0, p.q, 0, hidden, qDim, rows); err != nil {
-		return err
-	}
-	if err := m.prefillMatmul(plan, k, p.norm, 0, p.k, 0, hidden, kvDim, rows); err != nil {
-		return err
-	}
-	if err := m.prefillMatmul(plan, v, p.norm, 0, p.v, 0, hidden, kvDim, rows); err != nil {
+	if err := m.prefillProjections(plan, p.norm, hidden, rows, []prefillProjection{
+		{w: q, out: p.q, nOut: qDim},
+		{w: k, out: p.k, nOut: kvDim},
+		{w: v, out: p.v, nOut: kvDim},
+	}); err != nil {
 		return err
 	}
 	if err := plan.AddRMSNormHeadsBatchAt(p.q, 0, qNorm.buf, p.q, 0,
@@ -533,16 +573,12 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillMatmul(plan, qkv, p.norm, 0, p.qkv, 0, hidden, convDim, rows); err != nil {
-		return err
-	}
-	if err := m.prefillMatmul(plan, gate, p.norm, 0, p.z, 0, hidden, inner, rows); err != nil {
-		return err
-	}
-	if err := m.prefillMatmul(plan, beta, p.norm, 0, p.beta, 0, hidden, rank, rows); err != nil {
-		return err
-	}
-	if err := m.prefillMatmul(plan, alpha, p.norm, 0, p.alpha, 0, hidden, rank, rows); err != nil {
+	if err := m.prefillProjections(plan, p.norm, hidden, rows, []prefillProjection{
+		{w: qkv, out: p.qkv, nOut: convDim},
+		{w: gate, out: p.z, nOut: inner},
+		{w: beta, out: p.beta, nOut: rank},
+		{w: alpha, out: p.alpha, nOut: rank},
+	}); err != nil {
 		return err
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))

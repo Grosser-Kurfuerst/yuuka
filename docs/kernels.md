@@ -212,7 +212,8 @@ Prefill uses a separate operator family from decode. The runtime selects one of:
 - **rocBLAS FP16**: the external baseline in `kernels/hip/gemm/gemm_blas.hip`.
   It requires an FP16 activation buffer; the planner inserts an explicit cast.
 - **Int8 MMQ**: `kernels/hip/gemm/mmq_gemm.hip` keeps Q4_K/Q5_K/Q6_K weights
-  quantized, quantizes the activations to Q8_1, and accumulates exact int32
+  quantized, stages both operands in WMMA fragment order, quantizes the
+  activations to Q8_1, and accumulates exact int32
   products in 16x16x16 int8 WMMA. See 6.3.
 
 All four are validated against a float reference built from the exact packed
@@ -312,9 +313,9 @@ improve 48-50% for Q4_K, 49-54% for Q5_K, 32-49% for Q8_0, 3-23% for Q6_K, and
 time of that change. See [benchmarks.md](benchmarks.md#isolated-kernels).
 
 The int8 MMQ route (6.3) now carries K-quants from 128 rows up, so the current
-numbers for the wide shapes come from it: 13.7 TFLOP/s on Q4_K
-`2560 -> 9216` at `M = 512` against 8.5 for this WMMA tile, and a 512-token
-prefill of 1324 tok/s end to end against llama.cpp's 2346 tok/s on the same
+numbers for the wide shapes come from it: 17.3-18.3 TFLOP/s on Q4_K
+`2560 -> 9216` at `M = 512` against 8.4 for this WMMA tile, and a 512-token
+prefill of 1612 tok/s end to end against llama.cpp's 2346 tok/s on the same
 device. The gap record is in
 [benchmarks.md](benchmarks.md#llamacpp-comparison).
 
@@ -352,14 +353,14 @@ activation block sum. Ties round to even (`rintf`). The width must be a multiple
 of 128, so a wave never crosses a row.
 
 `gemm_mmq_kernel<DType>` computes a 64 output-channel by 128 token tile with
-eight waves, a 256-wide K step, and 64512 bytes of dynamic shared memory:
+eight waves, a 128-value K step, and 30720 bytes of dynamic shared memory:
 
 | Slice | Layout | Bytes |
 | --- | --- | ---: |
-| A, decoded weights | `[64][272]` int8 | 17408 |
-| B, Q8_1 activations | `[128][272]` int8 | 34816 |
-| A scales | `[16][64]` float, scale-slot major | 4096 |
-| B scales | `[8][128]` float2, block major | 8192 |
+| A, decoded weights | fragment order, `[4][4][512]` | 8192 |
+| B, Q8_1 activations | fragment order, `[8][4][512]` | 16384 |
+| A scales | `[8][64]` float, scale-slot major | 2048 |
+| B scales | `[4][128]` float2, block major | 4096 |
 
 Each wave owns one 16-row weight fragment at `row_base = (warp % 4) * 16` and
 four 16-column activation fragments at `col_base = (warp / 4) * 64`. The int32
@@ -368,47 +369,74 @@ product on this device: lane `l`, element `e` holds output row
 `2*e + l/16` of column `l%16`, so a lane applies one activation scale (its
 column) and eight weight scales (its rows) per block.
 
-Both tiles use a 272-byte row stride, not 256. At 256 every row of a tile starts
-on the same shared-memory bank and the 16x16 int8 fragment loads conflict 16
-ways: the identical compute loop measures 12.5 TFLOP/s at 256 bytes against
-48.1 TFLOP/s at 272 bytes. The padding costs 1 KiB per tile.
+Both operands are staged in the fragment register order of the int8 WMMA, not in
+row-major tiles. A 16x16 int8 fragment is 256 bytes and `rocwmma` loads eight
+bytes per lane, where lane `l` holds row `l%16` of the 8-value K half `l/16`.
+Staging therefore groups one 32-value K pair into a 512-byte region whose lane
+`l` slot holds 16 bytes: the first 16-value slice in bytes 0-7 and the second in
+bytes 8-15. One `ds_read_b128` then feeds two MMAs, five 128-bit loads serve the
+eight MMAs of a K pair, and the staging stores become 16-byte lane stores.
+
+Staging is assigned per warp: each warp owns whole 512-byte regions and every
+lane fills one 16-byte slot, so a warp store covers one contiguous region. The
+measured `LDSBankConflict` rate is 0.0% against 35.9% for the previous
+272-byte-stride row-major staging. Q4_K/Q5_K spans are decoded with a
+word-wide nibble expansion (a shift and one `0x0F0F0F0F` mask for eight
+digits, plus a bit-plane move for the Q5_K fifth bit); Q6_K block starts are only
+2-byte aligned, so its spans are still assembled from 16-bit halves.
+
+The K step is 128 values rather than 256. The staged operands then take 30 KiB,
+which keeps two blocks resident per CU (measured `OccupancyPercent` 45.6%
+against 23.9%), and the staging stalls of one block are covered by the other
+block's MMAs. A 256-value step needs 60 KiB and one block, and a 64-value step
+adds enough barriers to lose the tall-K shapes; both were measured and rejected
+(see [benchmarks.md](benchmarks.md#decisions-and-rejected-routes)).
 
 The Q4_K/Q5_K scale (one per 32 values) is applied after each pair of 16-wide
 slices, which is exact because the int32 partial sum is exact and the scale is
 constant across the block; the minimum term adds `-(d_m * m) * d_a * sum(q)`.
 Q6_K has one scale per 16 values and no minimum, so it applies the scale per
 slice. The weight scales load once per block and are reused by all four
-accumulator tiles. `MMA -> accumulate -> scale` dependencies are what limit this
-kernel: the MMA-only ceiling for the same geometry is 52 TFLOP/s (no fragment
-loads) and 48 TFLOP/s with loads, while the full kernel measures 10.4-14.8
-TFLOP/s. Software-pipelining the scale application behind the next block's MMAs
-was measured and rejected: it pushed the kernel to 192 VGPRs with 11 spills and
-lost 3-6%.
+accumulator tiles.
 
-Three throughput variants were then measured against this schedule, and none
-was adopted (`benchmarks.md`, 2026-11-17 MMQ throughput variants): vectorizing
-both scale tiles so a lane reads each scale run with `float4` instead of scalar
-loads (0.98x geometric mean over 18 M=128/M=512 K-quant cells, and it pushed
-Q5_K to six spills), hoisting every per-lane scale and epilogue index base with a
-compile-time dtype test (1.00x, no spills), and a fully unrolled ping-pong that
-issues the next block's MMAs before applying the previous block's scales (0.93x,
-192 VGPRs and 11 spills). The committed kernel still profiles at 41.0
-instructions per WMMA (24.8 VALU, 4.9 LDS) and 513 wave cycles per WMMA on Q4_K
-`2560 -> 9216` at M=512, against 2,949,120 WMMAs per launch: the loop is
-latency-bound on the int32-accumulator dependency, and neither LDS traffic nor
-index arithmetic is the limiter. Raising throughput requires shortening that
-dependency or changing the accumulator-tile geometry, not reducing instruction
-count.
+The epilogue writes the accumulators straight to global memory. For a fixed
+fragment the warp's 16 low lanes cover 16 consecutive tokens of one output
+channel, so each store instruction covers two 64-byte runs. Transposing through
+a shared-memory tile instead needs 33 KiB, which would break the two-block
+residency, and the direct stores measure the same within noise.
+
+The loop is limited by VALU issue, not by LDS: 41.6 instructions per WMMA of
+which 22.2 are VALU and 4.8 are LDS on Q4_K `2560 -> 9216` at `M=512`. Two
+costs dominate. First, rocWMMA duplicates gfx11 wave32 operands in registers, so
+every `mma_sync` costs 2.5 `ds_swizzle_b32` on the LDS pipe; feeding the builtin
+directly needs the duplicated 16-byte operands staged in LDS, which doubles the
+operand budget to 51 KiB and drops to one block per CU, and reconstructing the
+duplicate in registers costs the same two moves per fragment on the VALU pipe.
+Second, the scale application is four VALU per accumulator element per block
+(`int32 -> float` conversion, the scale product, the main FMA, and the minimum
+FMA), which is 16 VALU per WMMA by construction: each block updates eight
+elements per fragment while issuing two MMAs per fragment. `v_fma_mix_f32` does
+not convert an integer operand on gfx1151, so the conversion cannot be folded.
 
 Tails are masked: rows outside the batch stage zeros (their scales and sums are
 zero) and output rows and channels outside `n_out` are not written. `n_in` must
-be a multiple of 256, which every K-quant row layout already requires. The
-epilogue reuses the operand staging area as a `[128][65]` float tile, then all
-256 threads write coalesced over the output channel.
+be a multiple of 128; every K-quant row layout is a multiple of 256.
 
-Measured resources on gfx1151: 163-178 VGPRs, 48-52 SGPRs, no spills, no
-scratch, 8 waves/SIMD, dynamic LDS 64512. The quantizer reports 20 VGPRs and 16
-waves/SIMD.
+Measured resources on gfx1151: 133 VGPRs, 38-40 SGPRs, no spills, no scratch,
+10 waves/SIMD resource limit with two blocks resident per CU, dynamic LDS
+30720. The quantizer reports 20 VGPRs and 16 waves/SIMD.
+
+Measured throughput at `M = 512` (sweep, five timed submissions after two
+warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
+12.4-14.4 TFLOP/s across the three shapes, against 13.5-14.1, 12.6-13.4, and
+11.0-11.6 TFLOP/s before the layout and occupancy change. The route is still
+1.2x below llama.cpp's MMQ kernel on the same device; the remaining
+attribution is in [roadmap3.md](roadmap3.md#4-stage-s1-mmq-gemm-highest-value-73-of-the-gap).
+
+The q/k/v and qkv/gate groups read the same normalized tile, so the plan
+quantizes it once per group instead of once per projection
+(`prefillProjections` in `engine/gpu/plan.go`); a 512-row chunk runs 128
+`quant_q8_1` operations instead of 168.
 
 ### 6.4 Dispatch
 

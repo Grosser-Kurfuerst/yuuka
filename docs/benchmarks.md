@@ -11,7 +11,7 @@ clock, power, and thermal state are not pinned.
 
 | Field | Value |
 | --- | --- |
-| Date | 2026-11-17 |
+| Date | 2026-11-18 |
 | Model | `Qwen3.5-4B-Q4_K_M.gguf` |
 | Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
 | Model size | 2,740,937,888 bytes |
@@ -23,7 +23,7 @@ clock, power, and thermal state are not pinned.
 | Kernel | 7.0.14-28-pve |
 | Power performance level | `auto` (amdgpu sysfs) |
 | Go | go1.24.4, Release `cmake --build build` |
-| Commit | `9767284` |
+| Commit | `4542db8` |
 | Tokenizer / chat template | GGUF-embedded Qwen3.5 vocabulary and template |
 | Sampling | Greedy, temperature 0 |
 | Prefill chunk | 512 tokens (`--chunk-size 512`), except where a row states otherwise |
@@ -64,7 +64,7 @@ Current tree, same commit:
 | `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE) | 9 / 9 pass |
 | `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
 | `TestGPUMatchesCPU` | first-step maximum logit difference `0.00309944`, greedy tokens match |
-| `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.7e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
+| `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.9e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
 | `go build ./...`, `go vet ./...`, `go test ./...`, `go test -tags hip ./...` | pass |
 
 The Q8_1 prefill path moves logits against an FP16-activation reference
@@ -80,20 +80,20 @@ stated, median of five repetitions:
 
 | Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 0.121 s | 1061.7 | - | - | - | - |
-| 512 | 0.387 s | 1323.7 | 0.387 s | 1323.0 | 0.387 s | 1323.3 |
-| 1024 | 0.793 s | 1290.5 | - | - | - | - |
-| 2048 | 1.742 s | 1175.9 | 1.697 s | 1207.2 | 1.739 s | 1177.4 |
-| 4096 | 4.069 s | 1006.6 | - | - | - | - |
-| 8192 | 10.390 s | 788.4 | 7.384 s | 1109.4 | - | - |
+| 128 | 0.094 s | 1362.4 | 0.094 s | 1358.3 | 0.095 s | 1352.6 |
+| 512 | 0.318 s | 1609.1 | 0.316 s | 1620.0 | 0.317 s | 1615.6 |
+| 1024 | 0.654 s | 1565.9 | 0.658 s | 1556.2 | 0.663 s | 1545.3 |
+| 2048 | 1.447 s | 1415.4 | 1.436 s | 1426.3 | 1.512 s | 1354.5 |
+| 4096 | 3.540 s | 1157.1 | 2.831 s | 1447.1 | 3.416 s | 1198.9 |
+| 8192 | 9.333 s | 877.7 | 6.374 s | 1285.2 | 9.099 s | 900.3 |
 
-The F16 KV column rises above F32 from 2048 tokens because the matrixized
+The F16 KV column rises above F32 from 4096 tokens because the matrixized
 rocBLAS prefill-attention path is selected for F16 KV once the attention
-context reaches 2048; at 8192 tokens it is 1.41x faster than the tiled path.
-F32 and Q8_0 KV keep the tiled kernel, and the two KV formats are within noise
-of each other. At 512 tokens the chunk cost is dominated by the quantized GEMM
-([isolated kernels](#isolated-kernels)); at long context the tiled attention
-kernel is the limiter.
+context reaches 2048; the two are within noise at 2048 tokens and F16 is 1.25x
+faster at 4096 and 1.46x at 8192. F32 and Q8_0 KV keep the tiled kernel and are
+within noise of each other. At 512 tokens the chunk cost is dominated by the
+quantized GEMM ([isolated kernels](#isolated-kernels)); at long context the
+tiled attention kernel is the limiter.
 
 ## Decode: output length
 
@@ -164,35 +164,39 @@ pass; `wmma` is the custom rocWMMA kernel. K-quant dispatch selects `mmq` for
 
 | dtype | shape (K -> N) | M | wmma | mmq |
 | --- | --- | ---: | ---: | ---: |
-| Q4_K | 2560 -> 9216 | 128 | 8.4 | 12.8 |
-| Q4_K | 2560 -> 9216 | 512 | 8.5 | 13.7 |
-| Q4_K | 9216 -> 2560 | 128 | 9.6 | 14.5 |
-| Q4_K | 9216 -> 2560 | 512 | 8.2 | 13.7 |
-| Q4_K | 2560 -> 8192 | 128 | 7.7 | 11.4 |
-| Q4_K | 2560 -> 8192 | 512 | 8.6 | 14.0 |
-| Q5_K | 2560 -> 9216 | 128 | 8.3 | 12.2 |
-| Q5_K | 2560 -> 9216 | 512 | 8.1 | 13.0 |
-| Q5_K | 9216 -> 2560 | 128 | 9.3 | 13.7 |
-| Q5_K | 9216 -> 2560 | 512 | 8.0 | 12.8 |
-| Q5_K | 2560 -> 8192 | 128 | 7.6 | 10.8 |
-| Q5_K | 2560 -> 8192 | 512 | 8.6 | 13.4 |
-| Q6_K | 2560 -> 9216 | 128 | 7.5 | 11.4 |
-| Q6_K | 2560 -> 9216 | 512 | 7.7 | 11.9 |
-| Q6_K | 9216 -> 2560 | 128 | 7.3 | 12.8 |
-| Q6_K | 9216 -> 2560 | 512 | 6.2 | 11.0 |
-| Q6_K | 2560 -> 8192 | 128 | 6.9 | 10.0 |
-| Q6_K | 2560 -> 8192 | 512 | 7.8 | 12.3 |
+| Q4_K | 2560 -> 9216 | 128 | 8.6 | 17.2 |
+| Q4_K | 2560 -> 9216 | 512 | 8.4 | 17.3 |
+| Q4_K | 9216 -> 2560 | 128 | 9.8 | 18.4 |
+| Q4_K | 9216 -> 2560 | 512 | 8.0 | 18.3 |
+| Q4_K | 2560 -> 8192 | 128 | 7.8 | 15.6 |
+| Q4_K | 2560 -> 8192 | 512 | 8.3 | 17.9 |
+| Q5_K | 2560 -> 9216 | 128 | 8.5 | 17.2 |
+| Q5_K | 2560 -> 9216 | 512 | 8.3 | 17.6 |
+| Q5_K | 9216 -> 2560 | 128 | 8.6 | 17.4 |
+| Q5_K | 9216 -> 2560 | 512 | 7.5 | 18.1 |
+| Q5_K | 2560 -> 8192 | 128 | 7.9 | 14.8 |
+| Q5_K | 2560 -> 8192 | 512 | 8.5 | 17.5 |
+| Q6_K | 2560 -> 9216 | 128 | 7.3 | 14.0 |
+| Q6_K | 2560 -> 9216 | 512 | 7.6 | 14.4 |
+| Q6_K | 9216 -> 2560 | 128 | 7.1 | 14.0 |
+| Q6_K | 9216 -> 2560 | 512 | 6.4 | 12.4 |
+| Q6_K | 2560 -> 8192 | 128 | 6.8 | 12.9 |
+| Q6_K | 2560 -> 8192 | 512 | 7.2 | 13.1 |
 
 F16 and Q8_0 rows are not routed through `mmq`; for reference, `wmma` reaches
 8.0-9.2 TFLOP/s on Q8_0 and 3.4-4.7 on F16, while dequantize-plus-rocBLAS
 reaches 16.0-19.0 on F16 for the wide shapes (8.1 on the tall-`K` row) plus the
 dequantize pass, and is rejected for K-quants on numeric grounds.
 
-The int8 route profiles at 41.0 instructions (24.8 VALU, 4.9 LDS) and 513 wave
-cycles per 4096-MAC WMMA on Q4_K `2560 -> 9216` at M=512, against an MMA-only
-ceiling of 48-52 TFLOP/s for the same tile geometry. The loop is latency-bound
-on the int32 accumulator dependency; see
-[decisions and rejected routes](#decisions-and-rejected-routes).
+The int8 route profiles at 41.6 instructions (22.2 VALU, 4.8 LDS) per
+4096-MAC WMMA on Q4_K `2560 -> 9216` at M=512, with `LDSBankConflict` at 0.0%
+and two blocks resident per CU (`OccupancyPercent` 45.6%), against an MMA-only
+ceiling of 48-52 TFLOP/s for the same tile geometry. The loop is VALU-issue
+bound: 16 of the 22.2 VALU are the scale application, which is four operations
+per accumulator element per 32-value block by construction, and 2.5 of the 4.8
+LDS are the `ds_swizzle_b32` that rocWMMA uses to duplicate gfx11 wave32
+operands. See [decisions and rejected routes](#decisions-and-rejected-routes)
+and [kernels.md](kernels.md#63-int8-mmq-gemm).
 
 ### Batched GEMV
 
@@ -326,10 +330,10 @@ server scheduling, so CLI and server numbers are not interchangeable.
 
 | Test | llama.cpp t/s | yuuka t/s | yuuka/llama |
 | --- | ---: | ---: | ---: |
-| pp128 | 1743.28 ± 233.98 | 1061.7 (F32 KV) | 0.61 |
-| pp512 | 2346.17 ± 80.87 | 1323.7 (F32 KV) | 0.56 |
-| pp2048 | 2409.70 ± 5.39 | 1175.9 (F32 KV) / 1207.2 (F16 KV) | 0.49 / 0.50 |
-| pp8192 | 2170.79 ± 4.19 | 788.4 (F32 KV) / 1109.4 (F16 KV) | 0.36 / 0.51 |
+| pp128 | 1743.28 ± 233.98 | 1362.4 (F32 KV) | 0.78 |
+| pp512 | 2346.17 ± 80.87 | 1609.1 (F32 KV) | 0.69 |
+| pp2048 | 2409.70 ± 5.39 | 1415.4 (F32 KV) / 1426.3 (F16 KV) | 0.59 / 0.59 |
+| pp8192 | 2170.79 ± 4.19 | 877.7 (F32 KV) / 1285.2 (F16 KV) | 0.40 / 0.59 |
 | tg128 (prompt 128) | 62.29 ± 0.19 | 9.61 (F32 KV) | 0.15 |
 
 The remaining gaps, in order of size:
@@ -337,12 +341,12 @@ The remaining gaps, in order of size:
 1. Decode, 6.5x: llama.cpp streams the 2.74 GB of quantized weights at about
    170 GB/s, near the practical memory roofline; yuuka's single-request GEMV
    path reaches roughly 26 GB/s, and its decode step is dominated by that pass.
-2. Prefill at short and mid prompt lengths, 1.6-2.1x: the quantized prefill GEMM
-   runs at 13-14 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
+2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
+   runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see
-   [isolated kernels](#isolated-kernels)), and the gated delta-net chunk adds
+   [isolated kernels](#isolated-kernels)); the gated delta-net chunk adds
    further time yuuka does not measure separately here.
-3. Long-context prefill, 2.0-2.8x: the gap narrows with the F16 matrixized
+3. Long-context prefill, 1.7-3.0x: the gap narrows with the F16 matrixized
    attention default and stays widest with F32 KV, where the tiled attention
    kernel is the limiter.
 4. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
@@ -360,11 +364,20 @@ Each of these is a measured decision that still holds in the current code:
   1.6-3.3x faster per GEMM from 256 rows upward but numerically rejected on
   tall-K shapes and needed an FP16 copy of every weight matrix; the int8 MMQ
   route replaced it.
-- **MMQ schedule variants are rejected.** Vectorizing both scale tiles (0.98x
-  over 18 cells, and Q5_K began spilling), hoisting every per-lane index base
-  (1.00x), and a double-accumulator ping-pong (0.93x, 11 spill slots) all lost
-  to the committed schedule. The loop is latency-bound on the int32 accumulator
-  dependency, so instruction count and LDS traffic are not the limiter.
+- **The MMQ staging and K-step shape are settled.** The adopted change stages
+  both operands in WMMA fragment order (0.0% bank conflicts from 35.9%),
+  expands Q4_K/Q5_K digits with word-wide masks, and uses a 128-value K step so
+  two blocks stay resident per CU: 13.8 -> 17.3-18.5 TFLOP/s on Q4_K
+  `2560 -> 9216` at M=512. Rejected against it, in [roadmap3.md](roadmap3.md#10-rejected-routes-and-open-questions):
+  a 60 KiB double-buffered 256-value stage (one block per CU, 14.6 TFLOP/s),
+  register prefetch of the next step's weights (192 VGPRs, 161-195 spills,
+  6.4 TFLOP/s), a 64-value K step (16.4 TFLOP/s), and rebuilding the rocWMMA
+  gfx11 operand duplication to remove its `ds_swizzle_b32` cost.
+- **The MMQ scale epilogue is not reducible to two FMA per element.** The
+  activation scale differs per accumulator tile, so the 32 multiplies of a
+  32-value block cannot be hoisted, and `v_fma_mix_f32` does not convert an
+  integer operand on gfx1151. The loop keeps four VALU per element per block,
+  which is 16 of its 22.2 VALU per WMMA.
 - **128-row WMMA tiles and a 64-wide K step are rejected** for the custom GEMM.
   The 64x64/K32 and 32x64 variants remain the dispatch choice for the paths they
   serve, and the wide K-quant shapes in this report come from the int8 MMQ route

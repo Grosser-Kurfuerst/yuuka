@@ -18,42 +18,78 @@
 // The implementation here is independent: staging, tile shape, scale layout,
 // and epilogue were written for this repository and validated against the CPU
 // reference in tests/hip/prefill_test.cpp.
+//
+// Measured on gfx1151 at Q4_K 2560 -> 9216 with M=512, the staging and the K
+// loop are organized for instruction issue rather than for raw bandwidth:
+//   - both operands are staged in fragment register order, so each fragment
+//     pair is one ds_read_b128 and the staging stores are conflict free
+//     (LDSBankConflict 0.0% against 35.9% for row-major staging);
+//   - the K step is 128 values, which keeps the staged operands at 30 KiB and
+//     therefore two blocks resident per CU (occupancy 45.6% against 23.9%);
+//   - the epilogue writes the accumulators straight to global memory instead
+//     of transposing through a 33 KiB LDS tile, which would break the two-block
+//     residency for a store pattern that is already two 64-byte runs per warp.
+// See docs/kernels.md for the contract and docs/roadmap3.md for the attribution.
 
 namespace {
 
 constexpr int kTileI = 64;   // output channels (weight rows)
 constexpr int kTileJ = 128;  // tokens
-constexpr int kStepK = 256;
+constexpr int kStepK = 128;  // K values staged per step
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
-constexpr int kSpan = 8;
-constexpr int kSpansPerRow = kStepK / kSpan;
+constexpr int kSpan = 8;  // weight values decoded per step_weight_span call
 constexpr int kBlock32 = kStepK / 32;
-// Row stride of the staged operand tiles. A 256-byte stride makes every tile
-// row start at the same shared-memory bank, and the 16x16 int8 fragment loads
-// then conflict 16 ways: measured 12.5 TF/s against 48.1 TF/s at 272 bytes. The
-// padding adds 1 KiB per tile and keeps the stride a multiple of the 16-byte
-// fragment granularity.
-constexpr int kTileStride = 272;
-// Epilogue row stride. Padding the token-major staging tile moves the lane
-// stores in the accumulator epilogue off a single shared-memory bank.
-constexpr int kEpilogueStride = kTileI + 1;
+
+// Both operands are staged in the fragment register order of the int8 WMMA
+// instead of plain rows. A 16x16 int8 fragment is 256 bytes; rocWMMA loads it
+// as eight bytes per lane, where lane l holds row l%16 of the 8-value K half
+// l/16. Staging one 32-value K pair per lane as 16 bytes (two slices) lets one
+// ds_read_b128 feed two MMAs, and a warp then fills one 512-byte region with
+// conflict-free 16-byte lane stores. The layout was measured on gfx1151 against
+// the CPU product; see docs/kernels.md.
+constexpr int kFragRows = 16;
+constexpr int kLaneBytes = 16;               // two 8-byte slice halves per lane
+constexpr int kPairBytes = 32 * kLaneBytes;  // one 16-row group x 32 K values
+constexpr int kRowGroupsI = kTileI / kFragRows;  // 4
+constexpr int kRowGroupsJ = kTileJ / kFragRows;  // 8
+constexpr int kPairsPerStep = kStepK / 32;       // 4
 
 // One dynamic shared-memory allocation, sliced by offset. A and B hold the
-// staged int8 operands for the current K step, and the scale tiles carry the
-// weight and activation scales for the same step.
-constexpr int kABytes = kTileI * kTileStride;
-constexpr int kBBytes = kTileJ * kTileStride;
-constexpr int kAScaleOffset = kABytes + kBBytes;
-constexpr int kAScaleBytes = 16 * kTileI * sizeof(float);
-constexpr int kBScaleOffset = kAScaleOffset + kAScaleBytes;
+// staged int8 operands for the current K step and the scale tiles carry the
+// weight and activation scales for the same step. The total stays at 30 KiB so
+// that two blocks remain resident per CU.
+constexpr int kABytes = kRowGroupsI * kPairsPerStep * kPairBytes;
+constexpr int kBBytes = kRowGroupsJ * kPairsPerStep * kPairBytes;
+constexpr int kOperandBytes = kABytes + kBBytes;
+constexpr int kAScaleBytes = (kStepK / 16) * kTileI * sizeof(float);
 constexpr int kBScaleBytes = kBlock32 * kTileJ * sizeof(float2);
+constexpr int kAScaleOffset = kOperandBytes;
+constexpr int kBScaleOffset = kAScaleOffset + kAScaleBytes;
 constexpr int kSharedBytes = kBScaleOffset + kBScaleBytes;
-static_assert(kSharedBytes == 64512, "unexpected shared memory budget");
+static_assert(kABytes == 8192 && kBBytes == 16384, "unexpected operand staging size");
+static_assert(kSharedBytes == 30720, "unexpected shared memory budget");
 static_assert(kSharedBytes <= 64 * 1024, "exceeds the gfx1151 LDS budget");
-static_assert(kTileStride % 16 == 0, "fragment loads need 16-byte rows");
-static_assert(kTileJ * kEpilogueStride * int(sizeof(float)) <= kABytes + kBBytes,
-              "epilogue tile must fit the operand staging area");
+
+// fragment_offset locates the eight staged values that start at k_in_pair (a
+// multiple of eight) inside one 32-value K pair of a 16-row fragment group.
+// Bytes 0..7 of a lane carry the first 16-value slice, bytes 8..15 the second.
+__device__ __forceinline__ int fragment_offset(int group, int pair, int row_in_frag,
+                                               int k_in_pair) {
+    const int half = (k_in_pair >> 3) & 1;
+    const int slice = k_in_pair >> 4;
+    const int lane = row_in_frag + kFragRows * half;
+    return (group * kPairsPerStep + pair) * kPairBytes + lane * kLaneBytes + slice * 8;
+}
+
+// set_fragment copies the eight staged bytes of one 16x16 operand fragment
+// into a rocWMMA fragment, which is exactly what load_matrix_sync would put
+// there for the same bytes.
+template <typename FragT>
+__device__ __forceinline__ void set_fragment(FragT & frag, int lo, int hi) {
+    const int2 value = make_int2(lo, hi);
+    __builtin_memcpy(&frag.x, &value, sizeof(value));
+}
 
 // pack4 packs four values in [-128, 127] into one 32-bit word in little-endian
 // byte order, which is the int8 order of the staged operand tile.
@@ -66,7 +102,7 @@ __device__ __forceinline__ int32_t pack4(int a, int b, int c, int d) {
 // so the ql nibble and qh bit positions are hoisted once per span and each
 // 16-bit load covers two values. Block starts are only 2-byte aligned, so the
 // words are assembled from 16-bit halves.
-__device__ __forceinline__ void q6k_span8(const uint8_t * blk, int j, int8_t * dst) {
+__device__ __forceinline__ int2 q6k_span8(const uint8_t * blk, int j) {
     const int n = j / 128;
     const int l = j & 127;
     const uint8_t * ql = blk + n * 64;
@@ -112,18 +148,16 @@ __device__ __forceinline__ void q6k_span8(const uint8_t * blk, int j, int8_t * d
             hi |= word << (16 * (i - 2));
         }
     }
-    *reinterpret_cast<int32_t *>(dst) = lo;
-    *reinterpret_cast<int32_t *>(dst + 4) = hi;
+    return make_int2(lo, hi);
 }
 
 // stage_weight_span decodes eight consecutive weights of one packed row into
-// int8. The A tile keeps the raw quantized values, so the integer WMMA sees the
-// same digits the dequantized reference path sees; the block scale and the
-// Q4_K/Q5_K minimum are staged separately.
+// int8 and returns them packed. The A tile keeps the raw quantized values, so
+// the integer WMMA sees the same digits the dequantized reference path sees;
+// the block scale and the Q4_K/Q5_K minimum are staged separately.
 template <uint32_t DType>
-__device__ __forceinline__ void stage_weight_span(int8_t * dst, const uint8_t * row,
-                                                  int64_t k, float * scale_a,
-                                                  int row_index) {
+__device__ __forceinline__ int2 stage_weight_span(const uint8_t * row, int64_t k,
+                                                  float * scale_a, int row_index) {
     if (DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K) {
         const int sub = static_cast<int>((k % 256) / 32);
         const int within = static_cast<int>(k & 31);
@@ -131,47 +165,42 @@ __device__ __forceinline__ void stage_weight_span(int8_t * dst, const uint8_t * 
         const uint8_t * blk = row + (k / 256) * block_bytes;
         const uint8_t * ql_base = blk + (DType == YUUKA_DTYPE_Q4_K ? 16 : 48);
         const uint8_t * ql = ql_base + (sub / 2) * 32 + within;
-        const bool high = (sub & 1) != 0;
-        const int shift = high ? 4 : 0;
+        const int shift = (sub & 1) ? 4 : 0;
         const uint2 packed_ql = *reinterpret_cast<const uint2 *>(ql);
-        int q[8];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            q[i] = static_cast<int>((packed_ql.x >> (8 * i + shift)) & 0xF);
-            q[i + 4] = static_cast<int>((packed_ql.y >> (8 * i + shift)) & 0xF);
-        }
+        // The eight digits of a span are the low (or high) nibbles of eight
+        // consecutive ql bytes, so one mask (plus a shift for the high nibbles)
+        // expands all eight at once.
+        uint32_t lo = (packed_ql.x >> shift) & 0x0F0F0F0Fu;
+        uint32_t hi = (packed_ql.y >> shift) & 0x0F0F0F0Fu;
         if (DType == YUUKA_DTYPE_Q5_K) {
-            const uint2 packed_qh =
-                *reinterpret_cast<const uint2 *>(blk + 16 + within);
-            const uint32_t mask = 1u << sub;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                if ((packed_qh.x >> (8 * i)) & mask) {
-                    q[i] += 16;
-                }
-                if ((packed_qh.y >> (8 * i)) & mask) {
-                    q[i + 4] += 16;
-                }
-            }
+            // The fifth bit of each digit is one bit of the eight qh bytes; it
+            // moves to bit 4 of the matching output byte.
+            const uint2 packed_qh = *reinterpret_cast<const uint2 *>(blk + 16 + within);
+            const uint32_t bit = 0x01010101u << sub;
+            lo |= sub < 4 ? (packed_qh.x & bit) << (4 - sub)
+                          : (packed_qh.x & bit) >> (sub - 4);
+            hi |= sub < 4 ? (packed_qh.y & bit) << (4 - sub)
+                          : (packed_qh.y & bit) >> (sub - 4);
         }
-        *reinterpret_cast<int32_t *>(dst) = pack4(q[0], q[1], q[2], q[3]);
-        *reinterpret_cast<int32_t *>(dst + 4) = pack4(q[4], q[5], q[6], q[7]);
         if (within == 0) {
             uint8_t sc = 0;
             uint8_t m = 0;
             get_scale_min_k4(sub, blk + 4, sc, m);
             const float d = load_f16_device(blk);
             const float dm = load_f16_device(blk + 2);
-            scale_a[(2 * sub) * kTileI + row_index] = d * static_cast<float>(sc);
-            scale_a[(2 * sub + 1) * kTileI + row_index] =
+            // The scale tiles are indexed per staged step, not per 256-value
+            // quant block, because kStepK is smaller than a block.
+            const int slot = static_cast<int>((k % kStepK) / 32);
+            scale_a[(2 * slot) * kTileI + row_index] = d * static_cast<float>(sc);
+            scale_a[(2 * slot + 1) * kTileI + row_index] =
                 -(dm * static_cast<float>(m));
         }
-        return;
+        return make_int2(static_cast<int32_t>(lo), static_cast<int32_t>(hi));
     }
     // Q6_K: one scale per 16 values and no minimum.
     const int j = static_cast<int>(k % 256);
     const uint8_t * blk = row + (k / 256) * 210;
-    q6k_span8(blk, j, dst);
+    const int2 value = q6k_span8(blk, j);
     if ((j & 15) == 0) {
         const int n = j / 128;
         const int l = j & 127;
@@ -186,64 +215,80 @@ __device__ __forceinline__ void stage_weight_span(int8_t * dst, const uint8_t * 
             sidx = (l - 96) / 16 + 6;
         }
         const int8_t sc = reinterpret_cast<const int8_t *>(blk + 192)[n * 8 + sidx];
-        scale_a[(j / 16) * kTileI + row_index] =
+        const int slot = static_cast<int>((k % kStepK) / 16);
+        scale_a[slot * kTileI + row_index] =
             load_f16_device(blk + 208) * static_cast<float>(sc);
     }
+    return value;
 }
 
-// stage_weights decodes the kTileI x kStepK weight tile. Thread t owns spans
-// t, t + kThreads, ... so each thread writes eight spans of eight values.
+// stage_weights decodes the kTileI x kStepK weight tile in fragment order.
+// Each warp owns whole 512-byte fragment-pair regions and each lane fills one
+// 16-byte slot of a region, so a warp's stores cover one contiguous region and
+// never conflict in the LDS banks.
 template <uint32_t DType>
 __device__ __forceinline__ void stage_weights(int8_t * tile_a, float * scale_a,
                                               const uint8_t * w, uint64_t row_bytes,
                                               int64_t n0, int64_t n_out, int64_t k0) {
-    constexpr int kSpansPerThread = (kTileI * kSpansPerRow) / kThreads;
+    constexpr int kRegionsPerWarp = (kRowGroupsI * kPairsPerStep) / kWarps;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row_in_frag = lane & 15;
+    const int half = lane >> 4;
     #pragma unroll
-    for (int i = 0; i < kSpansPerThread; ++i) {
-        const int span_index = threadIdx.x + i * kThreads;
-        const int row = span_index / kSpansPerRow;
-        const int span = span_index % kSpansPerRow;
-        int8_t * dst = tile_a + row * kTileStride + span * kSpan;
-        const int64_t gn = n0 + row;
+    for (int i = 0; i < kRegionsPerWarp; ++i) {
+        const int region = warp * kRegionsPerWarp + i;
+        const int group = region / kPairsPerStep;
+        const int pair = region % kPairsPerStep;
+        int8_t * dst = tile_a + fragment_offset(group, pair, row_in_frag, half * kSpan);
+        const int64_t gn = n0 + group * kFragRows + row_in_frag;
         if (gn >= n_out) {
-            *reinterpret_cast<int32_t *>(dst) = 0;
-            *reinterpret_cast<int32_t *>(dst + 4) = 0;
+            *reinterpret_cast<int4 *>(dst) = make_int4(0, 0, 0, 0);
             continue;
         }
-        stage_weight_span<DType>(dst, w + gn * row_bytes, k0 + span * kSpan,
-                                 scale_a, row);
+        const uint8_t * row = w + gn * row_bytes;
+        // The two 16-value slices of the pair fill bytes 0..7 and 8..15.
+        const int64_t k = k0 + pair * 32 + half * kSpan;
+        const int row_index = group * kFragRows + row_in_frag;
+        const int2 low = stage_weight_span<DType>(row, k, scale_a, row_index);
+        const int2 high = stage_weight_span<DType>(row, k + 16, scale_a, row_index);
+        *reinterpret_cast<int4 *>(dst) = make_int4(low.x, low.y, high.x, high.y);
     }
 }
 
-// stage_activations copies the Q8_1 activation tile and its block scales. Rows
-// beyond the batch are zeroed, which also zeroes their scale and sum, so the
-// epilogue masks them instead of biasing the tile.
+// stage_activations copies the Q8_1 activation tile and its block scales in the
+// same warp-region form. Rows beyond the batch are zeroed, which also zeroes
+// their scale and sum, so the epilogue masks them instead of biasing the tile.
 __device__ __forceinline__ void stage_activations(int8_t * tile_b, float2 * scale_b,
                                                   const int8_t * xs, const float2 * xds,
                                                   int64_t m0, int64_t rows,
                                                   int64_t n_in, int64_t k0) {
-    constexpr int kWordsPerRow = kStepK / 16;
-    constexpr int kWords = kTileJ * kWordsPerRow;
-    for (int idx = threadIdx.x; idx < kWords; idx += kThreads) {
-        const int row = idx / kWordsPerRow;
-        const int col = (idx % kWordsPerRow) * 16;
-        const int64_t gm = m0 + row;
-        uint4 value = make_uint4(0, 0, 0, 0);
+    constexpr int kRegionsPerWarp = (kRowGroupsJ * kPairsPerStep) / kWarps;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row_in_frag = lane & 15;
+    const int half = lane >> 4;
+    #pragma unroll
+    for (int i = 0; i < kRegionsPerWarp; ++i) {
+        const int region = warp * kRegionsPerWarp + i;
+        const int group = region / kPairsPerStep;
+        const int pair = region % kPairsPerStep;
+        const int token = group * kFragRows + row_in_frag;
+        const int64_t gm = m0 + token;
+        const int64_t col = k0 + pair * 32 + half * kSpan;
+        int8_t * dst = tile_b + fragment_offset(group, pair, row_in_frag, half * kSpan);
+        uint2 low = make_uint2(0, 0);
+        uint2 high = make_uint2(0, 0);
+        float2 scale = make_float2(0.0f, 0.0f);
         if (gm < rows) {
-            value = *reinterpret_cast<const uint4 *>(xs + gm * n_in + k0 + col);
+            low = *reinterpret_cast<const uint2 *>(xs + gm * n_in + col);
+            high = *reinterpret_cast<const uint2 *>(xs + gm * n_in + col + 16);
+            scale = xds[gm * (n_in / 32) + (col / 32)];
         }
-        *reinterpret_cast<uint4 *>(tile_b + row * kTileStride + col) = value;
-    }
-    constexpr int kScaleCount = kTileJ * kBlock32;
-    for (int idx = threadIdx.x; idx < kScaleCount; idx += kThreads) {
-        const int row = idx / kBlock32;
-        const int block = idx % kBlock32;
-        const int64_t gm = m0 + row;
-        float2 value = make_float2(0.0f, 0.0f);
-        if (gm < rows) {
-            value = xds[gm * (n_in / 32) + k0 / 32 + block];
-        }
-        scale_b[block * kTileJ + row] = value;
+        *reinterpret_cast<int4 *>(dst) =
+            make_int4(static_cast<int>(low.x), static_cast<int>(low.y),
+                      static_cast<int>(high.x), static_cast<int>(high.y));
+        scale_b[pair * kTileJ + token] = scale;
     }
 }
 
@@ -288,7 +333,9 @@ __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
 
 // gemm_mmq_kernel computes a kTileI x kTileJ output tile with eight waves. Each
 // wave owns one 16-row weight fragment and four 16-column activation fragments,
-// so a wave issues four 16x16x16 int8 MMAs per 16-value K slice. The int32
+// so a wave issues four 16x16x16 int8 MMAs per 16-value K slice. One wave also
+// reads one 128-bit operand pair per 32-value K pair per fragment, and applies
+// the staged scales once per scale block. The int32
 // accumulator mapping was measured on gfx1151 against the CPU product:
 // lane l element e holds output row 2*e + l/16 of column l%16 inside the
 // 16x16 tile. Consequently one activation scale per lane (its column) and eight
@@ -299,10 +346,9 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
                                 int64_t rows, uint64_t row_bytes) {
     extern __shared__ __align__(16) unsigned char smem[];
     int8_t * tile_a = reinterpret_cast<int8_t *>(smem);
-    int8_t * tile_b = reinterpret_cast<int8_t *>(smem + kABytes);
+    int8_t * tile_b = tile_a + kABytes;
     float * scale_a = reinterpret_cast<float *>(smem + kAScaleOffset);
     float2 * scale_b = reinterpret_cast<float2 *>(smem + kBScaleOffset);
-    float * epilogue = reinterpret_cast<float *>(smem);
 
     const int tid = threadIdx.x;
     const int warp = tid / 32;
@@ -316,8 +362,17 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     // Q6_K carries one scale per 16 values and Q4_K/Q5_K one per 32 values, so
     // the slice group that shares a scale differs by dtype.
     constexpr bool kScalePer16 = (DType == YUUKA_DTYPE_Q6_K);
-    constexpr int kSlicesPerBlock = kScalePer16 ? 1 : 2;
-    constexpr int kBlocksPerStep = kStepK / (kScalePer16 ? 16 : 32);
+    constexpr int kSlicesPerScale = kScalePer16 ? 1 : 2;
+
+    // Fragment bases for this wave: one A row group and four B token groups.
+    // Each pair load covers 32 K values as 16 bytes.
+    const int a_base = row_base / kFragRows * kPairsPerStep * kPairBytes + lane * kLaneBytes;
+    int b_base[4];
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const int group = col_base / kFragRows + t;
+        b_base[t] = group * kPairsPerStep * kPairBytes + lane * kLaneBytes;
+    }
 
     float sum[4][8];
     #pragma unroll
@@ -328,81 +383,101 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
         }
     }
 
-    for (int64_t k0 = 0; k0 < n_in; k0 += kStepK) {
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, int32_t> c[4];
+
+    // A 128-value K step keeps the staged operands at 30 KiB, so two blocks
+    // stay resident per CU: the staging stalls of one block are covered by the
+    // MMAs of the other instead of idling the CU at a barrier.
+    const int64_t steps = n_in / kStepK;
+    for (int64_t step = 0; step < steps; ++step) {
+        const int64_t k0 = step * kStepK;
         stage_weights<DType>(tile_a, scale_a, w, row_bytes, n0, n_out, k0);
         stage_activations(tile_b, scale_b, xs, xds, m0, rows, n_in, k0);
         __syncthreads();
         #pragma unroll
-        for (int block = 0; block < kBlocksPerStep; ++block) {
-            rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, int32_t> c[4];
+        for (int pair = 0; pair < kPairsPerStep; ++pair) {
+            // One 128-bit load per operand fragment pair: .xy carries the 16
+            // values of the first slice, .zw the second.
+            const int4 av =
+                *reinterpret_cast<const int4 *>(tile_a + a_base + pair * kPairBytes);
+            int4 bv[4];
             #pragma unroll
             for (int t = 0; t < 4; ++t) {
-                rocwmma::fill_fragment(c[t], 0);
+                bv[t] = *reinterpret_cast<const int4 *>(tile_b + b_base[t] +
+                                                        pair * kPairBytes);
             }
             #pragma unroll
-            for (int slice = 0; slice < kSlicesPerBlock; ++slice) {
-                const int step = (block * kSlicesPerBlock + slice) * 16;
+            for (int s = 0; s < 2; ++s) {
+                const int slice = 2 * pair + s;
+                if (slice % kSlicesPerScale == 0) {
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        rocwmma::fill_fragment(c[t], 0);
+                    }
+                }
                 rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, int8_t,
                                   rocwmma::row_major> a;
-                rocwmma::load_matrix_sync(a, tile_a + row_base * kTileStride + step,
-                                          kTileStride);
+                set_fragment(a, s == 0 ? av.x : av.z, s == 0 ? av.y : av.w);
                 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
                     rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, int8_t,
                                       rocwmma::col_major> b;
-                    rocwmma::load_matrix_sync(
-                        b, tile_b + (col_base + t * 16) * kTileStride + step,
-                        kTileStride);
+                    set_fragment(b, s == 0 ? bv[t].x : bv[t].z,
+                                 s == 0 ? bv[t].y : bv[t].w);
                     rocwmma::mma_sync(c[t], a, b, c[t]);
                 }
-            }
-            // The weight scales belong to this lane's eight rows, so they are
-            // loaded once per block and reused by all four accumulator tiles.
-            // Q4_K/Q5_K additionally carry a per-row minimum that the activation
-            // block sum multiplies; Q6_K has no minimum.
-            const int b32 = kScalePer16 ? (block >> 1) : block;
-            const int slot0 = kScalePer16 ? block : 2 * block;
-            float wd[8];
-            float wm[8];
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int row = row_base + 2 * e + (lane >> 4);
-                wd[e] = scale_a[slot0 * kTileI + row];
-                wm[e] = kScalePer16 ? 0.0f : scale_a[(slot0 + 1) * kTileI + row];
-            }
-            #pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                const float2 dsb =
-                    scale_b[b32 * kTileJ + col_base + t * 16 + (lane & 15)];
+                if ((slice + 1) % kSlicesPerScale != 0) {
+                    continue;
+                }
+                // The weight scales belong to this lane's eight rows, so they
+                // are loaded once per scale block and reused by all four
+                // accumulator tiles. Q4_K/Q5_K additionally carry a per-row
+                // minimum that the activation block sum multiplies; Q6_K has
+                // no minimum.
+                const int block = slice / kSlicesPerScale;
+                const int b32 = kScalePer16 ? (block >> 1) : block;
+                const int slot0 = kScalePer16 ? block : 2 * block;
+                float wd[8];
+                float wm[8];
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    sum[t][e] = fmaf(wd[e] * dsb.x, static_cast<float>(c[t].x[e]),
-                                     fmaf(wm[e], dsb.y, sum[t][e]));
+                    const int row = row_base + 2 * e + (lane >> 4);
+                    wd[e] = scale_a[slot0 * kTileI + row];
+                    wm[e] = kScalePer16 ? 0.0f : scale_a[(slot0 + 1) * kTileI + row];
+                }
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const float2 dsb =
+                        scale_b[b32 * kTileJ + col_base + t * 16 + (lane & 15)];
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        sum[t][e] = fmaf(wd[e] * dsb.x, static_cast<float>(c[t].x[e]),
+                                         fmaf(wm[e], dsb.y, sum[t][e]));
+                    }
                 }
             }
         }
         __syncthreads();
     }
 
-    // The epilogue aliases the operand staging area: stage token-major, then
-    // write the tile back coalesced over the output channel.
+    // Write the accumulators straight to global memory. For a fixed fragment
+    // the warp's 16 low lanes cover 16 consecutive tokens of one output
+    // channel, so each store instruction still covers two 64-byte runs; a
+    // shared-memory transpose would cost 33 KiB of the LDS budget that keeps
+    // two blocks resident per CU.
     #pragma unroll
     for (int t = 0; t < 4; ++t) {
+        const int64_t gm = m0 + col_base + t * 16 + (lane & 15);
+        if (gm >= rows) {
+            continue;
+        }
+        float * dst = out + gm * n_out;
         #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            const int row = row_base + 2 * e + (lane >> 4);
-            const int col = col_base + t * 16 + (lane & 15);
-            epilogue[col * kEpilogueStride + row] = sum[t][e];
-        }
-    }
-    __syncthreads();
-    for (int idx = tid; idx < kTileJ * kTileI; idx += kThreads) {
-        const int col = idx / kTileI;
-        const int row = idx % kTileI;
-        const int64_t gm = m0 + col;
-        const int64_t gn = n0 + row;
-        if (gm < rows && gn < n_out) {
-            out[gm * n_out + gn] = epilogue[col * kEpilogueStride + row];
+            const int64_t gn = n0 + row_base + 2 * e + (lane >> 4);
+            if (gn < n_out) {
+                dst[gn] = sum[t][e];
+            }
         }
     }
 }
