@@ -17,12 +17,14 @@ import (
 // one gfx1151 device with Qwen3.5-4B-Q4_K_M. The operation count is structural
 // and exact; the timings track the current tree and are re-recorded when a
 // roadmap4 stage lands, because each stage moves them by design: 97.6 ms in the
-// D0 record, 89.4 ms after D1 (section 4.5), and the values below after D2
-// (section 5.5). The per-stage history stays in docs/roadmap4.md.
+// D0 record, 89.4 ms after D1 (section 4.5), 31.6 ms after D2 (section 5.5), and
+// the values below after D4 (section 7.5), which replaced five delta-net
+// operators per recurrent layer with two. The per-stage history stays in
+// docs/roadmap4.md.
 const (
-	decodeBaselineOps     = 579
-	decodeBaselineTotalMS = 31.600
-	decodeBaselineGemvMS  = 21.558
+	decodeBaselineOps     = 507
+	decodeBaselineTotalMS = 24.258
+	decodeBaselineGemvMS  = 21.438
 )
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated
@@ -108,10 +110,13 @@ type decodeSample struct {
 	rows     int64
 	ms       float64
 	// moved is the bytes the operation is expected to move; the GEMV family
-	// reads its packed weights once, the gated delta-net reads and writes its
-	// recurrent state five times (docs/roadmap4.md section 2.6).
+	// reads its packed weights once, and the delta-net forms read and write the
+	// recurrent state once (docs/roadmap4.md section 7).
 	moved  uint64
 	matmul bool
+	// stateful marks the operations whose traffic is recurrent or convolutional
+	// state, which the summary reports as one line.
+	stateful bool
 }
 
 func (s decodeSample) gbps() float64 {
@@ -132,8 +137,10 @@ func (s decodeSample) shapeText() string {
 			text = fmt.Sprintf("%s r%d", text, s.rows)
 		}
 		return text
-	case s.info.Code == hip.OpGDN:
+	case s.info.Code == hip.OpGDN || s.info.Code == hip.OpRecurrentToken:
 		return fmt.Sprintf("%d g x %d h x %d", s.info.N[0], s.info.N[1], s.info.N[2])
+	case s.info.Code == hip.OpConvL2Norm:
+		return fmt.Sprintf("%d ch k%d", s.info.N[0], s.info.N[1])
 	case s.info.Code == hip.OpAttentionPaged || s.info.Code == hip.OpAttentionPrefillPaged ||
 		s.info.Code == hip.OpAttention || s.info.Code == hip.OpAttentionPrefill:
 		return fmt.Sprintf("%d kv x %d h x %d d", s.info.N[0], s.info.N[1], s.info.N[2])
@@ -155,6 +162,10 @@ func decodeSamples(shadow []hip.OpInfo, times []hip.OpTime, names map[uintptr]st
 		}
 		s.tensor, s.role = resolveOperationNames(info, names)
 		s.moved, s.matmul, s.rows = operationTraffic(info)
+		switch info.Code {
+		case hip.OpGDN, hip.OpRecurrentToken, hip.OpConv1D, hip.OpConvL2Norm:
+			s.stateful = true
+		}
 		switch info.Code {
 		case hip.OpGemv, hip.OpGemvBatch, hip.OpGemm, hip.OpLMHead, hip.OpGemvQ8_1,
 			hip.OpGemmSwiglu, hip.OpQuantQ8_1:
@@ -250,6 +261,20 @@ func operationTraffic(info hip.OpInfo) (moved uint64, matmul bool, rows int64) {
 		// by the decay, the two S^T products, and the rank-1 update.
 		state := uint64(info.N[1]) * uint64(info.N[2]) * uint64(info.N[2]) * 4
 		return 5 * state, false, 1
+	case hip.OpRecurrentToken:
+		// The fused per-token operator reads the head state into registers once
+		// and writes it back once (docs/roadmap4.md section 7).
+		state := uint64(info.N[1]) * uint64(info.N[2]) * uint64(info.N[2]) * 4
+		return 2 * state, false, 1
+	case hip.OpConvL2Norm:
+		// The convolution ring state is read and written, the weights and the
+		// qkv row are read, the result is written, and the q and k groups are
+		// normalized in place.
+		channels := uint64(info.N[0])
+		kernel := uint64(info.N[1])
+		qk := uint64(info.N[2])
+		return 2*channels*(kernel-1)*4 + channels*kernel*4 + channels*4 + channels*4 +
+			2*qk*4, false, 1
 	case hip.OpEmbedding, hip.OpEmbeddingBatch:
 		// One packed weight row per token, read by the gather.
 		return uint64(info.N[1]) * uint64(batch), false, batch
@@ -262,13 +287,14 @@ func operationTraffic(info hip.OpInfo) (moved uint64, matmul bool, rows int64) {
 
 // decodeTensorRow aggregates every operation that reads the same tensor.
 type decodeTensorRow struct {
-	tensor string
-	dtype  tensor.DType
-	shape  string
-	ops    int
-	ms     float64
-	moved  uint64
-	matmul bool
+	tensor   string
+	dtype    tensor.DType
+	shape    string
+	ops      int
+	ms       float64
+	moved    uint64
+	matmul   bool
+	stateful bool
 }
 
 // decodeDTypeRow aggregates the matmul family by weight dtype.
@@ -324,6 +350,7 @@ func newDecodeReport(samples []decodeSample) *decodeReport {
 			tensors[key] = &decodeTensorRow{
 				tensor: s.tensor, dtype: s.dtype, shape: s.shapeText(),
 				ops: 1, ms: s.ms, moved: s.moved, matmul: s.matmul,
+				stateful: s.stateful,
 			}
 		}
 		if s.matmul && s.hasDType {
@@ -374,7 +401,8 @@ func printDecodeReport(t *testing.T, rt *Runtime, r *decodeReport) {
 			100*row.ms/r.total)
 	}
 
-	t.Logf("by tensor (matmul weights read once per token, gated delta-net state five times):")
+	t.Logf("by tensor (matmul weights read once per token, delta-net state read and" +
+		" written once):")
 	t.Logf("%-26s %-6s %-14s %5s %9s %8s %8s %7s", "tensor", "dtype", "shape",
 		"ops", "ms", "MB", "GB/s", "share")
 	var matmulMS, stateMS float64
@@ -387,7 +415,7 @@ func printDecodeReport(t *testing.T, rt *Runtime, r *decodeReport) {
 			matmulMoved += row.moved
 			dtype = row.dtype.String()
 		}
-		if !row.matmul && row.moved != 0 {
+		if row.stateful {
 			stateMS += row.ms
 			stateMoved += row.moved
 		}
@@ -406,8 +434,8 @@ func printDecodeReport(t *testing.T, rt *Runtime, r *decodeReport) {
 		" %.1f GB/s effective", matmulMS, r.total, 100*matmulMS/r.total,
 		float64(matmulMoved)/1e6, float64(matmulMoved)/(matmulMS*1e6))
 	if stateMS > 0 {
-		t.Logf("gated delta-net state: %.3f ms of %.3f ms (%.1f%%), %.1f MB moved,"+
-			" %.1f GB/s effective", stateMS, r.total, 100*stateMS/r.total,
+		t.Logf("delta-net state and convolution: %.3f ms of %.3f ms (%.1f%%), %.1f MB"+
+			" moved, %.1f GB/s effective", stateMS, r.total, 100*stateMS/r.total,
 			float64(stateMoved)/1e6, float64(stateMoved)/(stateMS*1e6))
 	}
 

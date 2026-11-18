@@ -106,6 +106,13 @@ type Options struct {
 	// It exists so the two activation sources can be measured against each other;
 	// the fused form is the selected one (docs/benchmarks.md).
 	PrequantizedInt8 bool
+	// LegacyDeltaNet builds the recurrent layer from the separate CONV1D,
+	// L2NORM, GDN, and GATED_RMSNORM operations instead of the fused
+	// CONV_L2NORM and RECURRENT_TOKEN pair, which is the selected path. It
+	// exists so a differential test can compare the two plans on identical
+	// inputs and so the unfused arithmetic stays reachable when a fused kernel
+	// is suspect; production sessions leave it false.
+	LegacyDeltaNet bool
 }
 
 const (
@@ -146,6 +153,7 @@ type Model struct {
 	forceDecodeGemv      bool
 	int8Matvec           bool
 	prequantizedInt8     bool
+	legacyDeltaNet       bool
 	// int8Act and int8ActWidth record the activation row whose Q8_1 digits the
 	// int8 matvecs of the current group read. They are a build-time check: the
 	// plan is sequential, so a matvec on any other row means the planner forgot
@@ -205,6 +213,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		forceDecodeGemv:      opts.ForceDecodeGemv,
 		int8Matvec:           opts.Int8Matvec,
 		prequantizedInt8:     opts.PrequantizedInt8,
+		legacyDeltaNet:       opts.LegacyDeltaNet,
 		device:               device,
 		stream:               stream,
 		event:                event,

@@ -1323,6 +1323,105 @@ yuuka_status validate_gdn_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// validate_recurrent_token_plan_op checks the fused per-token delta-net
+// operator. The register-resident kernel is compiled for a 128-wide state, so
+// any other width is unsupported rather than silently routed elsewhere.
+yuuka_status validate_recurrent_token_plan_op(const yuuka_op & op) {
+    const uint64_t groups = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t state_size = op.n[2];
+    if (groups == 0 || heads == 0 || groups > heads) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid recurrent token dimensions");
+    }
+    if (state_size != 128) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "recurrent token supports a 128-wide state, got %llu",
+                    static_cast<unsigned long long>(state_size));
+    }
+    for (int i = 0; i < 11; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent token buffer %d is null", i);
+        }
+    }
+    uint64_t state_elements = 0;
+    uint64_t group_elements = 0;
+    uint64_t head_elements = 0;
+    uint64_t state_bytes = 0;
+    uint64_t group_bytes = 0;
+    uint64_t row_bytes = 0;
+    uint64_t param_bytes = 0;
+    uint64_t state_weight_bytes = 0;
+    if (__builtin_mul_overflow(heads, state_size, &state_elements) ||
+        __builtin_mul_overflow(state_elements, state_size, &state_elements) ||
+        __builtin_mul_overflow(groups, state_size, &group_elements) ||
+        __builtin_mul_overflow(heads, state_size, &head_elements) ||
+        !checked_float_bytes(state_elements, &state_bytes) ||
+        !checked_float_bytes(group_elements, &group_bytes) ||
+        !checked_float_bytes(head_elements, &row_bytes) ||
+        !checked_float_bytes(heads, &param_bytes) ||
+        !checked_float_bytes(op.n[2], &state_weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent token dimensions overflow");
+    }
+    const uint64_t bytes[11] = {state_bytes, group_bytes, group_bytes, row_bytes,
+                                param_bytes, param_bytes, param_bytes, param_bytes,
+                                row_bytes,  state_weight_bytes, row_bytes};
+    const uint64_t offsets[11] = {op.off[0], op.off[1], op.off[2], op.off[3], 0, 0,
+                                  0, 0, op.off[8], 0, 0};
+    for (int i = 0; i < 11; ++i) {
+        if (!buffer_range_ok(op.buf[i], offsets[i], bytes[i])) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent token buffer %d is too small",
+                        i);
+        }
+    }
+    return YUUKA_OK;
+}
+
+// validate_conv_l2norm_plan_op checks the fused convolution and L2 norm. The
+// kernel normalizes whole 128-value groups inside a 256-channel block, so a
+// shape whose groups would cross a block boundary is unsupported.
+yuuka_status validate_conv_l2norm_plan_op(const yuuka_op & op) {
+    const uint64_t channels = op.n[0];
+    const uint64_t kernel = op.n[1];
+    const uint64_t qk_channels = op.n[2];
+    const uint64_t q_channels = op.n[3];
+    const uint64_t state = op.n[4];
+    if (channels == 0 || kernel < 2 || qk_channels > channels) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid conv L2Norm dimensions");
+    }
+    if (state != 128) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "conv L2Norm supports a 128-wide norm group, got %llu",
+                    static_cast<unsigned long long>(state));
+    }
+    if (channels % 256 != 0 || qk_channels % 256 != 0 || q_channels % state != 0 ||
+        q_channels > qk_channels) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "conv L2Norm requires 256-aligned channels and whole norm groups");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "conv L2Norm buffer %d is null", i);
+        }
+    }
+    uint64_t state_elements = 0;
+    uint64_t weight_elements = 0;
+    uint64_t state_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t channel_bytes = 0;
+    if (__builtin_mul_overflow(channels, kernel - 1, &state_elements) ||
+        __builtin_mul_overflow(channels, kernel, &weight_elements) ||
+        !checked_float_bytes(state_elements, &state_bytes) ||
+        !checked_float_bytes(weight_elements, &weight_bytes) ||
+        !checked_float_bytes(channels, &channel_bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], state_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], weight_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], channel_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], channel_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "conv L2Norm buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 yuuka_status validate_elementwise_plan_op(const yuuka_op & op, int buffers) {
     const uint64_t count = op.n[0];
     if (count == 0) {
@@ -1916,6 +2015,30 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                                      op_ptr<const float>(op, 2),
                                      op_ptr<float>(op, 3),
                                      int(op.n[0]), int(op.n[1]), stream);
+            break;
+        case YUUKA_OP_RECURRENT_TOKEN:
+            yuuka::launch_recurrent_token_f32(
+                op_ptr<float>(op, 0),
+                op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2),
+                op_ptr<const float>(op, 3),
+                op_ptr<const float>(op, 4),
+                op_ptr<const float>(op, 5),
+                op_ptr<const float>(op, 6),
+                op_ptr<const float>(op, 7),
+                op_ptr<float>(op, 8),
+                op_ptr<const float>(op, 9),
+                op_ptr<const float>(op, 10),
+                int(op.n[0]), int(op.n[1]), op.f[0], stream);
+            break;
+        case YUUKA_OP_CONV_L2NORM:
+            yuuka::launch_conv_l2norm_f32(
+                op_ptr<float>(op, 0),
+                op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2),
+                op_ptr<float>(op, 3),
+                int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]), op.f[0],
+                op.f[1], stream);
             break;
         case YUUKA_OP_GDN:
             yuuka::launch_gdn_f32(
@@ -3167,7 +3290,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMV_Q8_1) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_CONV_L2NORM) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3222,6 +3345,12 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_GEMV_Q8_1:
                 status = validate_gemv_i8_plan_op(*op);
+                break;
+            case YUUKA_OP_RECURRENT_TOKEN:
+                status = validate_recurrent_token_plan_op(*op);
+                break;
+            case YUUKA_OP_CONV_L2NORM:
+                status = validate_conv_l2norm_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

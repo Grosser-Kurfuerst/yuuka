@@ -186,6 +186,23 @@ void launch_gdn_f32(float * state, const float * q, const float * k, const float
                     const float * alpha, const float * beta, const float * dt,
                     const float * a, float * out, int groups, int heads,
                     int state_size, hipStream_t stream);
+// launch_recurrent_token_f32 runs one token of a gated delta-net layer with the
+// head's state held in registers: decay, both S^T products, and the rank-1
+// update are one pass, and the gated RMSNorm of the head is folded in, so out
+// receives the normalized head row rather than the raw delta-net result. The
+// state_width is fixed at 128 (kernels/hip/ssm/deltanet.hip).
+void launch_recurrent_token_f32(float * state, const float * q, const float * k,
+                                const float * v, const float * alpha, const float * beta,
+                                const float * dt, const float * a, float * out,
+                                const float * norm_weight, const float * gate,
+                                int groups, int heads, float eps, hipStream_t stream);
+// launch_conv_l2norm_f32 applies the short convolution to every channel and then
+// the L2 norm to the first qk_channels channels, q_channels of which use
+// q_scale and the rest unity. channels and qk_channels must be multiples of 256
+// and the norm group width is fixed at 128.
+void launch_conv_l2norm_f32(float * conv_state, const float * weights, const float * qkv,
+                            float * out, int channels, int kernel, int qk_channels,
+                            int q_channels, float eps, float q_scale, hipStream_t stream);
 void launch_embedding_f32(float * out, const void * weights, int32_t token,
                           uint64_t row_bytes, int64_t cols, uint32_t dtype,
                           hipStream_t stream);

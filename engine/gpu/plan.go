@@ -305,6 +305,18 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	return plan.Add(m.act.x, m.act.tmp, hidden)
 }
 
+// fusedDeltaNet reports whether the recurrent layer can take the fused
+// conv_l2norm and recurrent_token pair. Both kernels are compiled for a 128-wide
+// state and for norm groups and channel blocks that do not cross, so a model
+// with any other recurrent shape keeps the separate operators instead of failing
+// the plan.
+func (m *Model) fusedDeltaNet(convDim, qkDim, keyDim, stateSize int64) bool {
+	if m.legacyDeltaNet {
+		return false
+	}
+	return stateSize == 128 && convDim%256 == 0 && qkDim%256 == 0 && keyDim%128 == 0
+}
+
 func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight) error {
 	cfg := m.config
 	prefix := fmt.Sprintf("blk.%d.", layerIndex)
@@ -370,29 +382,50 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	if err := m.decodeMatmul(plan, alpha, m.act.norm, m.act.alpha, hidden, rank); err != nil {
 		return err
 	}
-	if err := plan.AddConv1D(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv, int(convDim), cfg.SSMConvKernel); err != nil {
-		return err
-	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
-	if err := plan.AddL2NormAt(m.act.conv, 0, m.act.conv, 0,
-		int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, qScale); err != nil {
-		return err
-	}
-	if err := plan.AddL2NormAt(m.act.conv, uint64(keyDim)*4, m.act.conv, uint64(keyDim)*4,
-		int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, 1); err != nil {
-		return err
-	}
-	if err := plan.AddGDNAt(s.recState[layerIndex],
-		m.act.conv, 0,
-		m.act.conv, uint64(keyDim)*4,
-		m.act.conv, uint64(2*keyDim)*4,
-		m.act.alpha, m.act.beta, dt.buf, a.buf, m.act.gdn,
-		cfg.SSMGroupCount, cfg.SSMTimeStepRank, int(stateSize)); err != nil {
-		return err
-	}
-	if err := plan.AddGatedRMSNorm(m.act.gdn, norm.buf, m.act.z, m.act.gdnNorm,
-		rank, stateSize, cfg.RMSNormEps); err != nil {
-		return err
+	if m.fusedDeltaNet(convDim, 2*keyDim, keyDim, stateSize) {
+		// conv_l2norm advances the convolution state and normalizes the q and k
+		// channels; recurrent_token keeps the head's state in registers and
+		// writes the gated RMSNorm of the head directly, so the raw delta-net
+		// row (m.act.gdn) is not materialized.
+		if err := plan.AddConvL2Norm(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv,
+			int(convDim), cfg.SSMConvKernel, int(2*keyDim), int(keyDim), int(stateSize),
+			cfg.RMSNormEps, qScale); err != nil {
+			return err
+		}
+		if err := plan.AddRecurrentTokenAt(s.recState[layerIndex],
+			m.act.conv, 0,
+			m.act.conv, uint64(keyDim)*4,
+			m.act.conv, uint64(2*keyDim)*4,
+			m.act.alpha, m.act.beta, dt.buf, a.buf, m.act.gdnNorm, norm.buf, m.act.z,
+			cfg.SSMGroupCount, cfg.SSMTimeStepRank, int(stateSize),
+			cfg.RMSNormEps); err != nil {
+			return err
+		}
+	} else {
+		if err := plan.AddConv1D(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv, int(convDim), cfg.SSMConvKernel); err != nil {
+			return err
+		}
+		if err := plan.AddL2NormAt(m.act.conv, 0, m.act.conv, 0,
+			int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, qScale); err != nil {
+			return err
+		}
+		if err := plan.AddL2NormAt(m.act.conv, uint64(keyDim)*4, m.act.conv, uint64(keyDim)*4,
+			int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, 1); err != nil {
+			return err
+		}
+		if err := plan.AddGDNAt(s.recState[layerIndex],
+			m.act.conv, 0,
+			m.act.conv, uint64(keyDim)*4,
+			m.act.conv, uint64(2*keyDim)*4,
+			m.act.alpha, m.act.beta, dt.buf, a.buf, m.act.gdn,
+			cfg.SSMGroupCount, cfg.SSMTimeStepRank, int(stateSize)); err != nil {
+			return err
+		}
+		if err := plan.AddGatedRMSNorm(m.act.gdn, norm.buf, m.act.z, m.act.gdnNorm,
+			rank, stateSize, cfg.RMSNormEps); err != nil {
+			return err
+		}
 	}
 	if err := m.decodeActGroup(plan, m.act.gdnNorm, inner, out.dtype); err != nil {
 		return err

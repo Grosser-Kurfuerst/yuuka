@@ -208,6 +208,26 @@ Paged KV and graph replay have dedicated native coverage in
   dynamic-parameter kernel, so the runtime can fall back instead of replaying
   stale arguments.
 
+The fused gated delta-net pair has native coverage in
+`tests/hip/deltanet_test.cpp`, which runs the fused plan (`CONV_L2NORM` and
+`RECURRENT_TOKEN`) and the unfused plan (`CONV1D`, two `L2NORM`, `GDN`,
+`GATED_RMSNORM`) on the same buffers for three tokens at the geometry of one
+Qwen3.5-4B recurrent layer:
+
+- both plans are compared against an independent host implementation of the
+  documented order of operations, at 1e-5, which is 300x below the 2.6e-4 that a
+  missing decay factor produces at the decay of 0.75 the test uses;
+- the convolution output, the ring state, the recurrent state, and the
+  normalized output are compared between the plans at 1e-5;
+- a state width other than 128 and a channel count that is not a multiple of 256
+  are rejected with `YUUKA_ERR_UNSUPPORTED`, so a plan builder that selected the
+  fused pair for an unsupported geometry fails instead of running.
+
+`TestGPUFusedDeltaNetMatchesLegacy` is the full-model differential: it builds the
+default plan and the `Options.LegacyDeltaNet` plan, checks the operator counts of
+both, and compares eight greedy decode steps (identical tokens, 9.5e-6 maximum
+logit difference, gated at 0.02).
+
 Serving tests are split by layer:
 
 - `memory`: allocator reference counting, double-release rejection, table
@@ -336,6 +356,22 @@ Record at minimum:
 Do not compare results collected under different power profiles, clock states,
 or background load without labeling the difference.
 
+### 6.2.1 Test inputs must expose the failure
+
+Choose test inputs that make the mistake under test visible, and say so in the
+test. A kernel that is wrong by a factor of `decay` agrees with a correct kernel
+to 1.6e-5 when `decay` is 0.997 and differs by 2.6e-4 when it is 0.75, so a test
+written against the first input would have accepted a wrong gated delta-net
+kernel (roadmap4 7.5 records the case). The rules:
+
+- For every decay, gate, scale, or mask the kernel applies, pick at least one
+  test value where applying it and not applying it differ by far more than the
+  tolerance.
+- Compare against an independent implementation, not only against the path being
+  replaced: the two device paths can share a mistake, and one of them is usually
+  the reference the other is compared against.
+- State the input choice in the test so the reason survives the next edit.
+
 ### 6.3 What to measure separately
 
 - model load and first-use warmup;
@@ -392,28 +428,41 @@ per-operation, per-tensor, and per-dtype tables plus one line per plan index
 sorted by time. It is opt-in through `YUUKA_TEST_MODEL`, and it gates the result
 against the recorded attribution of
 [roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18): the plan must hold
-the recorded 579 operations, the profiled total must stay inside a wide band
-around the recorded 97.605 ms, and the GEMV share must stay within five points
-of the recorded matvec share. The bands are wide because device clocks are not
-pinned, and the recorded constants are re-recorded when a roadmap4 stage lands,
-because each stage moves the total by design: 97.6 ms in the D0 record, 89.4 ms
-after D1, 31.6 ms after D2. The operation count is exact because it is
-structural, so a plan change is always visible, and a change that moves the
-attribution outside the bands has to re-record the constants and the document
-rather than pass silently. Section 5.5 of roadmap4 keeps the per-stage history. Event instrumentation
-adds a submission gap per operation, so the totals exceed a release run and are
-a diagnosis, not a benchmark result.
+the recorded 507 operations, the profiled total must stay inside a wide band
+around the recorded 24.258 ms, and the matvec share must stay within five points
+of the recorded share. The bands are wide because device clocks are not pinned,
+and the recorded constants are re-recorded when a roadmap4 stage lands, because
+each stage moves the total by design: 97.6 ms in the D0 record, 89.4 ms after D1,
+31.6 ms after D2, 24.3 ms after D4, in 579 operations until D4 folded the five
+delta-net operators of a recurrent layer into two and the count became 507. The
+operation count is exact because it is structural, so a plan change is always
+visible, and a change that moves the attribution outside the bands has to
+re-record the constants and the document rather than pass silently. Sections 5.5
+and 7.5 of roadmap4 keep the per-stage history. Event instrumentation adds a
+submission gap per operation, so the totals exceed a release run and are a
+diagnosis, not a benchmark result.
 
 `YUUKA_TEST_DECODE_INT8=fused` or `=prequantized` runs the same attribution with
 the opt-in int8 decode matvec instead of the FP32 streaming kernel, which is how
 roadmap4 D3 measured the two activation sources; the default is the selected
 route.
 
+`build/yuuka_gemv_decode_sweep --recurrent` is the RECURRENT cell of roadmap4
+section 7.3: it builds one recurrent layer from the five separate operators and
+from the fused pair, and prints the per-layer and 24-layer submission times with
+the state bandwidth each form moves. `build/yuuka_deltanet_sweep` is the design
+sweep behind the fused kernel: it times five candidate state-kernel forms (the
+five-pass kernel, a read-and-write copy floor, three register-resident thread
+counts, and a shared-memory-resident form) with HIP events around one launch and
+reports their agreement with the five-pass kernel, so a form is chosen on
+measured time and not on the layout argument.
+
 `scripts/decode_profile.sh` is the reproducible procedure for the isolated
 decode matvec table. It verifies the recorded GGUF SHA-256 when a model is
 supplied, fails when the device is not `gfx1151`, runs
 `build/yuuka_gemv_decode_sweep` once unprofiled (five warmups and twenty-five
-timed submissions per cell, median host timing), then traces it with
+timed submissions per cell, median host timing), runs the same binary in its
+`--threshold`, `--int8`, and `--recurrent` modes, then traces it with
 `SQ_WAVES SQ_INSTS_VALU SQ_INSTS_LDS` and reduces the database with
 `scripts/decode_profile.py`. The reduction pairs dispatches with sweep cells in
 submission order, thirty per cell, checks that each dispatch matches the form of

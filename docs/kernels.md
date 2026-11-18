@@ -117,6 +117,8 @@ hard-coded from another GPU.
 | --- | --- | --- |
 | `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
 | `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
+| `recurrent_token` | Gated delta-net per-token state (selected) | Head state in registers across four thread groups, decay and update fused in one pass, gated RMSNorm folded in |
+| `conv_l2norm` | Recurrent convolution and q/k L2 norm (selected) | One block per 256 channels, whole norm groups per block, ring state advanced in place |
 | `gemv_q4_k` / `gemv_q6_k` / `gemv_q8_0` / `gemv_q4_0` / `gemv_q5_0` | Decode fallback, narrow projections, kernel reference | Packed reads, fused dequantization, block reduction |
 | `gemm_fp16_wmma` | Prefill baseline | Tiling, WMMA, LDS, pipelining |
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
@@ -982,6 +984,49 @@ Correctness: `tests/hip/prefill_test.cpp` runs both paths against the same CPU
 reference (chunked maximum absolute difference `1.6e-7`, per-token `2.1e-7`) and
 checks that a repeated execution reproduces the outputs bitwise.
 
+### 9.2 Per-token form in decode
+
+Decode runs one token at a time, so the chunkwise form does not apply and the
+recurrence is evaluated directly. Two operators replace the five the decode plan
+used before roadmap4 D4 (`CONV1D`, two `L2NORM`, `GDN`, `GATED_RMSNORM`):
+
+- `conv_l2norm_f32_kernel` applies the short convolution to all 8192 channels,
+  advancing its ring state, and then the L2 norm to the q and k groups with the q
+  scale. One block owns 256 channels, which is exactly two 128-wide norm groups,
+  so a norm never crosses a block and needs no cross-block reduction.
+- `recurrent_token_f32_kernel` owns one head per block with 512 threads: four
+  thread groups share a column of the state, each holding 32 of its 128 rows in
+  registers. The block loads the column once, forms `S^T k` with the decay applied
+  to the sum (because `S^T k` over the decayed state is `decay * (S^T k)` over the
+  loaded state), exchanges the four partials through shared memory, forms
+  `d = (v - S^T k) * beta`, and then applies the decay, the rank-1 update, and
+  `S^T q` in one pass over the registers before writing the column back once. The
+  gated RMSNorm of the head is folded into the same block because its reduction is
+  over that head's own values: `out` receives the normalized row and the raw
+  delta-net row is not written.
+
+The state layout is unchanged, so the chunked prefill path and the decode path
+consume the same buffers; nothing about the prefill operators moved.
+
+Numerics. The five-pass kernel rounds the decayed state to memory and forms
+`S^T k` from it; the fused kernel forms `decay * (S^T k)` with one rounding and
+applies the update as a fused multiply-add. The column sums are also reassociated
+across the four thread groups. `tests/hip/deltanet_test.cpp` bounds both device
+paths against an independent host implementation of the documented order of
+operations: 3e-8 on the normalized output and 7e-9 on the state between the two
+device paths, over three tokens with a decay of about 0.75. The decay is chosen
+far from one on purpose: with a decay of 0.997 a missing factor on `S^T k`
+produces a 1.6e-5 difference, and with 0.75 it produces 2.6e-4, which the 1e-5
+bound rejects.
+
+Measured design choice (roadmap4 7.5,
+[benchmarks.md](benchmarks.md#gated-delta-net-d4)): the register-resident form
+reaches 375 GB/s of state traffic against 125 GB/s for a shared-memory-resident
+form of the same recurrence, because a 64 KB state fills the workgroup shared
+budget and leaves no room for the normalization; 512 threads beat 256 by 6% and
+beat a plain read-and-write copy of the same bytes, which makes memory-level
+parallelism per lane the limiter rather than bandwidth.
+
 SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
 epilogue, together with fusing the gate/up GEMMs themselves, is a candidate
 under [roadmap2.md](roadmap2.md); no fused implementation is claimed. Every
@@ -1017,6 +1062,13 @@ per plan, not per tensor per token.
 Dispatch is recorded in one explicit Go selector:
 `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
 rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
+The decode plan builds a recurrent layer from `RECURRENT_TOKEN` and
+`CONV_L2NORM` when the model's geometry is inside what those kernels are compiled
+for (a 128-wide state and 256-aligned channel counts) and from the five separate
+operators otherwise; nothing is decided at run time, and a fused operation whose
+geometry is outside that set is rejected instead of routed elsewhere.
+`Options.LegacyDeltaNet` forces the unfused plan for the differential test.
+
 Single-token decode submits one matvec per matrix. `SelectDecodeGemvPath`
 chooses between the per-row GEMV and the streaming kernel per operation
 (section 5.3), and the output projection takes the same rule; the int8 variant is

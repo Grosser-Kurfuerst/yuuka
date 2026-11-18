@@ -52,7 +52,7 @@ document in the same change.
 | D1: decode output projection on the streaming kernel | **Done** (2026-11-18) | Decode p50 13.21 s -> 12.2 s or less; tokens unchanged |
 | D2: channel-parallel decode GEMV | **Done** (2026-11-18); isolated-width gate partly met, see 5.5 | Isolated decode shapes at 150 GB/s or more; decode at 28 tok/s or more |
 | D3: Q8_1 activations with `dp4a` | **Implemented** (2026-11-18); gate missed, not selected, see 6.5 | Isolated decode shapes at 185 GB/s or more; decode at 31 tok/s or more |
-| D4: gated delta-net per-token kernel | Not started | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
+| D4: gated delta-net per-token kernel | **Done** (2026-11-18); both gates met, see 7.5 | 24 layers at 2.0 ms or less (from 7.23 ms); decode at 37 tok/s or more |
 | D5: launch gaps and operator fusion | Not started | Inter-operation gaps at 1.5 ms or less; decode at 45 tok/s or more |
 
 D0 is implemented; its record is 3.4 and its measurements are in
@@ -60,7 +60,10 @@ D0 is implemented; its record is 3.4 and its measurements are in
 gate; its record is 4.5. D2 is implemented and meets the throughput gate, with
 the isolated-width gate met on nine of twelve shapes; its record is 5.5. D3 is
 implemented and measured, misses both gates, and is not the selected route; its
-record is 6.5. D4-D5 are not started. The measurements in section 2 describe the tree at commit
+record is 6.5. D4 is implemented and meets both gates: the delta-net unit of all
+24 recurrent layers fell from 7.72 ms to 0.79 ms and decode from 29.92 to 38.02
+tok/s; its record is 7.5. D5 is not started. The measurements in section 2
+describe the tree at commit
 `bfd36c0` and are the baseline each gate is compared against; each stage record
 states what that stage moved.
 
@@ -239,7 +242,9 @@ Two secondary routes:
    five times per token (decay, `S^T k`, update, `S^T q`, plus the write-back).
    Each head moves 384 KiB, so 24 layers x 32 heads is about 302 MB of state
    traffic per token at 42 GB/s; the floor at 244 GB/s is about 1.2 ms against
-   the measured 7.23 ms.
+   the measured 7.23 ms. D4 replaced this kernel with the fused per-token pair;
+   the baseline description stays because it is what the gain is measured
+   against (7.5).
 
 ### 2.7 Reference structure (llama.cpp MMVQ)
 
@@ -834,6 +839,107 @@ a 1.2 ms floor.
   inside the existing bound.
 - The chunked prefill recurrent path is unchanged or faster.
 
+### 7.5 Implementation (2026-11-18)
+
+Both fused operators are implemented, measured, and selected. The delta-net unit
+of the 24 recurrent layers fell from 8.18 ms to 0.79 ms of the decode step, the
+operation count per recurrent layer from five to two, and decode from 29.92 to
+38.02 tok/s, so both gates of 7.3 are met.
+
+Added:
+
+- `kernels/hip/ssm/deltanet.hip`: `recurrent_token_f32_kernel` keeps one column
+  of a head's 128x128 state in registers, split across four thread groups of 32
+  rows each (512 threads per head), and applies the decay, the `S^T k` product,
+  the rank-1 update, and the `S^T q` product in a single pass over those
+  registers: the state is read once and written once per token. The gated RMSNorm
+  of the head is folded into the same block, because its reduction is over that
+  head's own values, so the operator writes the normalized row and the raw
+  delta-net row is no longer materialized.
+- `conv_l2norm_f32_kernel` in the same file fuses the 4-tap convolution with the
+  L2 norms of the q and k channel groups. Each block covers 256 channels, which
+  is a whole number of 128-wide groups, so a group never crosses a block
+  boundary and the norm needs no cross-block reduction.
+- ABI 6: `YUUKA_OP_RECURRENT_TOKEN` (39) and `YUUKA_OP_CONV_L2NORM` (40). Go
+  exposes `AddRecurrentTokenAt` and `AddConvL2Norm`, `Model.fusedDeltaNet`
+  decides between the fused pair and the five separate operators at plan-build
+  time, and `Options.LegacyDeltaNet` builds the unfused plan for the differential
+  test. Both kernels are compiled for a 128-wide state and 256-aligned channel
+  blocks; any other geometry keeps the separate operators, and a fused operation
+  whose geometry is outside that set is rejected with `YUUKA_ERR_UNSUPPORTED`
+  rather than routed elsewhere.
+
+Measured design choice. `bench/hip/deltanet_sweep.hip` is a standalone sweep that
+times each candidate kernel at the real layer shape with HIP events around one
+launch, so the figure is kernel time. State resident, 32 heads:
+
+| Form | ms/layer | State GB/s | x legacy |
+| --- | ---: | ---: | ---: |
+| five-pass kernel (legacy) | 0.3023 | 34.7 | 1.00 |
+| copy floor (read and write once) | 0.0177 | 236.8 | 17.1 |
+| register, 128 threads/head | 0.0133 | 316.2 | 22.8 |
+| register, 256 threads/head | 0.0117 | 357.2 | 25.8 |
+| register, 512 threads/head, **selected** | 0.0112 | 375.1 | 27.0 |
+| register, 512 threads/head, no RMSNorm | 0.0108 | 387.6 | 27.9 |
+| shared memory, 128 threads/head | 0.0334 | 125.5 | 9.0 |
+
+The register-resident form wins by 3x over the shared-memory form: a 64 KB state
+fills the workgroup shared budget, so the shared form runs one block per compute
+unit with four waves and cannot fuse the RMSNorm, while the register form leaves
+the budget free and reaches 375 GB/s. The 512-thread configuration beats 256 by
+6% and also beats the copy kernel, which is the same traffic with fewer waves: the
+limit here is memory-level parallelism per lane, not bandwidth. The RMSNorm fusion
+costs 0.4 us per layer, which is less than the launch it removes. Agreement with
+the legacy kernel over the same inputs: 2.6e-08 on the output and 3.7e-09 on the
+state.
+
+Inside the decode step (`TestGPUProfileDecode`), per token:
+
+| Operation | Ops | ms | Share |
+| --- | ---: | ---: | ---: |
+| `recurrent_token` (was `gdn`) | 24 | 0.467 | 1.9% |
+| `conv_l2norm` (was `conv1d` + 2x `l2norm`) | 24 | 0.328 | 1.3% |
+| fused delta-net unit | 48 | 0.790 | 3.3% |
+| the five operators it replaced (D3 tree) | 120 | 8.177 | 25.9% |
+
+The recurrent state alone moves 100.7 MB per token at 217 GB/s inside the step,
+against 34.7 GB/s for the five-pass form. The dense matvec family is now 88.4% of
+the step at 126.7 GB/s, which is the D5 subject.
+
+The RECURRENT cell is reproducible from the decode sweep:
+`build/yuuka_gemv_decode_sweep --recurrent` builds the same layer both ways and
+reports 0.3371 ms per layer for the five operators against 0.0168 ms for the
+fused pair, that is 8.1 ms against 0.40 ms for 24 layers, at 249.5 GB/s of state
+traffic. That is the gate figure of 7.3; the in-step figure is lower because the
+state of a layer is cold once 24 layers of state pass through a 32 MB cache.
+
+End to end, one device, same session, 128-token prompt (`yuuka bench`):
+
+| Route | Decode p50 | tok/s | Step (release) | Profiled step |
+| --- | ---: | ---: | ---: | ---: |
+| D3 tree | 4.245 s | 29.92 | 33.2 ms | 31.6 ms |
+| D4 tree | 3.341 s | **38.02** | 26.1 ms | 24.28 ms |
+
+At a 256-token prompt the same change takes decode from 8.807 s to 7.547 s
+(28.95 to 33.79 tok/s), so the gain is not a short-context artifact. Prefill is
+unchanged: 0.085 s for 128 prompt tokens (1507 tok/s), and
+`TestGPUChunkedPrefillLongContext` returns bit-identical logits, because the
+chunked recurrent path was not touched.
+
+A defect was found and fixed by this stage, and it is the reason
+`tests/hip/deltanet_test.cpp` now carries a host reference. The first version of
+the register kernel formed `S^T k` from the state as loaded and applied the decay
+only in the update pass, so the delta the rank-1 update uses was missing a factor
+of `decay`. With the sweep's original inputs, whose decay was 0.997, the kernel
+agreed with the legacy kernel to 1.6e-5 and the mistake was invisible; with a
+decay of 0.75 the same mistake shows up as 2.6e-4, which the platform test bound
+of 1e-5 rejects. The native test therefore fixes the decay far from one and
+compares both device paths against an independent host implementation of the
+documented order of operations, and [testing.md](testing.md) records the rule.
+
+What remains: the matvec family is 88.4% of the step at 126.7 GB/s, the
+inter-operation gap is about 6 ms of the 33 ms release step, and D5 owns both.
+
 ## 8. Stage D5: launch gaps and operator fusion
 
 ### 8.1 Problem
@@ -879,22 +985,26 @@ The stage gates are individually necessary; the plan is done when the whole
 matrix holds on the reference device, measured under
 [testing.md](testing.md)'s protocol with the metadata of 2.1:
 
-| Test | Current | After D1 (measured) | After D2 (measured) | After D3 (measured) | After D4 | After D5 | llama.cpp |
+| Test | Current | After D1 (measured) | After D2 (measured) | After D3 (measured) | After D4 (measured) | After D5 | llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | **29.91** (gate missed) | 37 | 45 | 62.39 |
-| Step time, release | 104.1 ms | **95.1 ms** | **33.4 ms** | 31 ms | 26 ms | 19 ms | 16.03 ms |
-| Step time, profiled | 97.6 ms | **89.0 ms** | **31.6 ms** | - | - | - | - |
-| Decode p50, 128 tokens | 13.21 s | **12.08 s** | **4.25 s** | - | - | - | 2.05 s |
-| Matvec bandwidth, in step | 31 GB/s | **34.5** | **126.5** | 185 | 185 | 190 | about 170 |
-| Matvec bandwidth, isolated | 46 GB/s | **186** | **184-287** | 185 | 185 | 190 | about 170 |
-| Prefill pp128 tok/s | 1359.9 | **1465** | **1484** | unchanged | unchanged | unchanged | 1766.6 |
+| tg128, 128 prompt | 9.61 | **10.51** | **29.92** | **29.91** (gate missed) | **38.02** | 45 | 62.39 |
+| Step time, release | 104.1 ms | **95.1 ms** | **33.4 ms** | 31 ms | **26.1 ms** | 19 ms | 16.03 ms |
+| Step time, profiled | 97.6 ms | **89.0 ms** | **31.6 ms** | - | **24.28 ms** | - | - |
+| Decode p50, 128 tokens | 13.21 s | **12.08 s** | **4.25 s** | - | **3.34 s** | - | 2.05 s |
+| Matvec bandwidth, in step | 31 GB/s | **34.5** | **126.5** | 185 | **126.7** | 190 | about 170 |
+| Matvec bandwidth, isolated | 46 GB/s | **186** | **184-287** | 185 | **376** (delta-net state) | 190 | about 170 |
+| Prefill pp128 tok/s | 1359.9 | **1465** | **1484** | unchanged | **1507** | unchanged | 1766.6 |
 
-The After-D1, After-D2, and After-D3 columns are measured (4.5, 5.5, 6.5); the
-D4 and D5 columns are arithmetic from the traffic floors of 2.8 and the gates of
-sections 7 and 8, not measurements, and every cell must be replaced by a measured
-value before this document claims it. The tg128 columns after D2 carry the gate value, which is
-deliberately below the projection: section 8.3 projects 52 tok/s from a 19 ms
-step and gates at 45. The reference column is measured.
+The After-D1, After-D2, After-D3, and After-D4 columns are measured (4.5, 5.5,
+6.5, 7.5); the D5 column is arithmetic from the traffic floors of 2.8 and the
+gates of section 8, not a measurement, and every cell must be replaced by a
+measured value before this document claims it. The tg128 columns after D2 carry
+the gate value, which is deliberately below the projection: section 8.3 projects
+52 tok/s from a 19 ms step and gates at 45; D4 measured 38.02, above its own gate
+of 37. After D3 the matvec row stays at the measured in-step rate because D3's
+route was not selected, and after D4 the isolated row is the delta-net state rate
+of the RECURRENT cell: the matvec isolated rate did not change. The reference
+column is measured.
 
 Additional acceptance:
 

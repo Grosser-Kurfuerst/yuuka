@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 5
+#define YUUKA_HIP_ABI_VERSION 6
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -139,7 +139,9 @@ typedef enum yuuka_op_code {
     YUUKA_OP_DEQUANT_F16 = 35,
     YUUKA_OP_QUANT_Q8_1 = 36,
     YUUKA_OP_LM_HEAD = 37,
-    YUUKA_OP_GEMV_Q8_1 = 38
+    YUUKA_OP_GEMV_Q8_1 = 38,
+    YUUKA_OP_RECURRENT_TOKEN = 39,
+    YUUKA_OP_CONV_L2NORM = 40
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -312,7 +314,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *
  * GEMV, GEMM, GEMM_SWIGLU, GEMV_BATCH, LM_HEAD, the legacy single-token family (RMSNORM, L2NORM,
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
- * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
+ * COPY, SCALE, and KV_WRITE), the fused delta-net pair (CONV_L2NORM and
+ * RECURRENT_TOKEN), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
  * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
  * DEQUANT_F16, and QUANT_Q8_1. Unsupported
@@ -361,6 +364,24 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   LM_HEAD:             buf0 packed weights, buf1 FP32 x, buf2 FP32 out;
  *                        n={n_in,n_out,rows}; u[0]=dtype; n_in must be a
  *                        multiple of 256 and rows at most 16
+ *   RECURRENT_TOKEN:     buf0 state, buf1 q, buf2 k, buf3 v, buf4 alpha,
+ *                        buf5 beta, buf6 dt, buf7 a, buf8 out, buf9 norm
+ *                        weight, buf10 gate; off[1..3] select q, k, and v;
+ *                        n={groups,heads,state}; f[0]=eps. state is
+ *                        [heads,state,state] FP32 in the chunked prefill
+ *                        layout, q and k are [groups,state], v, out, and gate
+ *                        are [heads,state], and out receives the gated RMSNorm
+ *                        of the head rather than the raw delta-net result.
+ *                        state must be 128, and the operation fails with
+ *                        YUUKA_ERR_UNSUPPORTED for any other width.
+ *   CONV_L2NORM:         buf0 conv state, buf1 conv weights, buf2 qkv, buf3 out;
+ *                        n={channels,kernel,qk_channels,q_channels,state};
+ *                        f[0]=eps; f[1]=q scale. out receives the SiLU of the
+ *                        convolution, and its first qk_channels channels are
+ *                        then L2 normalized per group of state values, with
+ *                        q_scale applied to the first q_channels. channels and
+ *                        qk_channels must be multiples of 256 and state must be
+ *                        128; other shapes fail with YUUKA_ERR_UNSUPPORTED.
  *
  * Paged family. The block table is an int32 buffer with ceil(capacity/block_size)
  * entries mapping logical token positions to pool blocks. The pool holds

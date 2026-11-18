@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 5
+const RequiredABI = 6
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -678,6 +678,65 @@ func (p *Plan) AddGDNAt(state, q *Buffer, qOff uint64, k *Buffer, kOff uint64, v
 	op.n[0] = C.uint64_t(groups)
 	op.n[1] = C.uint64_t(heads)
 	op.n[2] = C.uint64_t(stateSize)
+	return p.add(op)
+}
+
+// AddConvL2Norm appends the fused short convolution and L2 norm of a gated
+// delta-net layer: out receives the SiLU of the convolution for every channel,
+// and then its first qkChannels values are L2 normalized per group of stateSize,
+// with qScale applied to the first qChannels of them. The convolution ring state
+// in convState is advanced for every channel. channels and qkChannels must be
+// multiples of 256 and stateSize must be 128; other shapes are rejected by the
+// bridge with YUUKA_ERR_UNSUPPORTED.
+func (p *Plan) AddConvL2Norm(convState, weights, qkv, out *Buffer, channels, kernel, qkChannels, qChannels, stateSize int, eps, qScale float32) error {
+	if err := p.check(convState, weights, qkv, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_CONV_L2NORM}
+	op.buf[0] = convState.ptr
+	op.buf[1] = weights.ptr
+	op.buf[2] = qkv.ptr
+	op.buf[3] = out.ptr
+	op.n[0] = C.uint64_t(channels)
+	op.n[1] = C.uint64_t(kernel)
+	op.n[2] = C.uint64_t(qkChannels)
+	op.n[3] = C.uint64_t(qChannels)
+	op.n[4] = C.uint64_t(stateSize)
+	op.f[0] = C.float(eps)
+	op.f[1] = C.float(qScale)
+	return p.add(op)
+}
+
+// AddRecurrentTokenAt appends one token of a gated delta-net layer with the
+// head's state held in registers. out receives the gated RMSNorm of the head,
+// not the raw delta-net result: the operator fuses the decay, both S^T products,
+// the rank-1 update, and the normalization, because the normalization reduces
+// over the same head's values. state is [heads,stateSize,stateSize] FP32 and is
+// updated in place; q and k are indexed by group, v, out, and gate by head.
+// stateSize must be 128.
+func (p *Plan) AddRecurrentTokenAt(state, q *Buffer, qOff uint64, k *Buffer, kOff uint64, v *Buffer, vOff uint64, alpha, beta, dt, a, out, normWeight, gate *Buffer, groups, heads, stateSize int, eps float32) error {
+	if err := p.check(state, q, k, v, alpha, beta, dt, a, out, normWeight, gate); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_RECURRENT_TOKEN}
+	op.buf[0] = state.ptr
+	op.buf[1] = q.ptr
+	op.buf[2] = k.ptr
+	op.buf[3] = v.ptr
+	op.buf[4] = alpha.ptr
+	op.buf[5] = beta.ptr
+	op.buf[6] = dt.ptr
+	op.buf[7] = a.ptr
+	op.buf[8] = out.ptr
+	op.buf[9] = normWeight.ptr
+	op.buf[10] = gate.ptr
+	op.off[1] = C.uint64_t(qOff)
+	op.off[2] = C.uint64_t(kOff)
+	op.off[3] = C.uint64_t(vOff)
+	op.n[0] = C.uint64_t(groups)
+	op.n[1] = C.uint64_t(heads)
+	op.n[2] = C.uint64_t(stateSize)
+	op.f[0] = C.float(eps)
 	return p.add(op)
 }
 

@@ -139,8 +139,12 @@ Implemented and tested:
   measured status is in [roadmap2.md](roadmap2.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
-  The CLI and server select it with `--backend hip` when built with
-  `-tags hip`.
+  Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm
+  kernel and one per-token state kernel that keeps a head's 128x128 state in
+  registers and folds in the gated RMSNorm), which took the 24 recurrent layers
+  from 8.18 ms to 0.79 ms of the decode step; the unfused operators stay
+  reachable through `Options.LegacyDeltaNet`. The CLI and server select HIP with
+  `--backend hip` when built with `-tags hip`.
 - Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
   event profile path, and per-quantization/per-batch decode baselines.
 - CPU reference dequantization and matrix-vector products for `IQ2_XXS`,

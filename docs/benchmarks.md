@@ -132,29 +132,80 @@ F32 KV, median of three repetitions:
 
 | Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 320 | 0.086 s | 0.086 s | 4.245 s | 29.92 |
-| 256 | 448 | 0.085 s | 0.085 s | 8.807 s | 28.95 |
+| 128 | 320 | 0.085 s | 0.085 s | 3.341 s | 38.02 |
+| 256 | 448 | 0.160 s | 0.160 s | 7.547 s | 33.79 |
 
-Decode is weight-bandwidth bound and essentially flat in output length: the two
-rows differ by about 3%. Effective weight-read bandwidth is
-$2.726\\,\\mathrm{GB} \\times 29.9\\,\\mathrm{s^{-1}} \\approx 81.5\\,\\mathrm{GB/s}$,
-about half of what the same weights stream at in llama.cpp
-([llama.cpp comparison](#llamacpp-comparison)). The matvec family is still the
-limiter, not attention ([isolated kernels](#isolated-kernels)).
+Decode is weight-bandwidth bound and flat in output length: the two rows differ by
+11%, which is the prefill of the longer prompt plus the drift of an unpinned
+clock, not a change of regime. Effective weight-read bandwidth is
+$2.726\\,\\mathrm{GB} \\times 38.0\\,\\mathrm{s^{-1}} \\approx 103.6\\,\\mathrm{GB/s}$
+against the 127 GB/s the profiled step measures for the family, so the family
+itself is still the limiter ([isolated kernels](#isolated-kernels)).
 
 The decode rows measure the selected route, which is the FP32 streaming matvec
 (the int8 route of roadmap4 D3 is measured slower and stays opt-in; see
 [int8 decode matvec](#int8-decode-matvec-d3)).
 
-The table was re-measured twice: when the decode output projection moved to the
-streaming LM head kernel
-([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)) and when the rest of
-the decode matvec family followed it
-([roadmap4.md](roadmap4.md#55-implementation-2026-11-18)). Same flags, same
-session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s. The profiled
-step went 97.4, 89.4, 31.6 ms with the matvec family at 87.6, 79.2, 21.6 ms, so
-the matvec share fell from 90% to 68% and the gated delta-net became the second
-largest term at 24%. Prefill is unaffected across all three: 0.085-0.088 s.
+The table was re-measured three times: when the decode output projection moved to
+the streaming LM head kernel
+([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)), when the rest of the
+decode matvec family followed it
+([roadmap4.md](roadmap4.md#55-implementation-2026-11-18)), and when the gated
+delta-net moved to the fused per-token pair
+([roadmap4.md](roadmap4.md#75-implementation-2026-11-18)). Same flags, same
+session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s, then 3.341 s.
+The profiled step went 97.4, 89.4, 31.6, 24.3 ms with the matvec family at 87.6,
+79.2, 21.6, 21.5 ms, so the matvec share rose from 68% to 88% as the delta-net
+left the critical path. Prefill is unaffected across all four: 0.085-0.088 s.
+
+### Gated delta-net (D4)
+
+`build/yuuka_deltanet_sweep`: one recurrent layer at the decode geometry (32
+heads, 16 groups, 128-wide state), each candidate kernel timed with HIP events
+around a single launch, five warmups and twenty-five submissions. The state is
+resident, so this is the hot upper bound; the in-step figures below are lower. The
+five-pass form reads the state three times and writes it twice, the fused forms
+once each, which is the traffic the GB/s column uses.
+
+| Form | ms/layer | State GB/s | x five-pass |
+| --- | ---: | ---: | ---: |
+| five-pass kernel (legacy) | 0.3023 | 34.7 | 1.00 |
+| copy floor (read and write once) | 0.0177 | 236.8 | 17.1 |
+| register, 128 threads/head | 0.0133 | 316.2 | 22.8 |
+| register, 256 threads/head | 0.0117 | 357.2 | 25.8 |
+| register, 512 threads/head (selected) | 0.0112 | 375.1 | 27.0 |
+| register, 512 threads/head, no gated RMSNorm | 0.0108 | 387.6 | 27.9 |
+| shared memory, 128 threads/head | 0.0334 | 125.5 | 9.0 |
+
+The register form wins because the 64 KB state cannot share the workgroup budget
+with the normalization scratch the shared form would need, and because 512
+threads give the memory pipeline more independent loads per lane than the copy
+kernel itself: the selected form is faster than a read-and-write copy of the same
+bytes, which puts the limiter at memory-level parallelism rather than bandwidth.
+
+The same layer inside a decode step (`TestGPUProfileDecode`), per token:
+
+| Operation | Ops | ms | Share |
+| --- | ---: | ---: | ---: |
+| `recurrent_token` | 24 | 0.467 | 1.9% |
+| `conv_l2norm` | 24 | 0.328 | 1.3% |
+| delta-net unit | 48 | 0.790 | 3.3% |
+| the five operators it replaced | 120 | 8.177 | 25.9% |
+
+The recurrent state alone moves 100.7 MB per token at 217 GB/s inside the step,
+against 34.7 GB/s for the five-pass form. The operation count of the whole decode
+step fell from 579 to 507.
+
+`build/yuuka_gemv_decode_sweep --recurrent` is the reproducible RECURRENT cell: it
+builds the same layer from both plans and reports 0.3371 ms per layer for the five
+operators against 0.0168 ms for the fused pair, that is 8.1 ms against 0.40 ms for
+24 layers, at 249.5 GB/s of state traffic.
+
+Numerics: `tests/hip/deltanet_test.cpp` bounds both the fused pair and the five
+separate operators against an independent host reference over three tokens with a
+decay of about 0.75; the worst difference is 3e-8, and the two device paths agree
+with each other to 7e-9. On the real model the two plans produce identical greedy
+tokens over eight steps with a 9.5e-6 maximum logit difference.
 
 ### Int8 decode matvec (D3)
 
@@ -591,6 +642,10 @@ off, greedy:
 | | Per-request decode tok/s | 39.17 | 2.41 |
 | | TTFT median | 371 ms | 690 ms |
 
+The yuuka decode column of this table was measured before roadmap4 D1-D4 and is
+kept as the recorded server comparison; the CLI rows above are the current decode
+rate, and the server path has not been re-measured against llama.cpp since.
+
 Both servers tokenize the benchmark prompt to the same length (140, 530, 2051),
 so the prefill comparison is like for like. yuuka-server prefill throughput sits
 5-28% below the CLI rows at comparable prompt lengths (28% at ~140 tokens, 13%
@@ -630,17 +685,18 @@ extra work; see the attribution in roadmap3.
 | pp512 | 2346.17 ± 80.87 | 1634.8 (F16 KV) | 0.70 |
 | pp2048 | 2409.70 ± 5.39 | 1641.5 (F16 KV) | 0.68 |
 | pp8192 | 2170.79 ± 4.19 | 1438.2 (F16 KV) | 0.66 |
-| tg128 (prompt 128) | 62.29 ± 0.19 | 29.92 (F32 KV) | 0.48 |
+| tg128 (prompt 128) | 62.29 ± 0.19 | 38.02 (F32 KV) | 0.61 |
 
 The remaining gaps, in order of size:
 
-1. Decode, 2.1x: llama.cpp streams the 2.726 GB of quantized weights at about
+1. Decode, 1.6x: llama.cpp streams the 2.726 GB of quantized weights at about
    170 GB/s, near the practical memory roofline; yuuka now streams the same
-   weights at 126.5 GB/s inside a step (81.5 GB/s effective per token) after
-   moving the whole matvec family to the channel-parallel kernel
-   ([decode matvec](#decode-matvec)). What remains is 68% matvec at 127 GB/s
-   against a 244 GB/s read ceiling, plus 7.7 ms of gated delta-net and 2.7 ms of
-   other operations and submission gaps in a 31.6 ms step.
+   weights at 126.7 GB/s inside a step after moving the whole matvec family to
+   the channel-parallel kernel ([decode matvec](#decode-matvec)). What remains is
+   88% matvec at 126.7 GB/s against a 244 GB/s read ceiling, plus 0.79 ms of
+   gated delta-net and 2.0 ms of other operations and submission gaps in a
+   24.3 ms step; the gated delta-net left the critical path when the fused
+   per-token pair landed ([gated delta-net](#gated-delta-net-d4)).
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
    runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see

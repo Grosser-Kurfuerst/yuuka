@@ -99,6 +99,23 @@ int main() {
         op.n[2] = 4;
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT, "GDN") && ok;
     }
+    {
+        yuuka_op op = make_op(YUUKA_OP_RECURRENT_TOKEN, tiny);
+        op.n[0] = 1;
+        op.n[1] = 1;
+        op.n[2] = 128;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "RECURRENT_TOKEN") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_CONV_L2NORM, tiny);
+        op.n[0] = 256;
+        op.n[1] = 4;
+        op.n[2] = 256;
+        op.n[3] = 128;
+        op.n[4] = 128;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT, "CONV_L2NORM") && ok;
+    }
     for (uint32_t code : {YUUKA_OP_SILU_MUL, YUUKA_OP_ADD, YUUKA_OP_COPY, YUUKA_OP_SCALE}) {
         yuuka_op op = make_op(code, tiny);
         op.n[0] = 8;
@@ -230,6 +247,44 @@ int main() {
         yuuka_op op = make_op(YUUKA_OP_KV_WRITE, roomy);
         op.n[0] = 8;
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_OK, "KV_WRITE valid") && ok;
+    }
+
+    // The fused delta-net pair needs more room than the elementwise buffers: the
+    // recurrent state is 128x128 FP32 per head.
+    yuuka_buffer * wide = nullptr;
+    if (yuuka_buffer_alloc(device, 1u << 20, &wide) != YUUKA_OK) {
+        std::fprintf(stderr, "wide buffer: %s\n", yuuka_last_error());
+        ok = false;
+    } else {
+        yuuka_op op = make_op(YUUKA_OP_RECURRENT_TOKEN, wide);
+        op.n[0] = 1;
+        op.n[1] = 2;
+        op.n[2] = 128;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_OK, "RECURRENT_TOKEN valid") && ok;
+        yuuka_op conv = make_op(YUUKA_OP_CONV_L2NORM, wide);
+        conv.n[0] = 256;
+        conv.n[1] = 4;
+        conv.n[2] = 256;
+        conv.n[3] = 128;
+        conv.n[4] = 128;
+        ok = expect(yuuka_plan_add(plan, &conv), YUUKA_OK, "CONV_L2NORM valid") && ok;
+        // Both kernels are compiled for the supported geometry, so a shape the
+        // plan builder would refuse must be refused here as well.
+        yuuka_op narrow = make_op(YUUKA_OP_RECURRENT_TOKEN, wide);
+        narrow.n[0] = 1;
+        narrow.n[1] = 2;
+        narrow.n[2] = 64;
+        ok = expect(yuuka_plan_add(plan, &narrow), YUUKA_ERR_UNSUPPORTED,
+                    "RECURRENT_TOKEN narrow state") && ok;
+        yuuka_op unaligned = make_op(YUUKA_OP_CONV_L2NORM, wide);
+        unaligned.n[0] = 192;
+        unaligned.n[1] = 4;
+        unaligned.n[2] = 128;
+        unaligned.n[3] = 128;
+        unaligned.n[4] = 128;
+        ok = expect(yuuka_plan_add(plan, &unaligned), YUUKA_ERR_UNSUPPORTED,
+                    "CONV_L2NORM unaligned channels") && ok;
+        yuuka_buffer_free(wide);
     }
 
     yuuka_plan_destroy(plan);

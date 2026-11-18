@@ -18,6 +18,12 @@
 // --int8 measures the int8 decode matvec of roadmap4 D3 against the FP32
 // streaming kernel on the same matrix, both with a pre-quantized activation and
 // with the block-fused quantizer. It prints its own schema and is not traced.
+//
+// --recurrent is the isolated RECURRENT cell of roadmap4 section 7.3: the
+// delta-net unit of one recurrent layer at the exact decode shape, built from the
+// five separate operators against the fused pair, so the stage's time and state
+// bandwidth gates are reproducible from one command. It prints its own schema
+// and is not traced.
 
 #include "yuuka_hip.h"
 
@@ -293,23 +299,227 @@ double submit(yuuka_device * device, yuuka_stream * stream, yuuka_event * comple
     return ms;
 }
 
+// The recurrent layer geometry of Qwen3.5-4B: 32 heads in 16 groups, a 128-wide
+// state, and a 4-tap convolution over 8192 qkv channels whose first 4096 are the
+// q and k groups the L2 norm covers.
+constexpr int64_t kRecGroups = 16;
+constexpr int64_t kRecHeads = 32;
+constexpr int64_t kRecState = 128;
+constexpr int64_t kRecKernel = 4;
+constexpr int64_t kRecInner = kRecHeads * kRecState;
+constexpr int64_t kRecKey = kRecGroups * kRecState;
+constexpr int64_t kRecConvDim = 2 * kRecKey + kRecInner;
+
+bool alloc_floats(yuuka_device * device, int64_t count, yuuka_buffer ** out) {
+    std::vector<float> host(static_cast<size_t>(count), 0.01f);
+    if (!check(yuuka_buffer_alloc(device, uint64_t(count) * sizeof(float), out), "alloc")) {
+        return false;
+    }
+    return check(yuuka_memcpy_h2d(*out, host.data(), uint64_t(count) * sizeof(float)), "h2d");
+}
+
+yuuka_op make_elementwise(uint32_t code, uint64_t n) {
+    yuuka_op op{};
+    op.code = code;
+    op.n[0] = n;
+    return op;
+}
+
+// run_recurrent times one recurrent layer's delta-net unit in the unfused and
+// fused plans. Both submit the same arithmetic: the separate operators are the
+// CONV1D, two L2NORM, GDN, and GATED_RMSNORM operations of the legacy plan, and
+// the fused plan is CONV_L2NORM plus RECURRENT_TOKEN.
+int run_recurrent(yuuka_device * device, yuuka_stream * stream, yuuka_event * completion) {
+    yuuka_buffer * conv_state = nullptr;
+    yuuka_buffer * conv_w = nullptr;
+    yuuka_buffer * qkv = nullptr;
+    yuuka_buffer * conv_out = nullptr;
+    yuuka_buffer * rec_state = nullptr;
+    yuuka_buffer * alpha = nullptr;
+    yuuka_buffer * beta = nullptr;
+    yuuka_buffer * dt = nullptr;
+    yuuka_buffer * sa = nullptr;
+    yuuka_buffer * gdn_out = nullptr;
+    yuuka_buffer * gate = nullptr;
+    yuuka_buffer * norm = nullptr;
+    yuuka_buffer * gdn_norm = nullptr;
+    if (!alloc_floats(device, kRecConvDim * (kRecKernel - 1), &conv_state) ||
+        !alloc_floats(device, kRecConvDim * kRecKernel, &conv_w) ||
+        !alloc_floats(device, kRecConvDim, &qkv) ||
+        !alloc_floats(device, kRecConvDim, &conv_out) ||
+        !alloc_floats(device, kRecHeads * kRecState * kRecState, &rec_state) ||
+        !alloc_floats(device, kRecHeads, &alpha) || !alloc_floats(device, kRecHeads, &beta) ||
+        !alloc_floats(device, kRecHeads, &dt) || !alloc_floats(device, kRecHeads, &sa) ||
+        !alloc_floats(device, kRecInner, &gdn_out) || !alloc_floats(device, kRecInner, &gate) ||
+        !alloc_floats(device, kRecState, &norm) || !alloc_floats(device, kRecInner, &gdn_norm)) {
+        return 1;
+    }
+    const float eps = 1e-6f;
+    const float q_scale = 1.0f / std::sqrt(float(kRecState));
+
+    yuuka_plan * legacy = nullptr;
+    yuuka_plan * fused = nullptr;
+    if (!check(yuuka_plan_create(device, &legacy), "legacy plan") ||
+        !check(yuuka_plan_create(device, &fused), "fused plan")) {
+        return 1;
+    }
+    int status = 0;
+    yuuka_op op{};
+    op.code = YUUKA_OP_CONV1D;
+    op.buf[0] = conv_state;
+    op.buf[1] = conv_w;
+    op.buf[2] = qkv;
+    op.buf[3] = conv_out;
+    op.n[0] = uint64_t(kRecConvDim);
+    op.n[1] = uint64_t(kRecKernel);
+    status |= !check(yuuka_plan_add(legacy, &op), "add conv1d");
+    for (int pass = 0; pass < 2; ++pass) {
+        yuuka_op norm_op{};
+        norm_op.code = YUUKA_OP_L2NORM;
+        norm_op.buf[0] = conv_out;
+        norm_op.buf[2] = conv_out;
+        norm_op.off[0] = uint64_t(pass == 0 ? 0 : kRecKey) * sizeof(float);
+        norm_op.off[2] = norm_op.off[0];
+        norm_op.n[0] = uint64_t(kRecGroups);
+        norm_op.n[1] = uint64_t(kRecState);
+        norm_op.n[2] = uint64_t(kRecState);
+        norm_op.f[0] = eps;
+        norm_op.f[1] = pass == 0 ? q_scale : 1.0f;
+        status |= !check(yuuka_plan_add(legacy, &norm_op), "add l2norm");
+    }
+    yuuka_op gdn{};
+    gdn.code = YUUKA_OP_GDN;
+    gdn.buf[0] = rec_state;
+    gdn.buf[1] = conv_out;
+    gdn.buf[2] = conv_out;
+    gdn.buf[3] = conv_out;
+    gdn.buf[4] = alpha;
+    gdn.buf[5] = beta;
+    gdn.buf[6] = dt;
+    gdn.buf[7] = sa;
+    gdn.buf[8] = gdn_out;
+    gdn.off[2] = uint64_t(kRecKey) * sizeof(float);
+    gdn.off[3] = uint64_t(2 * kRecKey) * sizeof(float);
+    gdn.n[0] = uint64_t(kRecGroups);
+    gdn.n[1] = uint64_t(kRecHeads);
+    gdn.n[2] = uint64_t(kRecState);
+    status |= !check(yuuka_plan_add(legacy, &gdn), "add gdn");
+    yuuka_op gnorm{};
+    gnorm.code = YUUKA_OP_GATED_RMSNORM;
+    gnorm.buf[0] = gdn_out;
+    gnorm.buf[1] = norm;
+    gnorm.buf[2] = gate;
+    gnorm.buf[3] = gdn_norm;
+    gnorm.n[0] = uint64_t(kRecState);
+    gnorm.n[1] = uint64_t(kRecHeads);
+    gnorm.n[2] = uint64_t(kRecState);
+    gnorm.f[0] = eps;
+    status |= !check(yuuka_plan_add(legacy, &gnorm), "add gated rmsnorm");
+
+    yuuka_op conv_l2{};
+    conv_l2.code = YUUKA_OP_CONV_L2NORM;
+    conv_l2.buf[0] = conv_state;
+    conv_l2.buf[1] = conv_w;
+    conv_l2.buf[2] = qkv;
+    conv_l2.buf[3] = conv_out;
+    conv_l2.n[0] = uint64_t(kRecConvDim);
+    conv_l2.n[1] = uint64_t(kRecKernel);
+    conv_l2.n[2] = uint64_t(2 * kRecKey);
+    conv_l2.n[3] = uint64_t(kRecKey);
+    conv_l2.n[4] = uint64_t(kRecState);
+    conv_l2.f[0] = eps;
+    conv_l2.f[1] = q_scale;
+    status |= !check(yuuka_plan_add(fused, &conv_l2), "add conv l2norm");
+    yuuka_op token{};
+    token.code = YUUKA_OP_RECURRENT_TOKEN;
+    token.buf[0] = rec_state;
+    token.buf[1] = conv_out;
+    token.buf[2] = conv_out;
+    token.buf[3] = conv_out;
+    token.buf[4] = alpha;
+    token.buf[5] = beta;
+    token.buf[6] = dt;
+    token.buf[7] = sa;
+    token.buf[8] = gdn_norm;
+    token.buf[9] = norm;
+    token.buf[10] = gate;
+    token.off[2] = uint64_t(kRecKey) * sizeof(float);
+    token.off[3] = uint64_t(2 * kRecKey) * sizeof(float);
+    token.n[0] = uint64_t(kRecGroups);
+    token.n[1] = uint64_t(kRecHeads);
+    token.n[2] = uint64_t(kRecState);
+    token.f[0] = eps;
+    status |= !check(yuuka_plan_add(fused, &token), "add recurrent token");
+
+    const double state_bytes = double(kRecHeads) * kRecState * kRecState * sizeof(float);
+    std::printf("layers,%lld,groups,%lld,heads,%lld,state,%lld,conv_channels,%lld\n",
+                static_cast<long long>(kRecConvDim > 0 ? 24 : 0),
+                static_cast<long long>(kRecGroups), static_cast<long long>(kRecHeads),
+                static_cast<long long>(kRecState), static_cast<long long>(kRecConvDim));
+    std::printf("variant,ops,ms_per_layer,ms_24_layers,state_GB/s,state_MB_per_token\n");
+    struct Form {
+        const char * name;
+        yuuka_plan * plan;
+        int ops;
+        double traversals;
+    } forms[] = {
+        {"legacy_5_op", legacy, 5, 5.0},
+        {"fused_2_op", fused, 2, 2.0},
+    };
+    for (const Form & form : forms) {
+        if (status != 0) {
+            break;
+        }
+        const double ms = time_plan(form.plan, stream, completion);
+        if (ms <= 0) {
+            std::printf("%s,failed\n", form.name);
+            status = 1;
+            break;
+        }
+        const double bytes = form.traversals * state_bytes;
+        std::printf("%s,%d,%.4f,%.1f,%.1f,%.1f\n", form.name, form.ops, ms, ms * 24.0,
+                    bytes / (ms * 1.0e6), bytes * 24.0 / 1.0e6);
+    }
+    yuuka_plan_destroy(legacy);
+    yuuka_plan_destroy(fused);
+    yuuka_buffer_free(conv_state);
+    yuuka_buffer_free(conv_w);
+    yuuka_buffer_free(qkv);
+    yuuka_buffer_free(conv_out);
+    yuuka_buffer_free(rec_state);
+    yuuka_buffer_free(alpha);
+    yuuka_buffer_free(beta);
+    yuuka_buffer_free(dt);
+    yuuka_buffer_free(sa);
+    yuuka_buffer_free(gdn_out);
+    yuuka_buffer_free(gate);
+    yuuka_buffer_free(norm);
+    yuuka_buffer_free(gdn_norm);
+    return status;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     bool threshold = false;
     bool int8 = false;
+    bool recurrent = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--threshold") {
             threshold = true;
         } else if (arg == "--int8") {
             int8 = true;
+        } else if (arg == "--recurrent") {
+            recurrent = true;
         } else if (arg == "-h" || arg == "--help") {
-            std::printf("usage: %s [--threshold|--int8]\n"
+            std::printf("usage: %s [--threshold|--int8|--recurrent]\n"
                         "  (no option)  the twelve decode shapes in the per-row, batched,\n"
                         "               and streaming forms, traced by scripts/decode_profile.sh\n"
                         "  --threshold  the rows = 1 output projection crossover per dtype\n"
-                        "  --int8       the int8 decode matvec against the FP32 streaming kernel\n",
+                        "  --int8       the int8 decode matvec against the FP32 streaming kernel\n"
+                        "  --recurrent  the delta-net unit of one recurrent layer, five separate\n"
+                        "               operators against the fused pair (roadmap4 7.3)\n",
                         argv[0]);
             return 0;
         } else {
@@ -462,6 +672,14 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+        yuuka_event_destroy(completion);
+        yuuka_stream_destroy(stream);
+        yuuka_device_close(device);
+        return status;
+    }
+
+    if (recurrent) {
+        status = run_recurrent(device, stream, completion);
         yuuka_event_destroy(completion);
         yuuka_stream_destroy(stream);
         yuuka_device_close(device);

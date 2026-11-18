@@ -48,6 +48,8 @@ const (
 	OpQuantQ8_1             uint32 = uint32(C.YUUKA_OP_QUANT_Q8_1)
 	OpLMHead                uint32 = uint32(C.YUUKA_OP_LM_HEAD)
 	OpGemvQ8_1              uint32 = uint32(C.YUUKA_OP_GEMV_Q8_1)
+	OpRecurrentToken        uint32 = uint32(C.YUUKA_OP_RECURRENT_TOKEN)
+	OpConvL2Norm            uint32 = uint32(C.YUUKA_OP_CONV_L2NORM)
 )
 
 // opFlagTail mirrors YUUKA_OP_FLAG_TAIL.
@@ -56,7 +58,7 @@ const opFlagTail = 0x1
 // MaxOpCode is the highest op code the bound ABI declares. The shadow covers
 // every code in 1..MaxOpCode, and opinfo_test.go fails when one of them has no
 // name or role.
-const MaxOpCode = OpGemvQ8_1
+const MaxOpCode = OpConvL2Norm
 
 // OpRole names what a plan operation holds in one of its buffer slots. The role
 // is a property of the ABI opcode, so it is recorded once per code in opRoles
@@ -198,6 +200,10 @@ func OpName(code uint32) string {
 		return "lm_head"
 	case OpGemvQ8_1:
 		return "gemv_q8_1"
+	case OpRecurrentToken:
+		return "recurrent_token"
+	case OpConvL2Norm:
+		return "conv_l2norm"
 	default:
 		return "unknown"
 	}
@@ -229,6 +235,12 @@ func opRoles(code uint32) [3]OpRole {
 	case OpGDN:
 		// state, q, k, v, alpha, beta, dt, a, out.
 		return [3]OpRole{RoleState, RoleActivation, RoleActivation}
+	case OpRecurrentToken:
+		// state, q, k, v, alpha, beta, dt, a, out, norm weight, gate.
+		return [3]OpRole{RoleState, RoleActivation, RoleActivation}
+	case OpConvL2Norm:
+		// conv state, conv weights, qkv, out.
+		return [3]OpRole{RoleState, RoleWeight, RoleActivation}
 	case OpSiluMul:
 		return [3]OpRole{RoleActivation, RoleActivation, RoleOutput}
 	case OpAdd:
