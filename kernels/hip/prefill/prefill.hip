@@ -1082,13 +1082,13 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
 
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 const float * qkv, const float * z,
-                                const float * alpha, const float * beta,
+                                float * alpha, float * beta,
                                 const float * conv_weights, const float * dt,
                                 const float * a, const float * norm, float * conv,
-                                float * out, int rows, int groups, int heads,
-                                int state_size, int conv_dim, int inner,
-                                int conv_kernel, float eps, float q_scale,
-                                hipStream_t stream) {
+                                float * out, float * scratch, int rows,
+                                int groups, int heads, int state_size,
+                                int conv_dim, int inner, int conv_kernel,
+                                float eps, float q_scale, hipStream_t stream) {
     if (rows <= 0 || groups <= 0 || heads <= 0 || state_size <= 0) {
         return;
     }
@@ -1101,11 +1101,19 @@ void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
     conv1d_state_f32_kernel<<<state_blocks, kThreads, 0, stream>>>(
         conv_state, qkv, conv_dim, conv_kernel, rows);
     if (state_size == 128) {
-        const dim3 grid(static_cast<unsigned>(heads),
-                        static_cast<unsigned>(state_size / 32));
-        gdn_chunk_splitreg_f32_kernel<128><<<grid, 128, 0, stream>>>(
-            rec_state, conv, alpha, beta, dt, a, out, rows, groups, heads,
-            conv_dim, inner, eps, q_scale);
+        if (scratch != nullptr) {
+            launch_gdn_chunked_f32(rec_state, conv, alpha, beta, dt, a, out,
+                                   scratch, rows, groups, heads, state_size,
+                                   conv_dim, inner, eps, q_scale, stream);
+        } else {
+            // The split-register kernel is the reference form of the same
+            // recurrence and the fallback when no chunk scratch is supplied.
+            const dim3 grid(static_cast<unsigned>(heads),
+                            static_cast<unsigned>(state_size / 32));
+            gdn_chunk_splitreg_f32_kernel<128><<<grid, 128, 0, stream>>>(
+                rec_state, conv, alpha, beta, dt, a, out, rows, groups, heads,
+                conv_dim, inner, eps, q_scale);
+        }
         const dim3 norm_grid(static_cast<unsigned>((heads + 3) / 4),
                              static_cast<unsigned>(rows));
         gdn_norm_gate_rows_f32_kernel<<<norm_grid, 128, 0, stream>>>(

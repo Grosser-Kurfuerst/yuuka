@@ -268,10 +268,8 @@ func (m *Model) forwardRecurrent(index int, layer *Layer, st *State) error {
 	}
 
 	keyDim := cfg.SSMGroupCount * cfg.SSMStateSize
-	valueDim := cfg.SSMInnerSize
 	qConv := s.conv[:keyDim]
 	kConv := s.conv[keyDim : 2*keyDim]
-	vConv := s.conv[2*keyDim : 2*keyDim+valueDim]
 	stateSize := cfg.SSMStateSize
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
 	for h := 0; h < cfg.SSMGroupCount; h++ {
@@ -280,50 +278,13 @@ func (m *Model) forwardRecurrent(index int, layer *Layer, st *State) error {
 		l2NormHead(kConv[base:base+stateSize], cfg.RMSNormEps, 1)
 	}
 
-	for h := 0; h < cfg.SSMTimeStepRank; h++ {
-		kh := h % cfg.SSMGroupCount
-		q := qConv[kh*stateSize : (kh+1)*stateSize]
-		k := kConv[kh*stateSize : (kh+1)*stateSize]
-		v := vConv[h*stateSize : (h+1)*stateSize]
-		sBase := h * stateSize * stateSize
-		matrix := state.s[sBase : sBase+stateSize*stateSize]
-		decay := float32(math.Exp(float64(s.alpha[h])))
-		for i := range matrix {
-			matrix[i] *= decay
-		}
-		clear(s.sk)
-		for i := 0; i < stateSize; i++ {
-			ki := k[i]
-			row := matrix[i*stateSize : (i+1)*stateSize]
-			for j := 0; j < stateSize; j++ {
-				s.sk[j] += row[j] * ki
-			}
-		}
-		beta := s.beta[h]
-		for j := 0; j < stateSize; j++ {
-			s.d[j] = (v[j] - s.sk[j]) * beta
-		}
-		for i := 0; i < stateSize; i++ {
-			ki := k[i]
-			row := matrix[i*stateSize : (i+1)*stateSize]
-			for j := 0; j < stateSize; j++ {
-				row[j] += ki * s.d[j]
-			}
-		}
-		out := s.gdn[h*stateSize : (h+1)*stateSize]
-		clear(out)
-		for i := 0; i < stateSize; i++ {
-			qi := q[i]
-			row := matrix[i*stateSize : (i+1)*stateSize]
-			for j := 0; j < stateSize; j++ {
-				out[j] += row[j] * qi
-			}
-		}
-		rmsNormInPlace(out, rec.Norm, cfg.RMSNormEps)
-		for j := 0; j < stateSize; j++ {
-			out[j] *= silu(s.z[h*stateSize+j])
-		}
-	}
+	// The CPU reference keeps the per-token recurrence: it is the oracle the
+	// device kernels are compared against, and its summation order is fixed.
+	// The chunkwise form that the prefill device path uses is validated against
+	// this one in recurrent_test.go.
+	gdnPerTokenScan(state.s, s.sk, s.d, s.conv, s.alpha, s.beta, s.gdn, 1,
+		cfg.SSMGroupCount, cfg.SSMTimeStepRank, stateSize, convDim)
+	gdnNormGate(s.gdn, s.z, rec.Norm, 1, cfg.SSMTimeStepRank, stateSize, cfg.RMSNormEps)
 	if err := rec.Out.MatVec(s.tmp, s.gdn); err != nil {
 		return fmt.Errorf("ssm_out: %w", err)
 	}

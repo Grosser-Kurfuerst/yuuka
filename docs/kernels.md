@@ -717,6 +717,71 @@ traffic without reducing occupancy:
   The register path is the measured fast path; see the attribution in
   [benchmarks.md](benchmarks.md).
 
+### 6.5 Chunkwise gated delta-net form
+
+`kernels/hip/prefill/gdn_chunk.hip` implements the chunkwise WY form of the same
+recurrence and is validated against `gdn_chunk_splitreg_f32_kernel` and the CPU
+reference, but it is **not the selected path**: it is slower than the per-token
+kernel on gfx1151 (see the measurements below). The op selects it only when the
+caller supplies the scratch buffer of `yuuka_op.buf[12]`; the prefill graph
+leaves that slot null.
+
+With `p_r = gamma_1 .. gamma_r`, `g_r = log p_r`, and `g_c` the last cumulative
+decay of a chunk of `n` tokens, the recurrence
+
+```text
+S_r = gamma_r (I - beta_r k_r k_r^T) S_{r-1} + beta_r k_r v_r^T
+```
+
+becomes, with `K/Q/V` the normalized chunk rows and `M = I + B` where
+`B[r][s] = beta_r (k_r . k_s)` for `s < r`:
+
+```text
+S_C = exp(g_c) S_0 + K^T (M^-1 diag(beta) (exp(g_c - g) V - exp(g_c) K S_0))
+o_r = exp(g_r) (q_r S_0 + Z (diag(beta exp(-g)) V - K S_0))_r
+Z   = (Q K^T on the lower triangle) M^-1
+```
+
+The decay of a row is a scalar for the whole state matrix, so it factors out of
+the triangular solve and only rows of the chunk interact. The chunk length is
+fixed at 32 so the triangular system is one warp-wide inversion and the state
+projection is a 32-row tile.
+
+Three kernels run per prompt chunk:
+
+- `gdn_prepare_rows_f32_kernel` normalizes the q and k segments of every row and
+  replaces the raw alpha and beta projections with the log decay and the sigmoid
+  gate. It consumes `conv`, `alpha`, and `beta` in place; the callers treat them
+  as scratch.
+- `gdn_prep_f32_kernel` runs once per (chunk, head) and writes `M^-1` and `Z`.
+  One thread owns one column of the system and a quarter of the state
+  dimension, so a dot product keeps 32 accumulators live and resolves with two
+  shuffles. The inverse is a column-wise forward substitution on one wave.
+- `gdn_scan_f32_kernel` walks the chunks of one head in order with one state
+  column block per workgroup (32 of 128 columns, 8 column groups by 8 state
+  parts, two columns per thread). The state slice stays in registers, the state
+  projections reduce across the eight parts of a column group with shuffles,
+  and the triangular products hold only the thread's own rows. Chunk-row tiles
+  are staged in LDS as `tile[(i / 16) * 8 + (i % 16)][r]` so the eight parts of
+  a column read windows that differ by the padded stride and land on different
+  banks.
+
+Measured with `build/yuuka_hip_prefill_sweep`-style isolation
+(`/tmp/bench_gdn`, one op in a plan, 24 layers, 512 rows): the chunked path
+takes 3.10 ms per layer, the per-token split-register path 2.01 ms. Per kernel,
+the scan is 1.73 ms, the prep 0.85 ms, and the existing convolution, gated
+RMSNorm, and preparation kernels add 0.36 ms. The scan reaches 0.4 IPC per CU:
+it is LDS-latency bound, with 106-164 VGPRs and three 8-wave workgroups resident
+per CU against a 47-67 cycle LDS latency, and it issues 2.7M instructions per CU
+per layer. Every product is an FP32 FMA-pipe loop; the reference implementation
+instead runs its dense products on the FP16 WMMA path (`mmb_dense`), which is
+the step that would make this form competitive (see
+[roadmap3.md](roadmap3.md#51-implementation-2026-11-18)).
+
+Correctness: `tests/hip/prefill_test.cpp` runs both paths against the same CPU
+reference (chunked maximum absolute difference `1.6e-7`, per-token `2.1e-7`) and
+checks that a repeated execution reproduces the outputs bitwise.
+
 SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
 epilogue, together with fusing the gate/up GEMMs themselves, is a candidate
 under [roadmap2.md](roadmap2.md); no fused implementation is claimed. Every

@@ -159,8 +159,8 @@ typedef enum yuuka_op_code {
 typedef struct yuuka_op {
     uint32_t code;
     uint32_t flags;
-    yuuka_buffer * buf[12];
-    uint64_t off[12];
+    yuuka_buffer * buf[16];
+    uint64_t off[16];
     uint64_t n[6];
     uint32_t u[4];
     float f[4];

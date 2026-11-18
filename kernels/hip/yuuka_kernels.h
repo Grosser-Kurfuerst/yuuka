@@ -233,15 +233,29 @@ void launch_moe_reduce_add(float * x, const float * expert_out,
                            const float * weights, int rows, int used, int hidden,
                            hipStream_t stream);
 
+// launch_gdn_chunked_f32 runs the chunkwise gated delta rule, normalization,
+// and gate activations of one recurrent layer. scratch holds two 32x32
+// matrices per 32-token chunk and time-step head.
+void launch_gdn_chunked_f32(float * rec, float * conv, float * alpha,
+                            float * beta, const float * dt, const float * a,
+                            float * out, float * scratch, int rows, int groups,
+                            int heads, int state, int conv_dim, int inner,
+                            float eps, float q_scale, hipStream_t stream);
+
+// launch_recurrent_chunk_f32 runs the convolution, the gated delta-net
+// recurrence, and the gated RMSNorm of one recurrent layer chunk. alpha and
+// beta are overwritten with the activated gates. scratch holds the chunked
+// path's triangular intermediates and may be null, in which case state sizes
+// other than 128 take the per-token fallback.
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 const float * qkv, const float * z,
-                                const float * alpha, const float * beta,
+                                float * alpha, float * beta,
                                 const float * conv_weights, const float * dt,
                                 const float * a, const float * norm, float * conv,
-                                float * out, int rows, int groups, int heads,
-                                int state_size, int conv_dim, int inner,
-                                int conv_kernel, float eps, float q_scale,
-                                hipStream_t stream);
+                                float * out, float * scratch, int rows,
+                                int groups, int heads, int state_size,
+                                int conv_dim, int inner, int conv_kernel,
+                                float eps, float q_scale, hipStream_t stream);
 
 } // namespace yuuka
 

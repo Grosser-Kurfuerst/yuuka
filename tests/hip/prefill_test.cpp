@@ -1173,7 +1173,8 @@ bool test_attention_prefill(yuuka_device * device, yuuka_stream * stream,
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
-                          yuuka_event * event, std::mt19937 & rng, int state) {
+                          yuuka_event * event, std::mt19937 & rng, int state,
+                          bool chunked) {
     const int rows = 128, groups = 16, heads = 32, kernel = 4;
     const int inner = heads * state, conv_dim = 2 * groups * state + inner;
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
@@ -1196,13 +1197,17 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
     const std::vector<float> conv_state0 = conv_state;
     const std::vector<float> rec_state0 = rec_state;
 
-    Buffer qb, zb, ab, bb, cwb, dtb, avb, nb, csb, rsb, convb, ob;
+    // The chunked path keeps two chunk x chunk matrices per chunk and head.
+    const size_t chunks = size_t((rows + 31) / 32);
+    const size_t scratch_elems = chunked ? chunks * heads * 2 * 32 * 32 : 0;
+    Buffer qb, zb, ab, bb, cwb, dtb, avb, nb, csb, rsb, convb, ob, scb;
     bool ok = alloc(device, qb, qkv.size() * 4) && alloc(device, zb, z.size() * 4) &&
               alloc(device, ab, alpha.size() * 4) && alloc(device, bb, beta.size() * 4) &&
               alloc(device, cwb, conv_w.size() * 4) && alloc(device, dtb, dt.size() * 4) &&
               alloc(device, avb, a.size() * 4) && alloc(device, nb, norm.size() * 4) &&
               alloc(device, csb, conv_state.size() * 4) && alloc(device, rsb, rec_state.size() * 4) &&
               alloc(device, convb, qkv.size() * 4) && alloc(device, ob, z.size() * 4) &&
+              (!chunked || alloc(device, scb, scratch_elems * 4)) &&
               upload_vec(qb, qkv) && upload_vec(zb, z) && upload_vec(ab, alpha) &&
               upload_vec(bb, beta) && upload_vec(cwb, conv_w) && upload_vec(dtb, dt) &&
               upload_vec(avb, a) && upload_vec(nb, norm) && upload_vec(csb, conv_state) &&
@@ -1224,6 +1229,9 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
         op.buf[9] = nb.buf;
         op.buf[10] = ob.buf;
         op.buf[11] = convb.buf;
+        if (chunked) {
+            op.buf[12] = scb.buf;
+        }
         op.n[0] = rows;
         op.n[1] = groups;
         op.n[2] = heads;
@@ -1258,14 +1266,6 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
         const std::vector<float> raw_conv = conv;
         std::vector<float> expected(size_t(rows * inner));
         const int key_dim = groups * state;
-        double conv_max = 0;
-        for (size_t i = 0; i < raw_conv.size(); ++i) {
-            conv_max = std::max(conv_max, double(std::fabs(got_conv[i] - raw_conv[i])));
-        }
-        if (conv_max > 1e-5) {
-            std::fprintf(stderr, "recurrent conv scratch mismatch: %.3g\n", conv_max);
-            ok = false;
-        }
         for (int r = 0; r < rows; ++r) {
             for (int g = 0; g < groups; ++g) {
                 float qsum = 0, ksum = 0;
@@ -1330,6 +1330,20 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
                 break;
             }
         }
+        // The conv scratch holds the silu'd convolution; the chunked path also
+        // normalizes the q and k segments in place, which `conv` already holds.
+        double conv_max = 0;
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < conv_dim; ++c) {
+                const size_t i = size_t(r * conv_dim + c);
+                const float want = chunked ? conv[i] : raw_conv[i];
+                conv_max = std::max(conv_max, double(std::fabs(got_conv[i] - want)));
+            }
+        }
+        if (conv_max > 1e-5) {
+            std::fprintf(stderr, "recurrent conv scratch mismatch: %.3g\n", conv_max);
+            ok = false;
+        }
         for (size_t i = 0; i < conv_state.size() && ok; ++i) {
             if (std::fabs(got_conv_state[i] - conv_state[i]) > 1e-5f) {
                 std::fprintf(stderr, "recurrent conv state mismatch\n");
@@ -1345,7 +1359,9 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
             }
         }
         // Second execution with the original state must be bitwise identical.
+        // The chunked path consumes alpha and beta in place, so restore them.
         if (upload_vec(csb, conv_state0) && upload_vec(rsb, rec_state0) &&
+            upload_vec(ab, alpha) && upload_vec(bb, beta) &&
             execute(plan, stream, event, 0)) {
             std::vector<float> again(size_t(rows * inner));
             std::vector<float> conv_again(size_t(rows * conv_dim));
@@ -1366,9 +1382,11 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
                 }
             }
         }
-        std::printf("recurrent chunk state=%d: %s (max abs %.3g)\n", state, ok ? "ok" : "FAILED", max_abs);
+        std::printf("recurrent chunk state=%d %s: %s (max abs %.3g)\n", state,
+                    chunked ? "chunked" : "per-token", ok ? "ok" : "FAILED", max_abs);
     }
     if (plan != nullptr) yuuka_plan_destroy(plan);
+    release(scb);
     release(ob);
     release(convb);
     release(rsb);
@@ -1509,8 +1527,9 @@ int main() {
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
-    ok = test_recurrent_chunk(device, stream, event, rng, 128) && ok;
-    ok = test_recurrent_chunk(device, stream, event, rng, 64) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 128, false) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 128, true) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 64, false) && ok;
 
     yuuka_event_destroy(event);
     yuuka_stream_destroy(stream);

@@ -322,6 +322,27 @@ so the prefill comparison is like for like. yuuka-server prefill throughput sits
 at ~530, 5% at ~2050); that span covers the chat template, the HTTP path, and
 server scheduling, so CLI and server numbers are not interchangeable.
 
+### Gated delta-net chunk
+
+Per recurrent layer of a 512-row chunk, one `RECURRENT_CHUNK` op in a plan,
+20 repetitions after 3 warmups, 24 layers reported as the total. The per-token
+path is the selected one; the chunkwise form is measured for
+[kernels.md](kernels.md#65-chunkwise-gated-delta-net-form) and
+[roadmap3.md](roadmap3.md#51-implementation-2026-11-18).
+
+| Path / kernel | Per layer | 24 layers |
+| --- | ---: | ---: |
+| Per-token `gdn_chunk_splitreg_f32_kernel`, whole op | 2.01 ms | 48.2 ms |
+| Chunkwise, whole op | 3.10 ms | 74.5 ms |
+| Chunkwise, `gdn_scan_f32_kernel` | 1.73 ms | 41.5 ms |
+| Chunkwise, `gdn_prep_f32_kernel` | 0.85 ms | 20.4 ms |
+| Chunkwise, convolution + gated RMSNorm + preparation | 0.36 ms | 8.5 ms |
+
+The convolution, gated RMSNorm, and preparation kernels are shared by both
+paths. The chunkwise scan moves 2x the arithmetic of the per-token kernel
+through the FP32 FMA pipe and is LDS-latency bound, so it does not pay for the
+extra work; see the attribution in roadmap3.
+
 ## llama.cpp comparison
 
 `llama-bench -ngl 99 -b 512 -ub 512 -r 3`, F16 KV (llama.cpp's default; its
@@ -373,6 +394,14 @@ Each of these is a measured decision that still holds in the current code:
   register prefetch of the next step's weights (192 VGPRs, 161-195 spills,
   6.4 TFLOP/s), a 64-value K step (16.4 TFLOP/s), and rebuilding the rocWMMA
   gfx11 operand duplication to remove its `ds_swizzle_b32` cost.
+- **The chunkwise gated delta-net form is implemented but not selected.** It
+  matches the per-token recurrence to `1.6e-7` and removes the per-token barrier
+  chain, but takes 3.10 ms per recurrent layer against 2.01 ms for the
+  per-token kernel, because its dense products run on the FP32 FMA pipe and the
+  scan is LDS-latency bound (0.4 instructions per cycle per CU). One state
+  column per thread (2.23 ms for the scan alone) and four columns per thread
+  (192 VGPRs, 909 spill slots) were measured and rejected. Moving the dense
+  products to the FP16 WMMA path is the recorded follow-up.
 - **The MMQ scale epilogue is not reducible to two FMA per element.** The
   activation scale differs per accumulator tile, so the 32 multiplies of a
   32-value block cannot be hoisted, and `v_fma_mix_f32` does not convert an

@@ -581,7 +581,7 @@ yuuka_status validate_recurrent_chunk_plan_op(const yuuka_op & op) {
                         "recurrent chunk buffer %d is null", i);
         }
     }
-    uint64_t need[12] = {};
+    uint64_t need[13] = {};
     uint64_t elems = 0;
     if (__builtin_mul_overflow(conv_dim, kernel - 1, &elems)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
@@ -613,7 +613,19 @@ yuuka_status validate_recurrent_chunk_plan_op(const yuuka_op & op) {
     need[7] = heads;
     need[8] = heads;
     need[9] = state;
-    for (int i = 0; i < 12; ++i) {
+    // The chunkwise path needs two 32x32 matrices per 32-token chunk of every
+    // head; without the scratch buffer the op takes the per-token fallback.
+    int buffers = 12;
+    need[12] = 0;
+    if (op.buf[12] != nullptr) {
+        if (__builtin_mul_overflow((rows + 31) / 32, 2 * 32 * 32 * heads, &elems)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "recurrent chunk dimensions overflow");
+        }
+        need[12] = elems;
+        buffers = 13;
+    }
+    for (int i = 0; i < buffers; ++i) {
         uint64_t bytes = 0;
         if (__builtin_mul_overflow(need[i], uint64_t(sizeof(float)), &bytes) ||
             !buffer_range_ok(op.buf[i], op.off[i], bytes)) {
@@ -1433,8 +1445,13 @@ yuuka_status guard(Fn && fn) {
     }
 }
 
+// op_ptr resolves a slot of the op to a device pointer. Optional slots that the
+// op leaves null resolve to null so a launcher can select a fallback path.
 template <typename T>
 T * op_ptr(yuuka_op const & op, int index) {
+    if (op.buf[index] == nullptr) {
+        return nullptr;
+    }
     return reinterpret_cast<T *>(static_cast<uint8_t *>(op.buf[index]->ptr) + op.off[index]);
 }
 
@@ -1648,10 +1665,11 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             yuuka::launch_recurrent_chunk_f32(
                 op_ptr<float>(op, 0), op_ptr<float>(op, 1),
                 op_ptr<const float>(op, 2), op_ptr<const float>(op, 3),
-                op_ptr<const float>(op, 4), op_ptr<const float>(op, 5),
+                op_ptr<float>(op, 4), op_ptr<float>(op, 5),
                 op_ptr<const float>(op, 6), op_ptr<const float>(op, 7),
                 op_ptr<const float>(op, 8), op_ptr<const float>(op, 9),
                 op_ptr<float>(op, 11), op_ptr<float>(op, 10),
+                op_ptr<float>(op, 12),
                 int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
                 int(op.n[4]), int(op.n[5]), int(op.u[0]), op.f[0], op.f[1],
                 stream);

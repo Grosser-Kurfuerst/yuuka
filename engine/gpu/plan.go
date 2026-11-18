@@ -595,15 +595,21 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		Norm:        norm.buf,
 		Conv:        p.conv,
 		Out:         p.gdnNorm,
-		Rows:        rows,
-		Groups:      int64(cfg.SSMGroupCount),
-		Heads:       rank,
-		StateSize:   stateSize,
-		ConvDim:     convDim,
-		Inner:       inner,
-		Kernel:      int64(cfg.SSMConvKernel),
-		Eps:         cfg.RMSNormEps,
-		QScale:      qScale,
+		// The chunkwise gated delta-net kernel is implemented and validated
+		// against this path (see kernels/hip/prefill/gdn_chunk.hip), but it is
+		// slower on gfx1151: its dense products run on the FMA pipe with the
+		// state in registers and are LDS-latency bound, so the per-token kernel
+		// stays selected. Supplying Scratch here selects the chunked path.
+		Scratch:   nil,
+		Rows:      rows,
+		Groups:    int64(cfg.SSMGroupCount),
+		Heads:     rank,
+		StateSize: stateSize,
+		ConvDim:   convDim,
+		Inner:     inner,
+		Kernel:    int64(cfg.SSMConvKernel),
+		Eps:       cfg.RMSNormEps,
+		QScale:    qScale,
 	}); err != nil {
 		return err
 	}

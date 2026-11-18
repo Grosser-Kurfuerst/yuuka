@@ -1421,15 +1421,18 @@ type RecurrentChunkArgs struct {
 	Conv        *Buffer
 	Out         *Buffer
 	OutOff      uint64
-	Rows        int64
-	Groups      int64
-	Heads       int64
-	StateSize   int64
-	ConvDim     int64
-	Inner       int64
-	Kernel      int64
-	Eps         float32
-	QScale      float32
+	// Scratch holds two chunk x chunk matrices per 32-token chunk and head for
+	// the chunked path. It may be nil, which selects the per-token kernel.
+	Scratch   *Buffer
+	Rows      int64
+	Groups    int64
+	Heads     int64
+	StateSize int64
+	ConvDim   int64
+	Inner     int64
+	Kernel    int64
+	Eps       float32
+	QScale    float32
 }
 
 // AddRecurrentChunkAt appends the fused convolution, gated delta-net state
@@ -1449,6 +1452,14 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 	if err := p.check(a.ConvState, a.State, a.QKV, a.Z, a.Alpha, a.Beta, a.ConvWeights, a.DT, a.A, a.Norm, a.Conv, a.Out); err != nil {
 		return err
 	}
+	if a.Scratch != nil {
+		// Two chunk x chunk matrices per 32-token chunk of every head.
+		chunks := (a.Rows + 31) / 32
+		if got := int64(a.Scratch.Bytes() / 4); got < chunks*2*32*32*a.Heads {
+			return fmt.Errorf("hip: recurrent chunk scratch holds %d elements, want %d",
+				got, chunks*2*32*32*a.Heads)
+		}
+	}
 	op := C.yuuka_op{code: C.YUUKA_OP_RECURRENT_CHUNK}
 	op.buf[0] = a.ConvState.ptr
 	op.buf[1] = a.State.ptr
@@ -1465,6 +1476,9 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 	op.off[2] = C.uint64_t(a.QKVOff)
 	op.off[3] = C.uint64_t(a.ZOff)
 	op.off[10] = C.uint64_t(a.OutOff)
+	if a.Scratch != nil {
+		op.buf[12] = a.Scratch.ptr
+	}
 	op.n[0] = C.uint64_t(a.Rows)
 	op.n[1] = C.uint64_t(a.Groups)
 	op.n[2] = C.uint64_t(a.Heads)

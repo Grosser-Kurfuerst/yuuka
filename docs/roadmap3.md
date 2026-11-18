@@ -40,12 +40,12 @@ document in the same change.
 | --- | --- | --- |
 | S0: counter and attribution tooling in `scripts/` | Implemented (2026-11-18), see 3.1 | Reproducible counters for both engines |
 | S1: MMQ GEMM layout, epilogue, and K-stage pipelining | Implemented (2026-11-18); gate missed, see 4.6 | Isolated Q4_K `2560 -> 9216` at `M=512` at 19 TF/s or more |
-| S2: gated delta-net chunked form | Not started | 512-row chunk at 15 ms or less for 24 layers |
+| S2: gated delta-net chunked form | Implemented (2026-11-18); gate missed, see 5.1 | 512-row chunk at 15 ms or less for 24 layers |
 | S3: MMA prefill attention | Not started | 512-token chunk at 6 ms or less; position 7680 at 150 ms or less |
 | S4: prefill LM head via batched GEMM | Not started | 4 ms or less per chunk |
 
-S0 and S1 are implemented; S1 misses its 19 TF/s gate (4.6) and S2-S4 are not
-started. The tables in section 2 are the decision summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
+S0-S2 are implemented; S1 misses its 19 TF/s gate (4.6), S2 its 15 ms gate
+(5.1), and S3-S4 are not started. The tables in section 2 are the decision summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
 measured throughput, and this document records the attribution that motivates
 the order.
 
@@ -486,6 +486,58 @@ greedy tokens as the split-register kernel over a 1024-token prompt, and no
 Risk: the chunked form changes the summation order of the state update. Gate it
 on logits, not on bitwise identity, and state the measured maximum difference
 in the commit body.
+
+### 5.1 Implementation (2026-11-18)
+
+The chunkwise form is implemented as `kernels/hip/prefill/gdn_chunk.hip` with the
+prep, dense-product, solve, and scan split from section 5, plus a CPU reference
+(`model/qwen35/recurrent.go`, `gdnChunkedScan`) and tests
+(`model/qwen35/recurrent_test.go`, `TestGDNChunkedMatchesPerToken`). The
+split-register kernel stays in place as the oracle and as the fallback.
+
+Correctness is met: the chunked form agrees with the per-token recurrence to
+`5e-7` relative on random inputs at 1, 5, 32, 33, 64, 100, and 160 rows, the C
+test matches the same CPU reference to `1.6e-7` against `2.1e-7` for the
+split-register kernel, a repeated execution is bitwise identical, and the
+real-model tests are unchanged (`TestGPUMatchesCPU` first-step logit difference
+`0.00309944`, `TestGPUChunkedPrefillLongContext` top-1 `33075` with zero
+difference). There is no `__syncthreads` loop that scales with chunk length: the
+per-chunk cost is a fixed sequence of barriers inside a 32-row step.
+
+The gate is missed by 5x. Measured with one op in a plan over 24 layers at 512
+rows:
+
+| Path | Per layer | 24 layers |
+| --- | ---: | ---: |
+| `gdn_chunk_splitreg_f32_kernel` (per-token, selected) | 2.01 ms | 48.2 ms |
+| chunked form: scan | 1.73 ms | 41.5 ms |
+| chunked form: prep | 0.85 ms | 20.4 ms |
+| chunked form: convolution, gated RMSNorm, preparation | 0.36 ms | 8.5 ms |
+| chunked form, total | 3.10 ms | 74.5 ms |
+
+The chunked scan is only 1.16x faster than the per-token kernel at 2x the
+arithmetic, so its efficiency is 2.6x worse per multiply-add. The attribution is
+instruction issue, not FLOPs: the scan issues 54M VALU and 23M LDS instructions
+per layer, 2.7M instructions per CU, and reaches 0.4 instructions per cycle per
+CU against a 4-wide issue limit. It is LDS-latency bound at 47-67 cycles with
+three 8-wave workgroups resident per CU (106-164 VGPRs, 50.7 KiB LDS), and the
+FP32 FMA pipe carries every product. The prep kernel adds 0.85 ms per layer for
+the triangular systems, which the reference folds into its batched dense
+products.
+
+The step that would make this form competitive is the one the reference takes:
+run the three dense products per (head, chunk) on the FP16 WMMA path
+(llama.cpp's `mmb_dense`) instead of the FMA pipe, with the state kept in FP32
+and cast per chunk. That is a new kernel family, not a tuning change, so it is
+recorded here rather than attempted inside S2. Two cheaper variants were
+measured and rejected while tuning the current form: assigning one state column
+per thread (4 bytes of LDS per multiply-add, 2.23 ms per layer for the scan
+alone) and four columns per thread (register-limited: 192 VGPRs with 909 spill
+slots).
+
+Because the chunked path is slower, the prefill graph keeps selecting
+`gdn_chunk_splitreg_f32_kernel`: the op takes the chunked path only when the
+caller supplies the triangular scratch buffer, which the graph leaves null.
 
 ## 6. Stage S3: MMA prefill attention
 
