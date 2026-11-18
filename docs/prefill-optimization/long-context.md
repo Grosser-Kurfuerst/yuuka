@@ -15,32 +15,61 @@ because it changes the number of query rows.
    loop. At this width its dynamic LDS footprint is 50 KiB. Increasing the
    key tile to 32 in the same layout would require 68 KiB, above the dispatch
    limit. Keep the tile size for the first experiment.
-2. **Implement partial attention.** Add a split coordinate to the grid.
-   Try two disjoint key ranges, then four. Align interior boundaries to
-   16 keys. Fetch each tile through the existing page table and apply the
-   causal mask using each query's absolute position. For each split,
-   query and head, write a local maximum `m`, exponential sum `l` and
-   unnormalized value vector `v` in FP32. Keep the current base-2 score
-   convention. A wholly masked range contributes zero mass and a zero
-   vector. Handle it before evaluating any difference of infinities.
-3. **Merge on the same stream.** For each query/head with participating
-   splits, compute `M = max(m_i)` over nonempty splits and
-   `a_i = exp2(m_i - M)`. The output is
-   `sum(a_i * v_i) / sum(a_i * l_i)`. Apply the Qwen sigmoid gate once
-   after normalization. Preserve head sharing, row strides and page order.
-   Time the partial and merge kernels together.
+2. **Split the existing WMMA key loop.** Extend the launch grid from
+   `(kv_heads, ceil(rows/16))` to `(kv_heads, ceil(rows/16), S)`, first
+   testing `S=2`, then 4. Within each query tile compute
+   `T = ceil((position + min(16*(blockIdx.y+1), rows))/16)` visible
+   key tiles. Split `s = blockIdx.z` visits tile indices in
+   `[floor(s*T/S), floor((s+1)*T/S))`. For tile index `i`, stage paged
+   K/V starting at `16*i` with the original tail bound. Score each key
+   only up to that query row's absolute position. All threads participate
+   in block barriers even for a row whose keys are entirely masked.
+   [Key loop and online softmax](../../kernels/hip/prefill/attention_wmma.hip#L164) · [Current grid](../../kernels/hip/prefill/attention_wmma.hip#L325)
+
+   Use the existing scaled base-2 scores, FP16 probability tile and FP32
+   accumulators. In a tile with no valid key for a row, write zero
+   probabilities, rescale the previous accumulator by one and preserve
+   its maximum and sum. This avoids `exp2(-inf - -inf)`. At the end,
+   write the partial record indexed by `((s*rows+r)*heads+h)*(head_dim+2)`
+   in floats. Its fields at offsets 0, 1 and 2 onward are maximum, sum,
+   and the **unnormalized** value vector. One lane per real row writes the
+   scalar pair using the score-lane row mapping. Store vector components
+   using the existing accumulator-to-output mapping. An empty split
+   writes `(-inf, 0, zeros)`. Skip padded query rows. A split grid of one
+   can be forced in the test to check record layout against the unsplit output.
+3. **Merge on the same stream.** Launch one workgroup per `(r,h)`.
+   Have one lane compute `M = max(m_i)` over records with `l_i > 0`,
+   the participating `a_i = exp2(m_i - M)` and denominator
+   `L = sum(a_i*l_i)`. Broadcast these through shared memory with one
+   barrier. Threads cover dimensions in strides of the block size and
+   write `sum(a_i*v_i[d])/L` over the same participating splits, in
+   ascending split order. Every real query can attend to its own token.
+   Apply the Qwen sigmoid gate once from the original Q/gate row after
+   normalization. Time both kernels including their intermediate traffic.
 4. **Bind scratch and select at runtime.** The logical scratch requirement
    is `splits * rows * query_heads * (head_dim + 2) * sizeof(float)`,
    before alignment. At 512 rows, 16 query heads and four splits this is
    32.25 MiB. Size it for the actual configured chunk and supported split
-   count. Allocate once during [prefill configuration](../../engine/gpu/model.go#L349),
-   reuse across sequential layers and validate capacity in the
-   [paged plan op](../../backend/hip/bridge/yuuka_hip.h). Bind it from
-   [addPrefillFullAttention](../../engine/gpu/plan.go#L462). Pass the dynamic
-   execution position to the [native launcher](../../kernels/hip/prefill/prefill.hip#L791)
-   to choose the measured crossover. A plan cached by row count can run at
-   multiple prefix lengths. Freezing the decision at plan creation would
-   apply the first chunk's route to later chunks.
+   count. Add a `prefillActivations` buffer to the existing allocation
+   list for the experimental F16, four-heads-per-KV, head-width-256
+   route. Bind the optional buffer at `ATTENTION_PREFILL_PAGED.buf[6]`
+   in the Go plan builder. Slot 5 holds BLAS scratch, `u[3]` selects
+   the dense/gated layout and `n[5]` is reserved by the proposed cropped
+   query for its position displacement. With slot 6 present, validate
+   its aligned byte range for four splits using checked products at plan
+   creation. Reuse it across layers on the model stream and release it
+   with the other prefill allocations. Cover an exact-fit span and a span
+   one byte short. [Allocation](../../engine/gpu/model.go#L349) · [Plan binding](../../engine/gpu/plan.go#L546) · [Go paged descriptor](../../backend/hip/hip.go#L1458) · [Native validation](../../backend/hip/bridge/bridge.cpp#L956)
+
+   Inside `launch_attention_prefill_paged_f32`, after the WMMA geometry
+   check, choose the split count using the **execution-time** query position
+   and row count. Sweep forced counts 1/2/4 at the positions below before
+   setting any crossover. For each measured row/prefix class, select the
+   lowest median total time (direct kernel or partial plus merge). Use the
+   direct kernel on ties within observed run-to-run spread and for unmeasured
+   shapes, including the compact one-query tail. Feed the winning table
+   back into this launcher. The same cached 512-row plan executes at
+   positions 0 and 7680. [Native dispatch](../../kernels/hip/prefill/prefill.hip#L791)
 
 ## Verify the attention change
 
@@ -49,7 +78,12 @@ identical paged KV. Cover a partial last page, noncontiguous physical pages,
 query rows on both sides of a split boundary, and an entirely masked split
 for an early query. Check the existing native attention tolerances, gated
 output, deterministic reruns, real-model logits and greedy continuation.
-Extend the [paged tests](../../tests/hip/paged_test.cpp) and the
+Extend [test_attention_prefill_mma](../../tests/hip/prefill_test.cpp#L1299)
+with an F16 pool. Round K/V once before feeding the same values to both
+the reference and the candidate. With 17 new queries at position zero,
+run four forced splits to exercise empty intervals and the one-row tail.
+At a nonzero start, test a row whose final tile is partially masked.
+Also run the [paged tests](../../tests/hip/paged_test.cpp) and the
 [model attention comparison](../../engine/gpu/attention_compare_test.go).
 
 Measure at positions 0, 2048 and 7680 with 512 new tokens. Use the full
