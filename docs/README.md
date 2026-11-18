@@ -90,6 +90,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
 | [roadmap2.md](roadmap2.md) | Ordered prefill optimization plan: measured attribution, workstreams, gates, and references | Kernel and performance contributors |
 | [roadmap3.md](roadmap3.md) | Prefill gap closure plan against the llama.cpp reference: 2026-11-18 attribution, stages S0-S4, gates, and rejected routes | Kernel and performance contributors |
+| [roadmap4.md](roadmap4.md) | Decode gap closure plan against the llama.cpp reference: 2026-11-18 attribution, stages D0-D5, gates, and rejected routes | Kernel and performance contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
@@ -202,7 +203,8 @@ Other architectures are rejected at load time.
 - **Hardware bring-up:** [hardware](hardware.md) → [roadmap Phase 0](roadmap.md#3-phase-0--bootstrap-and-hardware-validation).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
   [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode) →
-  [prefill optimization plan](roadmap2.md).
+  [prefill optimization plan](roadmap2.md) →
+  [decode optimization plan](roadmap4.md).
 - **Runtime/service work:** [architecture](architecture.md) →
   [serving](serving.md) → [roadmap Phase 4](roadmap.md#7-phase-4--multi-request-serving).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →
