@@ -23,7 +23,7 @@ clock, power, and thermal state are not pinned.
 | Kernel | 7.0.14-28-pve |
 | Power performance level | `auto` (amdgpu sysfs) |
 | Go | go1.24.4, Release `cmake --build build` |
-| Commit | `4542db8` |
+| Commit | `161fbba` |
 | Tokenizer / chat template | GGUF-embedded Qwen3.5 vocabulary and template |
 | Sampling | Greedy, temperature 0 |
 | Prefill chunk | 512 tokens (`--chunk-size 512`), except where a row states otherwise |
