@@ -396,6 +396,27 @@ Findings:
   cell and within 0.3% on the profiled decode step, so the table is stable
   enough to judge a kernel change against.
 
+The hot-matrix sweep and the real decode step do not measure the same thing,
+because a single resident matrix can stay in the 32 MB MALL cache while a token
+rotates through 2.7 GB of weights. Per-layer comparison, same run, sweep value
+against the in-step value of the profiled cell:
+
+| matrix | size | sweep GB/s | step GB/s | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| `attn_gate` Q4_K 2560 -> 4096 | 5.9 MB | 34 | 26.3 | 1.29 |
+| `ssm_out` Q5_K 4096 -> 2560 | 7.2 MB | 39 | 28.6 | 1.36 |
+| `attn_q` Q4_K 2560 -> 8192 | 11.8 MB | 37 | 26.1 | 1.42 |
+| `ffn_gate` Q4_K 2560 -> 9216 | 13.3 MB | 38 | 26.3 | 1.44 |
+| `ffn_down` Q4_K 9216 -> 2560 | 13.3 MB | 42 | 29.7 | 1.41 |
+| `attn_qkv` Q5_K 2560 -> 8192 | 14.4 MB | 41 | 27.1 | 1.51 |
+| `ffn_down` Q6_K 9216 -> 2560 | 19.4 MB | 76 | 47.9 | 1.59 |
+| `lm_head` Q6_K 2560 -> 248320 | 521.5 MB | 46 | 46.4 | 0.99 |
+
+Every matrix below the cache size reads 1.3-1.6x faster in the sweep, and the
+one matrix far above it agrees within 1%. Use the sweep for the kernel's own
+ceiling and the step column for what a token costs; roadmap4 section 3.4 records
+the criterion this replaces.
+
 ### Grouped MoE pipeline
 
 Synthetic single-layer shape: 128 experts, top-8, hidden 2048, expert FFN 768,

@@ -315,8 +315,13 @@ The current tooling cannot support the later stages:
 
 - One command reproduces the per-tensor table of 2.3 and the GB/s column of 2.4
   within run-to-run noise on two consecutive runs.
-- The sweep binary reports the same GB/s as an equivalent `yuuka bench` step
-  within 5% for the same matrix size.
+- The sweep binary and the profiled step agree on a matrix that exceeds the
+  device cache, and the difference on the smaller matrices is measured and
+  attributed rather than left open: at the 521 MB `lm_head` matrix they agree
+  within 1%, and the 6-20 MB per-layer matrices read 1.3-1.6x faster in the
+  sweep because they fit the 32 MB MALL cache that the real step rotates
+  through. The comparison is recorded in
+  [benchmarks.md](benchmarks.md#decode-matvec).
 - No change to measured behavior: `go test ./...`, `go test -tags hip ./...`,
   and `ctest --test-dir build` stay green.
 
@@ -342,7 +347,7 @@ Added:
 - `docs/testing.md` 6.3 records how the decode attribution is produced;
   [benchmarks.md](benchmarks.md#decode-matvec) holds the measurements.
 
-Two decisions differ from 3.2 as written:
+Three decisions differ from 3.2 as written:
 
 1. **Roles are recorded per op code, not per `Add*` call site.** A buffer role is
    a property of the ABI opcode: every launcher in `bridge.cpp` reads buf[0..2]
@@ -357,6 +362,15 @@ Two decisions differ from 3.2 as written:
    the same value, so the caller resolves names with a map of its own; the test
    builds that map from the model weights, the activation structs, the KV pool,
    and the session state.
+3. **The sweep-to-step agreement is stated per matrix size, not as a flat 5%.**
+   The acceptance criterion as first written assumed a hot matrix and a real
+   step measure the same thing. They do not for a matrix that fits the cache:
+   the sweep re-reads one matrix while it is resident, and a decode step rotates
+   through 2.7 GB of weights per token. Measured, the 521 MB `lm_head` matrix
+   agrees within 1% (46.5 against 46.4 GB/s) and the 6-20 MB per-layer matrices
+   read 1.3-1.6x faster in the sweep. The criterion above therefore compares the
+   two on the cache-exceeding matrix and records the ratio for the rest, and 2.4
+   already stated the upper-bound caveat that the original wording contradicted.
 
 Measured reproduction (two consecutive runs of `scripts/decode_profile.sh` on
 the reference device):
