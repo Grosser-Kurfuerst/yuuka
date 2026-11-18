@@ -95,3 +95,23 @@ func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 	}
 	return PrefillWMMA
 }
+
+// PrefillAttentionMMA reports whether the FP16 MMA paged prefill attention
+// kernel is selected for a shape. It mirrors the C++ rule in
+// kernels/hip/prefill/attention_wmma.hip: the kernel serves the four query
+// heads that share a KV head, needs an FP16-storable pool and a head width of
+// 64, 128, or 256, and only wins once the chunk or the prefix is long enough to
+// fill the device. A shape it rejects keeps the tiled kernel, which is correct
+// for every format.
+func PrefillAttentionMMA(heads, kvHeads, headDim, rows, position int, dtype tensor.DType) bool {
+	if heads != 4*kvHeads || headDim <= 0 || rows <= 0 {
+		return false
+	}
+	if dtype != tensor.F32 && dtype != tensor.F16 {
+		return false
+	}
+	if headDim != 64 && headDim != 128 && headDim != 256 {
+		return false
+	}
+	return rows >= 64 || position+rows >= 256
+}

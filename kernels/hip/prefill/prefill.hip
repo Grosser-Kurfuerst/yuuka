@@ -576,241 +576,10 @@ __global__ void kv_write_paged_dynamic_kv_kernel(void * k_pool, void * v_pool,
     }
 }
 
-constexpr int kGQAHeads = 4;
-constexpr int kGQAQPerBlock = 16;
-constexpr int kGQAThreshold = 2048;
-
-// The GQA tile is sized at launch: the packed path stages K as FP16 and keeps V
-// in FP32, which fits a 32-key tile at head_dim 256, while the FP32 path needs
-// 73.7 KiB for the same tile and therefore keeps 16 keys. Head dims that cannot
-// use half2 dots fall back to the FP32 tile.
-constexpr int kGQAKeysWide = 32;
-constexpr int kGQAKeysNarrow = 16;
-constexpr size_t kGQASharedLimit = 65536;
-
-struct GQATile {
-    int keys;
-    size_t shared;
-};
-
-GQATile gqa_tile(bool packed, int vec) {
-    const size_t k_row = size_t(32) * size_t(vec + 1) * sizeof(float);
-    const size_t v_row = k_row;
-    const size_t packed_row =
-        size_t(32) * size_t(vec / 2 + 1) * sizeof(__half2) + v_row;
-    const size_t row = packed ? packed_row : 2 * k_row;
-    if (size_t(kGQAKeysWide) * row <= kGQASharedLimit) {
-        return {kGQAKeysWide, size_t(kGQAKeysWide) * row};
-    }
-    return {kGQAKeysNarrow, size_t(kGQAKeysNarrow) * row};
-}
-
-// attention_prefill_paged_gqa_f32_kernel covers the four query heads that share
-// one KV head in a single workgroup, so one staged K/V tile serves all four.
-// Each wave owns one head and four of the block's 16 query rows, strided by the
-// four rows a wave slot covers; the shared tile layout, the staging walk, and
-// the online-softmax update are the ones the one-head kernel uses. Only the
-// long-context chunk uses this kernel: below the threshold the staging cost is
-// small and the extra workgroup count of the one-head kernel wins.
-//
-// Packed stages K as FP16 and accumulates each score with v_dot2, which halves
-// the K loads and the score instructions; the accumulator and the online
-// softmax stay FP32. V stays FP32 as well, because converting a half2 V tile
-// costs more instructions than the shared-memory halves it saves.
-template <bool Dense, bool Packed>
-__global__ void attention_prefill_paged_gqa_f32_kernel(
-    float * out, const float * q, const void * k_pool, const void * v_pool,
-    const int32_t * block_table, int block_size, int heads, int head_dim,
-    int kv_dim, int rows, int position, float scale, uint32_t dtype,
-    int keys_per_block) {
-    const int tid = threadIdx.x;
-    const int wave = tid >> 5;
-    const int lane = tid & 31;
-    const int kvh = blockIdx.x;
-    const int head = kvh * kGQAHeads + (wave & (kGQAHeads - 1));
-    const int row_slot = wave / kGQAHeads;
-    const int q_base = blockIdx.y * kGQAQPerBlock;
-    const int vec = (head_dim + 31) / 32;
-    const int head_stride = Dense ? head_dim : 2 * head_dim;
-    const int row_stride = heads * head_stride;
-    const int last_row = min(q_base + kGQAQPerBlock, rows) - 1;
-    const int max_pos = position + last_row;
-    float qv[kGQAHeads][kMaxHeadVec];
-    __half2 qv2[kGQAHeads][kMaxHeadVec / 2];
-    float acc[kGQAHeads][kMaxHeadVec];
-    float m[kGQAHeads];
-    float l[kGQAHeads];
-    bool active[kGQAHeads];
-    #pragma unroll
-    for (int i = 0; i < kGQAHeads; ++i) {
-        const int q_row = q_base + row_slot + i * kGQAHeads;
-        active[i] = q_row < rows;
-        const float * q_ptr =
-            q + static_cast<int64_t>(active[i] ? q_row : last_row) * row_stride +
-            head * head_stride;
-        m[i] = -INFINITY;
-        l[i] = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < kMaxHeadVec; ++j) {
-            acc[i][j] = 0.0f;
-        }
-        if constexpr (Packed) {
-            #pragma unroll
-            for (int j = 0; j < kMaxHeadVec / 2; ++j) {
-                const int d = lane * vec + 2 * j;
-                const bool live = active[i] && 2 * j + 1 < vec && d + 1 < head_dim;
-                qv2[i][j] = live ? __halves2half2(__float2half(q_ptr[d]),
-                                                  __float2half(q_ptr[d + 1]))
-                                 : __halves2half2(__float2half(0.0f),
-                                                  __float2half(0.0f));
-            }
-        } else {
-            #pragma unroll
-            for (int j = 0; j < kMaxHeadVec; ++j) {
-                const int d = lane * vec + j;
-                qv[i][j] = (active[i] && j < vec && d < head_dim) ? q_ptr[d] : 0.0f;
-            }
-        }
-    }
-    const int lane_stride = vec + 1;
-    const int lane_stride_h2 = vec / 2 + 1;
-    const int key_stride = 32 * lane_stride;
-    const int key_stride_h2 = 32 * lane_stride_h2;
-    extern __shared__ float kv_shared[];
-    __half2 * k_h2 = reinterpret_cast<__half2 *>(kv_shared);
-    float * k_shared = kv_shared;
-    float * v_shared = kv_shared + keys_per_block * key_stride;
-    if constexpr (Packed) {
-        v_shared = reinterpret_cast<float *>(k_h2 + keys_per_block * key_stride_h2);
-    }
-    for (int k0 = 0; k0 <= max_pos; k0 += keys_per_block) {
-        const int valid = min(keys_per_block, max_pos + 1 - k0);
-        for (int idx = tid; idx < valid * head_dim; idx += blockDim.x) {
-            const int kk = idx / head_dim;
-            const int d = idx % head_dim;
-            const int64_t row = paged_kv_row(block_table, block_size, k0 + kk);
-            const float kval =
-                kv_load(k_pool, dtype, row, kvh * head_dim + d, kv_dim);
-            v_shared[kk * key_stride + (d / vec) * lane_stride + d % vec] =
-                kv_load(v_pool, dtype, row, kvh * head_dim + d, kv_dim);
-            if constexpr (Packed) {
-                __half * kh = reinterpret_cast<__half *>(k_h2);
-                kh[(kk * key_stride_h2 + (d / vec) * lane_stride_h2) * 2 +
-                   d % vec] = __float2half(kval);
-            } else {
-                k_shared[kk * key_stride + (d / vec) * lane_stride + d % vec] =
-                    kval;
-            }
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int i = 0; i < kGQAHeads; ++i) {
-            if (!active[i]) {
-                continue;
-            }
-            const int pos = position + q_base + row_slot + i * kGQAHeads;
-            const int stop = min(valid, pos - k0 + 1);
-            float m_i = m[i];
-            float l_i = l[i];
-            // One score: the staged K dot, the warp reduction, and the scale.
-            // Two scores are computed before either softmax update, so the two
-            // shuffle chains and their shared loads overlap.
-            auto score = [&](int kk) {
-                float dot = 0.0f;
-                if constexpr (Packed) {
-                    const __half2 * kp =
-                        k_h2 + kk * key_stride_h2 + lane * lane_stride_h2;
-                    #pragma unroll
-                    for (int j = 0; j < kMaxHeadVec / 2; ++j) {
-                        if (2 * j + 1 < vec) {
-                            dot = __builtin_amdgcn_fdot2(kp[j], qv2[i][j], dot,
-                                                         false);
-                        }
-                    }
-                } else {
-                    #pragma unroll
-                    for (int j = 0; j < kMaxHeadVec; ++j) {
-                        const int d = lane * vec + j;
-                        if (j < vec && d < head_dim) {
-                            dot += qv[i][j] * k_shared[kk * key_stride +
-                                                        lane * lane_stride + j];
-                        }
-                    }
-                }
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    dot += __shfl_xor(dot, offset);
-                }
-                return dot * scale;
-            };
-            // acc = acc * corr + p * V, one key.
-            auto fold = [&](int kk, float corr, float p) {
-                #pragma unroll
-                for (int j = 0; j < kMaxHeadVec; ++j) {
-                    const int d = lane * vec + j;
-                    if (j < vec && d < head_dim) {
-                        acc[i][j] = acc[i][j] * corr +
-                                    p * v_shared[kk * key_stride +
-                                                 lane * lane_stride + j];
-                    }
-                }
-            };
-            int kk = 0;
-            for (; kk + 1 < stop; kk += 2) {
-                const float s0 = score(kk);
-                const float s1 = score(kk + 1);
-                const float m0 = fmaxf(m_i, s0);
-                const float corr0 = expf(m_i - m0);
-                const float p0 = expf(s0 - m0);
-                l_i = l_i * corr0 + p0;
-                m_i = m0;
-                fold(kk, corr0, p0);
-                const float m1 = fmaxf(m_i, s1);
-                const float corr1 = expf(m_i - m1);
-                const float p1 = expf(s1 - m1);
-                l_i = l_i * corr1 + p1;
-                m_i = m1;
-                fold(kk + 1, corr1, p1);
-            }
-            if (kk < stop) {
-                const float s = score(kk);
-                const float m_new = fmaxf(m_i, s);
-                const float corr = expf(m_i - m_new);
-                const float p = expf(s - m_new);
-                l_i = l_i * corr + p;
-                m_i = m_new;
-                fold(kk, corr, p);
-            }
-            m[i] = m_i;
-            l[i] = l_i;
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int i = 0; i < kGQAHeads; ++i) {
-        if (!active[i]) {
-            continue;
-        }
-        const int q_row = q_base + row_slot + i * kGQAHeads;
-        const float inv = 1.0f / l[i];
-        const int64_t out_row =
-            static_cast<int64_t>(q_row) * heads * head_dim + head * head_dim;
-        const float * q_ptr = q + static_cast<int64_t>(q_row) * row_stride +
-                              head * head_stride;
-        #pragma unroll
-        for (int j = 0; j < kMaxHeadVec; ++j) {
-            const int d = lane * vec + j;
-            if (j < vec && d < head_dim) {
-                if constexpr (Dense) {
-                    out[out_row + d] = acc[i][j] * inv;
-                } else {
-                    const float gate = q_ptr[head_dim + d];
-                    out[out_row + d] = acc[i][j] * inv / (1.0f + expf(-gate));
-                }
-            }
-        }
-    }
-}
+// The FP16 MMA path in attention_wmma.hip replaces the earlier per-group tiled
+// kernel that covered four query heads per workgroup: it serves the same group,
+// runs both products on the WMMA pipe, and is measured faster at every chunk
+// length and position it accepts (kernels.md section 7.5).
 
 template <bool Dense>
 __global__ void attention_prefill_paged_f32_kernel(
@@ -1025,46 +794,19 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        hipStream_t stream) {
+                                        int force_tiled, hipStream_t stream) {
     if (rows <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
         block_size <= 0) {
         return;
     }
-    const int vec = (head_dim + 31) / 32;
-    if (heads / kv_heads == kGQAHeads && position + rows >= kGQAThreshold) {
-        // Half2 dots need every lane to cover a whole number of pairs, so the
-        // packed tile requires an even vector width that spans the head exactly.
-        const bool packed = head_dim == 32 * vec && vec >= 2 && vec % 2 == 0;
-        const GQATile tile = gqa_tile(packed, vec);
-        const dim3 gqa_grid(static_cast<unsigned>(kv_heads),
-                            static_cast<unsigned>((rows + kGQAQPerBlock - 1) / kGQAQPerBlock));
-        if (dense) {
-            if (packed) {
-                attention_prefill_paged_gqa_f32_kernel<true, true>
-                    <<<gqa_grid, kAttnThreads, tile.shared, stream>>>(
-                        out, q, k_pool, v_pool, block_table, block_size, heads,
-                        head_dim, kv_dim, rows, position, scale, dtype, tile.keys);
-            } else {
-                attention_prefill_paged_gqa_f32_kernel<true, false>
-                    <<<gqa_grid, kAttnThreads, tile.shared, stream>>>(
-                        out, q, k_pool, v_pool, block_table, block_size, heads,
-                        head_dim, kv_dim, rows, position, scale, dtype, tile.keys);
-            }
-        } else {
-            if (packed) {
-                attention_prefill_paged_gqa_f32_kernel<false, true>
-                    <<<gqa_grid, kAttnThreads, tile.shared, stream>>>(
-                        out, q, k_pool, v_pool, block_table, block_size, heads,
-                        head_dim, kv_dim, rows, position, scale, dtype, tile.keys);
-            } else {
-                attention_prefill_paged_gqa_f32_kernel<false, false>
-                    <<<gqa_grid, kAttnThreads, tile.shared, stream>>>(
-                        out, q, k_pool, v_pool, block_table, block_size, heads,
-                        head_dim, kv_dim, rows, position, scale, dtype, tile.keys);
-            }
-        }
+    if (!force_tiled && attention_wmma_preferred(rows, position) &&
+        attention_wmma_supported(heads, kv_heads, head_dim, block_size, dtype)) {
+        launch_attention_prefill_paged_wmma_f32(
+            out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
+            head_dim, kv_dim, rows, position, scale, dtype, dense, stream);
         return;
     }
+    const int vec = (head_dim + 31) / 32;
     const size_t shared =
         size_t(2 * kKeysPerBlock) * size_t(32 * (vec + 1)) * sizeof(float);
     const int blocks = (rows + kQPerBlock - 1) / kQPerBlock;

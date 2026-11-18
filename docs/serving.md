@@ -220,11 +220,11 @@ Requirements and current behavior:
   opt-in F16 and Q8_0 pools for the `qwen35` CPU and HIP backends and the
   `qwen35moe` CPU backend. The prefix-cache model key includes the format, and
   the F32 path remains the numerical baseline.
-- With F16 keys and values, HIP paged prefill attention switches to the
-  matrixized rocBLAS kernel once the prompt context reaches 2048 tokens. F32,
-  Q8_0, and shorter F16 contexts use the tiled kernel. The matrixized path is
-  skipped when its per-model scratch would exceed 4096 MiB, so a large KV pool
-  can still be opened. Decode attention is unchanged.
+- HIP paged prefill attention runs the FP16 MMA kernel for F32 and F16 pools
+  once the chunk has 64 rows or the context reaches 256 tokens; Q8_0 pools,
+  other head widths, and shorter chunks use the tiled kernel. Both read the
+  same paged KV layout, and decode attention is unchanged. The retired rocBLAS
+  path stays behind `LegacyBlasAttention` for A/B measurement only.
 - Configurable block size; the server and benchmark default to 16 tokens.
 - One allocator per model with a fixed block count derived from context and
   concurrency, or set explicitly with `--kv-blocks`.

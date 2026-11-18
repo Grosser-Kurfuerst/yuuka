@@ -505,7 +505,19 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		return err
 	}
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	if m.attentionBlasEnabled {
+	// The rocBLAS path only runs where the FP16 MMA kernel does not cover the
+	// shape, so F16 KV never selects the slower kernel by default.
+	useBlas := m.attentionBlasEnabled && !m.forceTiledAttention &&
+		!hip.PrefillAttentionMMA(cfg.HeadCount, cfg.KVHeadCount, int(headDim),
+			int(rows), s.position, m.kvType)
+	if m.forceTiledAttention {
+		if err := plan.AddAttentionPrefillPagedTiledFormatAt(p.q, 0, m.poolK[layerIndex],
+			m.poolV[layerIndex], p.attn, 0, s.tableBuf,
+			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
+			s.capacity, m.blockSize, scale, m.kvType); err != nil {
+			return err
+		}
+	} else if useBlas {
 		if err := plan.AddAttentionPrefillPagedBlasFormatAt(p.q, 0, m.poolK[layerIndex],
 			m.poolV[layerIndex], p.attn, 0, s.tableBuf, p.attentionBlas,
 			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),

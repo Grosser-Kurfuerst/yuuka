@@ -148,12 +148,12 @@ int expect_graph_rejected(context & ctx, yuuka_plan * plan, yuuka_buffer * dynam
     return 0;
 }
 
-// test_gqa_attention_group4 checks the group-of-four prefill attention kernel,
-// which the launcher selects at a position of 2048 or more when four query
-// heads share one KV head. The pool is filled through the paged write op with
-// an identity block table, so the reference attention sweep over the same host
-// arrays is a direct comparison. head_dim 4 uses one 32-bit value per lane and
-// head_dim 64 uses the packed FP16 K tile with half2 dots.
+// test_gqa_attention_group4 checks a prefill attention dispatch where four
+// query heads share one KV head. The launcher gives head_dim 4 to the tiled
+// per-head kernel and head_dim 64 at a long position to the FP16 MMA kernel.
+// The pool is filled through the paged write op with an identity block table,
+// so the reference attention sweep over the same host arrays is a direct
+// comparison.
 int test_gqa_attention_group4(context & ctx, int head_dim, int position, int rows,
                               int block_size, int capacity, bool blas = false) {
     const int heads = 4, kv_heads = 1, kv_dim = kv_heads * head_dim;

@@ -194,13 +194,32 @@ void launch_attention_prefill_f32(float * out, const float * q,
                                   int kv_heads, int heads, int head_dim, int kv_dim,
                                   int rows, int position, int capacity, float scale,
                                   hipStream_t stream);
+// attention_wmma_shared_bytes reports the dynamic shared memory the FP16 MMA
+// prefill attention kernel needs for a head width.
+size_t attention_wmma_shared_bytes(int head_dim);
+
+// attention_wmma_preferred reports whether the FP16 MMA prefill attention kernel
+// beats the tiled kernel at a chunk length and context position.
+bool attention_wmma_preferred(int rows, int position);
+
+// attention_wmma_supported reports whether the FP16 MMA prefill attention kernel
+// covers a shape and KV format.
+bool attention_wmma_supported(int heads, int kv_heads, int head_dim,
+                              int block_size, uint32_t dtype);
+
+void launch_attention_prefill_paged_wmma_f32(
+    float * out, const float * q, const void * k_pool, const void * v_pool,
+    const int32_t * block_table, int block_size, int kv_heads, int heads,
+    int head_dim, int kv_dim, int rows, int position, float scale,
+    uint32_t dtype, int dense, hipStream_t stream);
+
 void launch_attention_prefill_paged_f32(float * out, const float * q,
                                         const void * k_pool, const void * v_pool,
                                         const int32_t * block_table, int block_size,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        hipStream_t stream);
+                                        int force_tiled, hipStream_t stream);
 // Experimental GEMM-based attention with gathered FP16 KV, batched QK/PV
 // matrix multiplication, causal softmax, and gated final FP32 output.
 int launch_attention_prefill_paged_blas_f16(

@@ -73,10 +73,15 @@ type Options struct {
 	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
 	// Q8_0 are opt-in Phase 5 formats.
 	KVType tensor.DType
-	// DisableBlasAttention keeps the tiled paged prefill attention kernel when
-	// the KV pool is F16. F16 KV otherwise selects the matrixized rocBLAS path
-	// by default. This is an A/B and diagnostic control.
-	DisableBlasAttention bool
+	// LegacyBlasAttention selects the rocBLAS prefill attention path for F16 KV
+	// pools. It is off by default: the FP16 MMA kernel covers the shapes this
+	// path can stage and is measured faster at every chunk length it accepts
+	// (kernels.md section 7.5). The path stays available for A/B measurement.
+	LegacyBlasAttention bool
+	// ForceTiledAttention keeps the tiled paged prefill attention kernel where
+	// the FP16 MMA kernel would be selected. It exists so a differential test
+	// can compare the two kernels on identical plan inputs.
+	ForceTiledAttention bool
 }
 
 const (
@@ -112,6 +117,7 @@ type Model struct {
 
 	attentionBlasCapable bool
 	attentionBlasEnabled bool
+	forceTiledAttention  bool
 	prefillRows          int
 	prefillGen           int64
 	prefillAll           []*hip.Buffer
@@ -157,10 +163,11 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		_ = device.Close()
 		return nil, err
 	}
-	useBlasAttention := opts.KVType == tensor.F16 && !opts.DisableBlasAttention
+	useBlasAttention := opts.KVType == tensor.F16 && opts.LegacyBlasAttention
 	m := &Model{
 		attentionBlasCapable: useBlasAttention,
 		attentionBlasEnabled: useBlasAttention,
+		forceTiledAttention:  opts.ForceTiledAttention,
 		device:               device,
 		stream:               stream,
 		event:                event,

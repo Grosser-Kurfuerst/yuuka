@@ -1172,6 +1172,138 @@ bool test_attention_prefill(yuuka_device * device, yuuka_stream * stream,
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
+// test_attention_prefill_mma exercises the FP16 MMA paged prefill attention
+// kernel: four query heads per KV head, head width 256, and a 64-row chunk at
+// position 0, which is the smallest shape that selects it. The pool is FP32 and
+// the kernel stages FP16 operands, so the reference comparison uses a relative
+// tolerance; the plan also runs the tiled kernel on the same input, reports the
+// difference between the two device results, and re-runs the MMA plan to check
+// that the result is reproducible.
+bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
+                                yuuka_event * event, std::mt19937 & rng) {
+    const int heads = 16, kv_heads = 4, head_dim = 256;
+    const int kv_dim = kv_heads * head_dim;
+    const int block_size = 16, capacity = 128, position = 0, rows = 64;
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> q(size_t(rows) * heads * 2 * head_dim);
+    std::vector<float> kc(size_t(capacity) * kv_dim), vc(size_t(capacity) * kv_dim);
+    for (float & x : q) x = dist(rng);
+    for (float & x : kc) x = dist(rng);
+    for (float & x : vc) x = dist(rng);
+    const float scale = 1.0f / std::sqrt(float(head_dim));
+    // Permute the block order so a kernel that ignores the table disagrees.
+    const int blocks = capacity / block_size;
+    std::vector<int32_t> block_table(static_cast<size_t>(blocks), 0);
+    for (int i = 0; i < blocks; ++i) block_table[size_t(i)] = blocks - 1 - i;
+    std::vector<float> pk(kc.size()), pv(vc.size());
+    for (int r = 0; r < capacity; ++r) {
+        const int64_t dst = int64_t(block_table[size_t(r / block_size)]) * block_size + (r % block_size);
+        std::memcpy(&pk[size_t(dst) * kv_dim], &kc[size_t(r) * kv_dim], size_t(kv_dim) * 4);
+        std::memcpy(&pv[size_t(dst) * kv_dim], &vc[size_t(r) * kv_dim], size_t(kv_dim) * 4);
+    }
+    Buffer qb, kb, vb, ob, tb, ot;
+    bool ok = alloc(device, qb, q.size() * 4) && alloc(device, kb, pk.size() * 4) &&
+              alloc(device, vb, pv.size() * 4) &&
+              alloc(device, ob, size_t(rows) * heads * head_dim * 4) &&
+              alloc(device, ot, size_t(rows) * heads * head_dim * 4) &&
+              alloc(device, tb, block_table.size() * 4) && upload_vec(qb, q) &&
+              upload_vec(kb, pk) && upload_vec(vb, pv) && upload_vec(tb, block_table);
+    std::vector<float> got(size_t(rows) * heads * head_dim);
+    std::vector<float> got_tiled(size_t(rows) * heads * head_dim);
+    std::vector<float> again(size_t(rows) * heads * head_dim);
+    for (int pass = 0; pass < 2 && ok; ++pass) {
+        yuuka_plan * plan = nullptr;
+        ok = check(yuuka_plan_create(device, &plan), "plan create");
+        if (ok) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_ATTENTION_PREFILL_PAGED;
+            op.buf[0] = qb.buf;
+            op.buf[1] = kb.buf;
+            op.buf[2] = vb.buf;
+            op.buf[3] = ob.buf;
+            op.buf[4] = tb.buf;
+            op.n[0] = kv_heads;
+            op.n[1] = heads;
+            op.n[2] = head_dim;
+            op.n[3] = kv_dim;
+            op.n[4] = rows;
+            op.u[0] = block_size;
+            op.u[1] = capacity;
+            op.u[2] = YUUKA_DTYPE_F32;
+            op.f[0] = scale;
+            ok = check(yuuka_plan_add(plan, &op), "add attention prefill mma");
+            if (ok) {
+                op.buf[3] = ot.buf;
+                op.flags = YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED;
+                ok = check(yuuka_plan_add(plan, &op), "add attention prefill tiled");
+            }
+        }
+        if (ok) ok = execute(plan, stream, event, position);
+        if (ok) {
+            ok = download_vec(ob, pass == 0 ? got : again) && download_vec(ot, got_tiled);
+        }
+        if (plan != nullptr) yuuka_plan_destroy(plan);
+    }
+    if (ok) {
+        double max_abs = 0.0;
+        double max_tiled = 0.0;
+        for (int r = 0; r < rows && ok; ++r) {
+            const int pos = position + r;
+            for (int h = 0; h < heads && ok; ++h) {
+                const int kvh = h / (heads / kv_heads);
+                const float * qp = q.data() + size_t(r * heads + h) * 2 * head_dim;
+                std::vector<float> scores(size_t(pos + 1));
+                float max_s = -INFINITY;
+                for (int p = 0; p <= pos; ++p) {
+                    float dot = 0;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += qp[d] * kc[size_t(p * kv_dim + kvh * head_dim + d)];
+                    }
+                    scores[size_t(p)] = dot * scale;
+                    max_s = std::max(max_s, scores[size_t(p)]);
+                }
+                float total = 0;
+                for (float & x : scores) {
+                    x = std::exp(x - max_s);
+                    total += x;
+                }
+                for (int d = 0; d < head_dim; ++d) {
+                    float value = 0;
+                    for (int p = 0; p <= pos; ++p) {
+                        value += scores[size_t(p)] / total * vc[size_t(p * kv_dim + kvh * head_dim + d)];
+                    }
+                    const float gate = qp[head_dim + d];
+                    value *= 1.0f / (1.0f + std::exp(-gate));
+                    const size_t idx = size_t(r * heads + h) * head_dim + d;
+                    max_abs = std::max(max_abs, double(std::fabs(got[idx] - value)));
+                    max_tiled = std::max(max_tiled, double(std::fabs(got[idx] - got_tiled[idx])));
+                    if (std::fabs(got[idx] - value) > 5e-3f * (1.0f + std::fabs(value))) {
+                        std::fprintf(stderr, "attention mma mismatch [%d,%d,%d]: %.6f vs %.6f\n",
+                                     r, h, d, got[idx], value);
+                        ok = false;
+                        break;
+                    }
+                    if (got[idx] != again[idx]) {
+                        std::fprintf(stderr, "attention mma not reproducible [%d,%d,%d]\n", r, h, d);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        std::printf("mma attention prefill: %s (max abs vs f32 reference %.3g, "
+                    "vs tiled kernel %.3g)\n",
+                    ok ? "ok" : "FAILED", max_abs, max_tiled);
+    }
+    release(tb);
+    release(ot);
+    release(ob);
+    release(vb);
+    release(kb);
+    release(qb);
+    return ok;
+}
+
 bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
                           yuuka_event * event, std::mt19937 & rng, int state,
                           bool chunked) {
@@ -1527,6 +1659,7 @@ int main() {
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
+    ok = test_attention_prefill_mma(device, stream, event, rng) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, false) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, true) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 64, false) && ok;

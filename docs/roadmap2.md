@@ -599,8 +599,13 @@ instructions per `(query row, key)` with a five-step shuffle reduction and two
 
 ### 5.9 Status (2026-11-17): matrixized F16 prefill attention
 
-A rocBLAS matrixized paged prefill path is now the default for F16 KV at 2048
-or more positions. It gathers the causal K/V prefix through the block table,
+> Superseded on 2026-11-18 by the FP16 MMA prefill attention kernel, which is
+> 3-5x faster than this path and is now the default for F32 and F16 pools. The
+> rocBLAS path is reachable only through `LegacyBlasAttention`. See
+> [roadmap3.md](roadmap3.md#61-implementation-2026-11-18).
+
+A rocBLAS matrixized paged prefill path was made the default for F16 KV at 2048
+or more positions at the time. It gathers the causal K/V prefix through the block table,
 runs QK and PV as FP16 GEMMs with FP32 accumulation, and applies the gate
 during unpack. The 8192-token F16 prefill moves from 15.443 s to 8.235 s (530
 to 995 tok/s) under the same 512-token chunk, and the full-model difference

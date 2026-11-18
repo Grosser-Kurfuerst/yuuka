@@ -80,20 +80,18 @@ stated, median of five repetitions:
 
 | Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 0.094 s | 1362.4 | 0.094 s | 1358.3 | 0.095 s | 1352.6 |
-| 512 | 0.318 s | 1609.1 | 0.316 s | 1620.0 | 0.317 s | 1615.6 |
-| 1024 | 0.654 s | 1565.9 | 0.658 s | 1556.2 | 0.663 s | 1545.3 |
-| 2048 | 1.447 s | 1415.4 | 1.436 s | 1426.3 | 1.512 s | 1354.5 |
-| 4096 | 3.540 s | 1157.1 | 2.831 s | 1447.1 | 3.416 s | 1198.9 |
-| 8192 | 9.333 s | 877.7 | 6.374 s | 1285.2 | 9.099 s | 900.3 |
+| 128 | 0.093 s | 1380.1 | 0.095 s | 1344.4 | 0.096 s | 1326.9 |
+| 512 | 0.300 s | 1704.8 | 0.313 s | 1634.8 | 0.330 s | 1553.6 |
+| 2048 | 1.194 s | 1715.2 | 1.248 s | 1641.5 | 1.524 s | 1343.7 |
+| 8192 | 5.682 s | 1441.7 | 5.696 s | 1438.2 | 9.480 s | 864.1 |
 
-The F16 KV column rises above F32 from 4096 tokens because the matrixized
-rocBLAS prefill-attention path is selected for F16 KV once the attention
-context reaches 2048; the two are within noise at 2048 tokens and F16 is 1.25x
-faster at 4096 and 1.46x at 8192. F32 and Q8_0 KV keep the tiled kernel and are
-within noise of each other. At 512 tokens the chunk cost is dominated by the
-quantized GEMM ([isolated kernels](#isolated-kernels)); at long context the
-tiled attention kernel is the limiter.
+Measured 2026-11-18 after the FP16 MMA prefill attention kernel
+([kernels.md](kernels.md#75-fp16-mma-paged-prefill-attention)). F32 and F16 KV
+are now within 4% of each other at every length, because both run the same
+attention kernel; Q8_0 keeps the tiled kernel and diverges from 2048 tokens,
+where attention starts to dominate. Against the 2026-11-18 pre-S3 tree the
+same-length results are 1.06x at 512 tokens, 1.21x at 2048, and 1.64x at 8192
+for F32 KV.
 
 ## Decode: output length
 
@@ -149,9 +147,50 @@ At a 128-token prompt and 32 generated tokens, median of three repetitions:
 
 The differences are inside run-to-run noise: KV format is a memory-capacity
 feature at this context length, and the prefill effect appears only through the
-F16 matrixized-attention default at 2048 tokens or more. The real-model
+attention kernel the format selects (see [prefill attention](#prefill-attention)).
+The real-model
 correctness test produced the same greedy tokens for all three formats, with
 maximum logit difference from F32 of `1.12e-3` (F16) and `4.53e-2` (Q8_0).
+
+## Prefill attention
+
+Isolated paged prefill attention, one layer, F32 pool, Qwen3.5 geometry (16
+query heads, 4 KV heads, head width 256), median of 20 launches after a warmup.
+`tiled` is `attention_prefill_paged_f32_kernel`, `mma` is
+`attention_prefill_paged_wmma_kernel` from
+[kernels.md](kernels.md#75-fp16-mma-paged-prefill-attention). Op-level harness:
+one `ATTENTION_PREFILL_PAGED` op, no other work in the plan.
+
+| Rows | Position | Tiled | MMA | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 0 | 0.016 ms | 0.039 ms | 0.41x |
+| 32 | 0 | 0.027 ms | 0.041 ms | 0.66x |
+| 48 | 0 | 0.044 ms | 0.052 ms | 0.85x |
+| 64 | 0 | 0.075 ms | 0.057 ms | 1.32x |
+| 128 | 0 | 0.195 ms | 0.083 ms | 2.35x |
+| 512 | 0 | 2.468 ms | 0.507 ms | 4.87x |
+| 16 | 256 | 0.209 ms | 0.119 ms | 1.76x |
+| 32 | 1024 | 0.844 ms | 0.311 ms | 2.71x |
+| 16 | 2048 | 3.518 ms | 0.609 ms | 5.78x |
+| 32 | 7680 | 14.651 ms | 3.266 ms | 4.49x |
+| 512 | 2048 | 18.809 ms | 3.409 ms | 5.52x |
+| 512 | 7680 | 70.243 ms | 14.815 ms | 4.74x |
+
+The dispatch rule follows the table: the MMA kernel is selected from 64 rows or
+from a 256-token prefix. Over the eight full-attention layers of a 512-token
+chunk that is 4.1 ms of attention at position 0 and 117.6 ms at position 7680,
+against 19.7 ms and 562 ms for the tiled kernel (the roadmap gates are 6 ms and
+150 ms).
+
+Numerics, same harness: the MMA output differs from the FP32 reference by
+9.3e-5 maximum absolute value at head width 256 and differs from the tiled
+kernel by the same 9.3e-5, which is entirely the FP16 staging step. Model level,
+`TestGPUAttentionPathsAgree` records 0.015 maximum logit difference at a 64-token
+prompt (top-1 `33075` in both arms), against 0.011 for the F32-to-F16 KV storage
+change on the tiled kernel over the same prompt. At 2048 tokens the same
+comparison records 0.220 (MMA) and 0.220 (rocBLAS) against 0.235 for the
+KV-format change, because the int8 prefill route amplifies any ~1e-4 hidden-state
+change onto different Q8_1 grid points.
 
 ## Isolated kernels
 
@@ -258,7 +297,7 @@ appear in the compiler's static figure.
 | `gemv_batch_kernel<*>` | 26-34 | 37 | 1,024 B |
 | `attention_prefill_f32_kernel` | 49 | 48 | 0 (36,864 B dynamic) |
 | `attention_prefill_paged_f32_kernel<*>` | 51-53 | 61-63 | 0 |
-| `attention_prefill_paged_gqa_f32_kernel<*>` | 108-119 | 78-79 | 0 |
+| `attention_prefill_paged_wmma_kernel<*,256,*>` | 256 | 30-34 | 0 (50,176 B dynamic) |
 | `gdn_chunk_f32_kernel` / `gdn_chunk_splitreg_f32_kernel<128>` | 37 / 93 | 70 / 34 | 8 B / 1,064 B |
 | `gdn_norm_gate_rows_f32_kernel` | 17 | 18 | 0 |
 | `rmsnorm_batch_f32_kernel` / `rmsnorm_heads_batch_f32_kernel` | 9 / 9 | 18 / 20 | 1,024 B |
@@ -351,10 +390,10 @@ extra work; see the attribution in roadmap3.
 
 | Test | llama.cpp t/s | yuuka t/s | yuuka/llama |
 | --- | ---: | ---: | ---: |
-| pp128 | 1743.28 ± 233.98 | 1362.4 (F32 KV) | 0.78 |
-| pp512 | 2346.17 ± 80.87 | 1609.1 (F32 KV) | 0.69 |
-| pp2048 | 2409.70 ± 5.39 | 1415.4 (F32 KV) / 1426.3 (F16 KV) | 0.59 / 0.59 |
-| pp8192 | 2170.79 ± 4.19 | 877.7 (F32 KV) / 1285.2 (F16 KV) | 0.40 / 0.59 |
+| pp128 | 1743.28 ± 233.98 | 1344.4 (F16 KV) | 0.77 |
+| pp512 | 2346.17 ± 80.87 | 1634.8 (F16 KV) | 0.70 |
+| pp2048 | 2409.70 ± 5.39 | 1641.5 (F16 KV) | 0.68 |
+| pp8192 | 2170.79 ± 4.19 | 1438.2 (F16 KV) | 0.66 |
 | tg128 (prompt 128) | 62.29 ± 0.19 | 9.61 (F32 KV) | 0.15 |
 
 The remaining gaps, in order of size:
@@ -367,9 +406,9 @@ The remaining gaps, in order of size:
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see
    [isolated kernels](#isolated-kernels)); the gated delta-net chunk adds
    further time yuuka does not measure separately here.
-3. Long-context prefill, 1.7-3.0x: the gap narrows with the F16 matrixized
-   attention default and stays widest with F32 KV, where the tiled attention
-   kernel is the limiter.
+3. Long-context prefill, 1.5x at 8192: the FP16 MMA attention kernel closed
+   most of this gap, so what remains is the quantized GEMM plus the delta-net
+   chunk, not attention. Q8_0 KV keeps the tiled kernel and stays at 0.40.
 4. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
    into one weight pass; yuuka re-reads the weights per request because fused
    mixed-shape decode batching is not implemented.
@@ -411,11 +450,16 @@ Each of these is a measured decision that still holds in the current code:
   The 64x64/K32 and 32x64 variants remain the dispatch choice for the paths they
   serve, and the wide K-quant shapes in this report come from the int8 MMQ route
   instead.
-- **Prefill attention** keeps the tiled kernel for F32 KV, for Q8_0 KV, and
-  below 2048 attention tokens; the matrixized rocBLAS path is the F16 default
-  from 2048 tokens. Restructuring the paged attention traversal by row phase
-  and splitting the GQA key traversal into four partitions were measured and
-  rejected.
+- **Prefill attention is settled on the FP16 MMA kernel** for F32 and F16 pools
+  from 64 rows or a 256-token prefix; the tiled kernel stays for Q8_0, for
+  shapes the MMA kernel does not cover, and below that crossover (measured
+  1.2-2.4x faster there). Staging K transposed per key tile instead of Q once
+  per workgroup, and keeping the accumulator at 192 registers instead of
+  `__launch_bounds__(128, 2)`, were measured and rejected: the first costs 128
+  scalar shared-memory loads per key tile, the second spilled 21 slots into the
+  key loop for 1.5x. The earlier group-of-four tiled kernel and the rocBLAS
+  path are no longer selected by default; rocBLAS stays reachable through
+  `LegacyBlasAttention` for A/B measurement.
 - **Disabled by default:** the FFN FP16 weight cache (removed with the
   dequantize route) and HIP Graph replay (no gain at the serving contexts
   measured). Speculative decoding is opt-in: exact and 4x faster on repetitive

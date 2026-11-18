@@ -1365,7 +1365,20 @@ func (p *Plan) AddAttentionPrefillPagedDenseFormatAt(q *Buffer, qOff uint64, kPo
 		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, true)
 }
 
+// AddAttentionPrefillPagedTiledFormatAt is AddAttentionPrefillPagedFormatAt
+// with the FP16 MMA kernel forced off, so a test can compare the two kernels on
+// the same plan input.
+func (p *Plan) AddAttentionPrefillPagedTiledFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {
+	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, false, true)
+}
+
 func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
+	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, dense, false)
+}
+
+func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense, tiled bool) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
 		kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity {
@@ -1398,6 +1411,9 @@ func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, ou
 	op.u[2] = C.uint32_t(dtype)
 	if dense {
 		op.u[3] = 1
+	}
+	if tiled {
+		op.flags |= C.YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED
 	}
 	op.f[0] = C.float(scale)
 	return p.add(op)

@@ -31,9 +31,9 @@ resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
 token and position from device memory, and a C ABI (version 4) for
 device-to-device block copies and HIP Graph capture/replay. KV pools support
-F32 (default), F16, and Q8_0; see section 7.3. Attention uses scalar per-lane
-kernels for F32/Q8_0 and for F16 contexts below 2048 tokens; F16 contexts at or
-above 2048 tokens use a matrixized rocBLAS path by default (section 7.5).
+F32 (default), F16, and Q8_0; see section 7.3. Prefill attention runs on the
+FP16 MMA kernel for F32 and F16 pools whose shape it covers, and on the scalar
+per-lane tiled kernel otherwise (section 7.5).
 Continuous batching is scheduler-level interleaving of per-request plans;
 mixed-shape prefill/decode kernel batches and split-KV decode are not
 implemented.
@@ -552,32 +552,6 @@ staged K row and each V read through the block table. `launch_kv_write_paged_f32
 and `launch_kv_write_paged_dynamic_f32` map written positions through the same
 table; the batch case is selected by the row count, not a separate kernel name.
 
-`attention_prefill_paged_gqa_f32_kernel` runs the four query heads that share one
-KV head in one workgroup, so a staged K/V tile serves all four instead of being
-reloaded by four workgroups. Each of the 16 waves owns one head and four of the
-block's 16 query rows; the tile layout, staging walk, and online-softmax update
-are the ones the one-head kernel uses, applied to the four rows independently
-with their own causal stops. It is selected only when `heads / kv_heads == 4`
-and `position + rows >= 2048`: below that the staging cost is small and the
-larger workgroup count of the one-head kernel wins, so a 512-token prompt at
-position 0 is unchanged. The kernel has two staged-tile variants:
-
-- **Packed K.** When `head_dim == 32 * vec` with an even `vec >= 2` (so every
-  lane covers whole FP16 pairs), K is staged as `__half2` and each score
-  accumulates with `v_dot2` in FP32. V stays FP32 because converting a half2 V
-  tile costs more instructions than the shared memory it saves. The packed tile
-  is also what makes a 32-key tile fit: at `head_dim` 256 it needs 55 KiB of the
-  64 KiB dynamic limit, while two FP32 tiles of 32 keys need 73.7 KiB.
-- **FP32 tile.** Everything else stages K and V as FP32.
-
-`gqa_tile()` picks 32 keys when the variant's tile fits the 64 KiB dynamic shared
-limit and 16 keys otherwise, so the barrier count per staged key halves wherever
-the budget allows. Two keys are scored before either softmax update, which
-overlaps the two shuffle chains. `tests/hip/paged_test.cpp` covers both variants
-(`head_dim` 4 FP32, `head_dim` 64 packed) against the same reference attention
-sweep at 2e-4. Measured effect and the rejected row-phase restructure are in
-[benchmarks.md](benchmarks.md#decisions-and-rejected-routes).
-
 ### 7.3 KV cache formats
 
 The paged KV family accepts an F32, F16, or Q8_0 pool selected by the plan. The
@@ -602,42 +576,90 @@ output gate in the second head-sized half. The plan carries a dense flag in
 retains that variant, but no supported model selects it. The `qwen35` path uses
 the gated layout exclusively.
 
-### 7.5 Matrixized paged prefill attention
+### 7.5 FP16 MMA paged prefill attention
 
-`attention_prefill_paged_blas_f16` is selected by default when the KV pool is
-F16 and `position + rows >= 2048`; F32, Q8_0, shorter F16 contexts, and models
-opened with `DisableBlasAttention` keep the tiled paged prefill kernels. Decode
-attention is unaffected.
+`attention_prefill_paged_wmma_kernel` in
+`kernels/hip/prefill/attention_wmma.hip` is the default prefill attention
+kernel. `launch_attention_prefill_paged_f32` selects it when all of the
+following hold, and falls back to the tiled per-head kernel otherwise:
 
-The kernel packs the query values to FP16, gathers the K/V prefix through the
-block table into reusable contiguous FP16 buffers, runs QK^T and PV as rocBLAS
-GEMMs with FP32 accumulation, applies the causal mask and softmax in a
-256-thread workgroup per `(query row, head)` with an FP32 reduction, writes
-probabilities as FP16, and applies the Qwen3.5 attention gate during unpack.
-The FP16 score and probability matrices trade accuracy for the ability to use
-rocBLAS; the recorded logit difference stays below the chunk gate.
+- the pool is F32 or F16, so an FP16 tile staging is either lossless or a
+  documented rounding step (Q8_0 stays on the tiled kernel);
+- `heads == 4 * kv_heads`, so one workgroup can serve the four query heads that
+  share a KV head;
+- `head_dim` is 64, 128, or 256, the widths the kernel is instantiated for;
+- `rows >= 64` or `position + rows >= 256`: below that the chunk offers too few
+  16-row query tiles to fill 40 CUs, and the tiled kernel measures faster.
 
-Q, K, V, scores, probabilities, and results share one scratch allocation sized
-`6*q + 4*kv + 6*score` elements, where `q = heads*rows*head_dim`,
-`kv = kv_heads*capacity*head_dim`, and `score = heads*rows*capacity`. The model
-keeps the tiled kernel when that allocation would exceed 4096 MiB, so large KV
-pools remain openable without an opt-in switch.
+Geometry. A workgroup is four waves, one per query head of the group, and owns a
+16-row query tile. Each wave keeps the whole `16 x head_dim` output block in
+accumulator registers (128 registers per lane at head width 256), so the value
+product never leaves the wave. K and V tiles of 16 keys are staged in shared
+memory once per workgroup and reused by all four heads.
 
-The native test at position 2048 validates against the float reference within
-2e-4. A full-model F16-KV differential test records maximum logit differences
-of 0.0132079 after a 2048-token prompt and 0.00757194 after an 8192-token
-prompt against the tiled path, with the same top-1 token and below the 0.05
-chunk gate. Performance and reproduction steps are in
-[benchmarks.md](benchmarks.md#prefill-prompt-length).
+Score orientation. The score product runs as `S^T = K Q^T` rather than
+`S = Q K^T`, so both operands are row major in shared memory: K keeps the
+key-row layout it is gathered in, and Q is stored transposed once per workgroup
+instead of once per key tile. A score lane then owns one query row and eight
+keys, so a row statistic is eight register operations and one cross-lane step
+instead of a four-step butterfly, and the running maximum and sum are scalars
+rather than per-row arrays. The transposed P the value product needs is written
+back to shared memory from the same lane mapping.
+
+Online softmax. The mask is applied inside the tile: a lane's element is `-inf`
+when its key is beyond the query row or beyond the tile's causal bound. The
+softmax runs in base-2 units, so an exponent is one `v_exp_f32` after a scaled
+multiply, and the accumulator is rescaled by the row factor before each product.
+The running statistics stay FP32, the accumulator is FP32, and only the staged
+Q/K/V tiles and the probability tile are FP16.
+
+Shared memory. At head width 256 the workgroup uses `(4*16 + 2*16)*256` halves
+for the transposed Q and the K/V tiles plus four 16x16 probability tiles, 50 KiB
+in total, which keeps two workgroups resident per CU. The kernel declares
+`__launch_bounds__(128, 2)` so the compiler can use the full register file for
+the accumulator block: at 192 registers it spilled 21 slots into the key loop,
+and removing that spill was most of the 1.5x the stage measured.
+
+Crossover and measurements. Isolated prefill attention, one layer, FP32 pool,
+median of 20 launches after a warmup (full table in
+[benchmarks.md](benchmarks.md#prefill-attention)):
+
+| Shape | Tiled | MMA |
+| --- | ---: | ---: |
+| 16 rows at position 0 | 0.016 ms | 0.039 ms |
+| 48 rows at position 0 | 0.044 ms | 0.052 ms |
+| 64 rows at position 0 | 0.075 ms | 0.057 ms |
+| 512 rows at position 0 | 2.468 ms | 0.507 ms |
+| 32 rows at position 7680 | 14.651 ms | 3.266 ms |
+| 512 rows at position 7680 | 70.243 ms | 14.815 ms |
+
+A 512-token chunk therefore spends 4.1 ms in attention at position 0 and
+117.6 ms at position 7680 over the eight full-attention layers, against 19.7 ms
+and 562 ms for the tiled kernel.
+
+Numerics. Staging rounds Q, K, and V to FP16, so an F32 pool gains the rounding
+step an F16 pool already has. The native test measures 9.3e-5 maximum absolute
+difference against the FP32 reference and against the tiled kernel on the same
+plan input at head width 256, and the output is bitwise reproducible on a second
+run. The full-model differential test records 0.015 maximum logit difference at
+a 64-token prompt with the top-1 token unchanged; that is the same magnitude as
+changing the KV storage format from F32 to F16 on the tiled kernel (0.011 on the
+same prompt), which is the accuracy regime the current route runs in.
+
+The earlier group-of-four tiled kernel (`attention_prefill_paged_gqa_f32_kernel`)
+is removed: the MMA kernel serves the same group at every shape the tiled kernel
+won on, so keeping it would have left a slower path behind a silent condition.
 
 Current limits:
 
 - Q8_0 KV is supported but not faster than F32 at short context; its benefit is
   cache memory.
-- The tiled kernels run one workgroup per head, or per group of four query
-  heads above 2048 positions; split-KV is not implemented. The tiled path is
-  6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic at long context,
-  which is the remaining long-context gap for F32/Q8_0 and short F16 contexts.
+- The tiled fallback runs one workgroup per head; split-KV is not implemented.
+  It is 6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic, which is why
+  Q8_0 pools and short chunks keep the long-context gap.
+- The MMA kernel splits the value dimension across the four waves of a
+  workgroup only through the accumulator layout, not across workgroups, so a
+  16-row query tile is the smallest unit of parallelism.
 - No mixed prefill/decode batch. Each step belongs to one request plan.
 - Block-table entries are immutable for a request; all blocks are allocated at
   admission, so replay and kernels never observe a changing table.

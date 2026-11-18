@@ -964,7 +964,7 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
             !buffer_range_ok(op.buf[5], 0, scratchBytes)) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "BLAS attention scratch too small");
         }
-    } else if ((op.flags & ~YUUKA_OP_FLAG_TAIL) != 0u) {
+    } else if ((op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED)) != 0u) {
         return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged attention flags");
     }
     return YUUKA_OK;
@@ -1898,7 +1898,9 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                     op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
                     int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
-                    int(position), op.f[0], op.u[2], int(op.u[3]), stream);
+                    int(position), op.f[0], op.u[2], int(op.u[3]),
+                    (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) != 0,
+                    stream);
             }
             break;
         }

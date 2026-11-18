@@ -58,13 +58,14 @@ func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Opt
 		chunk = capacity
 	}
 	m, err := Open(reader, model, Options{
-		Blocks:               blocks,
-		BlockSize:            blockSize,
-		PrefillChunk:         chunk,
-		EnableGraph:          false,
-		GraphMinSteps:        1,
-		KVType:               opts.KVType,
-		DisableBlasAttention: opts.DisableBlasAttention,
+		Blocks:              blocks,
+		BlockSize:           blockSize,
+		PrefillChunk:        chunk,
+		EnableGraph:         false,
+		GraphMinSteps:       1,
+		KVType:              opts.KVType,
+		LegacyBlasAttention: opts.LegacyBlasAttention,
+		ForceTiledAttention: opts.ForceTiledAttention,
 	})
 	if err != nil {
 		return nil, err

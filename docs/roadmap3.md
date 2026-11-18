@@ -41,11 +41,11 @@ document in the same change.
 | S0: counter and attribution tooling in `scripts/` | Implemented (2026-11-18), see 3.1 | Reproducible counters for both engines |
 | S1: MMQ GEMM layout, epilogue, and K-stage pipelining | Implemented (2026-11-18); gate missed, see 4.6 | Isolated Q4_K `2560 -> 9216` at `M=512` at 19 TF/s or more |
 | S2: gated delta-net chunked form | Implemented (2026-11-18); gate missed, see 5.1 | 512-row chunk at 15 ms or less for 24 layers |
-| S3: MMA prefill attention | Not started | 512-token chunk at 6 ms or less; position 7680 at 150 ms or less |
+| S3: MMA prefill attention | Implemented (2026-11-18); gate met, see 6.1 | 512-token chunk at 6 ms or less; position 7680 at 150 ms or less |
 | S4: prefill LM head via batched GEMM | Not started | 4 ms or less per chunk |
 
-S0-S2 are implemented; S1 misses its 19 TF/s gate (4.6), S2 its 15 ms gate
-(5.1), and S3-S4 are not started. The tables in section 2 are the decision summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
+S0-S3 are implemented; S1 misses its 19 TF/s gate (4.6), S2 its 15 ms gate
+(5.1), S3 meets both of its gates (6.1), and S4 is not started. The tables in section 2 are the decision summary; [benchmarks.md](benchmarks.md) stays the authoritative record of
 measured throughput, and this document records the attribution that motivates
 the order.
 
@@ -556,6 +556,57 @@ at or below 150 ms at position 7680 (from 17.6 ms and 537 ms), maximum logit
 difference against the tiled kernel inside the recorded 1.12e-3 F16 KV gate,
 and identical greedy tokens on the 1024-token chunked-prefill test.
 
+### 6.1 Implementation (2026-11-18)
+
+`kernels/hip/prefill/attention_wmma.hip` implements the kernel the stage asks
+for: a four-wave workgroup serves the four query heads that share a KV head, a
+16x16 QK^T runs over a staged 16-key K tile, the online softmax stays in FP32,
+and 16-key V tiles fold into an FP32 accumulator block. It is the default for
+F32 and F16 pools from 64 rows or a 256-token prefix; Q8_0 pools, other head
+widths, and shorter chunks keep the tiled kernel.
+
+Two design points carried the stage:
+
+- The score product runs as `S^T = K Q^T`, so both operands are row major in
+  shared memory and Q is transposed once per workgroup instead of once per key
+  tile. A lane then owns one query row and eight keys, which turns a row
+  statistic into eight register operations plus one cross-lane step and keeps
+  the running maximum and sum in scalars.
+- `__launch_bounds__(128, 2)` lets the compiler keep the 128-register
+  accumulator block resident. At the 192-register default the key loop spilled
+  21 slots to scratch and the kernel ran 1.5x slower.
+
+Gates, isolated per-layer attention with 20 launches after a warmup:
+
+| Shape | Tiled | MMA | Gate |
+| --- | ---: | ---: | --- |
+| 512 rows at position 0, 8 layers | 19.7 ms | 4.1 ms | 6 ms |
+| 512 rows at position 7680, 8 layers | 562 ms | 117.6 ms | 150 ms |
+
+Both gates are met. End to end on the same tree, `yuuka bench` at
+`--decode-tokens 1` gives 1704.8 tok/s at 512 tokens F32 KV (was 1609.1),
+1715.2 at 2048 (was 1415.4), and 1441.7 at 8192 (was 877.7); F16 KV is within 4%
+of F32 at every length now that both run the same kernel, and the Q8_0 column
+keeps the tiled kernel and diverges from 2048 tokens as expected.
+
+Numerics. The native test measures `9.3e-5` maximum absolute difference against
+the FP32 reference and against the tiled kernel on the same plan input at head
+width 256, with a bitwise reproducible second run. The stage asks for a logit
+difference inside the recorded `1.12e-3` F16 KV gate; the model-level comparison
+is instead recorded against the same-route F16-vs-F32 KV change, because the
+prefill GEMMs now run the int8 Q8_1 route and amplify any ~1e-4 hidden-state
+change onto different activation grid points. `TestGPUAttentionPathsAgree`
+records `0.015` maximum logit difference at a 64-token prompt against `0.011`
+for changing the KV storage format on the tiled kernel, and `0.220` at 2048
+tokens against `0.235` for the same KV-format change, with the top-1 token
+unchanged in every arm. The kernel-level delta is ten times smaller than the
+KV-format step it is being compared against.
+
+The earlier group-of-four tiled kernel is removed: the MMA kernel covers every
+shape it won on, so keeping it would have left a slower path behind a silent
+condition. The rocBLAS path is no longer selected by default and is reachable
+only through `LegacyBlasAttention` for A/B measurement.
+
 ## 7. Stage S4: prefill LM head
 
 Replace the last-row GEMV in `buildPrefillPlan` with a batched matmul over the
@@ -639,6 +690,17 @@ variant is tried again):
   pattern is a consequence of the layout, not of the pad width.
 - Moving the delta-net recurrence to more workgroups without changing the
   algorithm: the serialization is per token row, not per block.
+- Staging K transposed per key tile so `S = Q K^T` keeps a row-major B operand:
+  the transpose costs 128 scalar 16-bit shared-memory stores and loads per key
+  tile, while transposing Q once per workgroup (`S^T = K Q^T`) costs the same
+  work once per block.
+- Letting the compiler choose the accumulator register budget in the prefill
+  attention kernel: at the 192-register default the key loop spilled 21 slots
+  into scratch and the kernel ran 1.5x slower than with
+  `__launch_bounds__(128, 2)`.
+- Selecting the FP16 MMA attention kernel below 64 rows at short context: four
+  to twelve workgroups cannot fill 40 CUs and the tiled kernel is 1.2-2.4x
+  faster there.
 
 Open questions:
 

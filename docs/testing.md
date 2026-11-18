@@ -169,9 +169,9 @@ On the 2048-token prompt the maximum logit delta is 0.264 (mean 0.045) with the
 top-1 token preserved; the cause is the Q8_1 activation grid (~4e-3 relative per
 value) against FP16 staging (~5e-4), which compounds across 32 layers. Any
 comparison between two non-identical routes therefore sits on that noise floor:
-`TestGPUBlasAttentionMatchesTiled`, which changes only the prefill attention
-dispatch in both arms, measures 0.184 instead of 0.0132 and is gated at 0.3 with
-the top-1 token still required to match. This is the accuracy regime that
+`TestGPUAttentionPathsAgree`, which changes only the prefill attention dispatch
+between its arms, measures 0.18-0.25 at 2048 tokens instead of 0.0132 and is
+gated at 0.3 with the top-1 token still required to match. This is the accuracy regime that
 llama.cpp's default K-quant prefill path runs in. See
 [benchmarks.md](benchmarks.md#isolated-kernels).
 
@@ -181,14 +181,17 @@ Paged KV and graph replay have dedicated native coverage in
 - KV writes through a permuted block table land in the mapped physical rows;
 - paged decode and prefill attention match an independent float reference
   through the same table;
-- the group-of-four prefill attention kernel runs at `head_dim` 4 (FP32 tile)
-  and `head_dim` 64 (packed FP16 K tile with half2 dots) against the same
-  reference, covering both staged-tile variants at 2e-4;
-- the matrixized F16 prefill path runs at `head_dim` 64 and position 2048
-  against the same reference, also at 2e-4. The full-model differential test
-  `TestGPUBlasAttentionMatchesTiled` compares the default F16 dispatch against
-  the tiled path selected by `DisableBlasAttention` and enforces the 0.05 logit
-  gate;
+- the prefill attention dispatch matches the same reference at 2e-4 for a
+  group of four query heads per KV head: head_dim 4 selects the tiled per-head
+  kernel and head_dim 64 at position 2048 selects the FP16 MMA kernel;
+- the FP16 MMA prefill attention kernel runs at `head_dim` 256 with four query
+  heads per KV head, a permuted block table, and a 64-row chunk, matches the
+  FP32 reference within 5e-3 relative, reproduces its output bitwise on a second
+  run, and reports its difference against the tiled kernel on the same plan
+  input. The full-model differential test `TestGPUAttentionPathsAgree` compares
+  the default FP16 MMA dispatch against the tiled path selected by
+  `ForceTiledAttention` (and the opt-in rocBLAS path) and enforces the 0.05
+  logit gate at a 64-token prompt and 0.3 at 2048 tokens;
 - device-to-device block copies used for private prefix blocks;
 - graph capture and replay with device-resident token/position updates across
   several positions;

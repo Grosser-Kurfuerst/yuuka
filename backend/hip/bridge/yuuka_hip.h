@@ -142,6 +142,9 @@ typedef enum yuuka_op_code {
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
 #define YUUKA_OP_FLAG_PREFILL_BLAS 0x2u
+// Forces the tiled paged prefill attention kernel where the FP16 MMA kernel
+// would otherwise be selected. Validation and measurement only.
+#define YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED 0x4u
 
 /* GEMM implementation selection carried in yuuka_op.u[1]. AUTO uses the
  * compiled default for the dtype. BLAS is the rocBLAS route and requires FP16

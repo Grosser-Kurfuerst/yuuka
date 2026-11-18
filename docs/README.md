@@ -122,11 +122,11 @@ Implemented and tested:
 - rocWMMA FP16 and quantized prefill GEMM with measured 64x64 and 32x64 tile
   selection, an int8 MMQ route for K-quant weights (Q8_1 activations, exact
   int32 WMMA accumulation, FP32 scales), a fused gate/up SwiGLU kernel, a
-  rocBLAS FP16 baseline, causal GQA
-  Flash Attention that stages K and V for a 16-query-row tile, chunked prefill
-  with per-chunk KV writes, the measured `SelectPrefillPath` dispatch table,
-  and a rocBLAS matrixized paged prefill attention path that is the default for
-  F16 KV at 2048 or more positions.
+  rocBLAS FP16 baseline, causal paged
+  prefill attention with an FP16 MMA kernel for F32 and F16 pools (four query
+  heads per workgroup, 16-key tiles, FP32 online softmax) and a tiled fallback
+  for Q8_0 and short chunks, chunked prefill with per-chunk KV writes, and the
+  measured `SelectPrefillPath` dispatch table.
 - A split-register gated delta-net chunk kernel that keeps the recurrent state
   resident for the whole chunk. With the int8 MMQ prefill GEMM the 512-token
   prefill rate is 1324 tok/s, up from 313 tok/s before the delta-net and GEMM
