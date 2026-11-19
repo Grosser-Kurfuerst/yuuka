@@ -438,7 +438,7 @@ bool compare_gemm(const char * name, const std::vector<uint8_t> & packed,
             const float value = got[size_t(row * n_out + col)];
             const double diff = std::fabs(double(value) - double(expected));
             max_abs = std::max(max_abs, diff);
-            if (diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
+            if (!std::isfinite(diff) || diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
                 std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
                              name, static_cast<long long>(row),
                              static_cast<long long>(col), value, expected);
@@ -1744,6 +1744,8 @@ int main() {
                                s.n_out, s.rows, rng) && ok;
         }
     }
+    ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q4_K, "mmq Q4_K FFN",
+                       2560, 9216, 512, rng) && ok;
     ok = test_blas(device, stream, event, rng) && ok;
     const struct {
         yuuka_dtype dtype;

@@ -353,7 +353,7 @@ contiguous values, four per lane. Each 32-value block keeps `d = amax/127` and
 activation block sum. Ties round to even (`rintf`). The width must be a multiple
 of 128, so a wave never crosses a row.
 
-`gemm_mmq_kernel<DType>` computes a 64 output-channel by 128 token tile with
+The generic `gemm_mmq_kernel` computes a 64 output-channel by 128 token tile with
 eight waves, a 128-value K step, and 30720 bytes of dynamic shared memory:
 
 | Slice | Layout | Bytes |
@@ -408,13 +408,12 @@ channel, so each store instruction covers two 64-byte runs. Transposing through
 a shared-memory tile instead needs 33 KiB, which would break the two-block
 residency, and the direct stores measure the same within noise.
 
-The loop is limited by VALU issue, not by LDS: 22.2 VALU and 4.8 LDS
-instructions per WMMA on Q4_K `2560 -> 9216` at `M=512`. Two costs dominate.
-First, rocWMMA duplicates gfx11 wave32 operands in registers, so every
-`mma_sync` costs 2.5 `ds_swizzle_b32` on the LDS pipe; feeding the builtin
-directly needs the duplicated 16-byte operands staged in LDS, which doubles the
-operand budget to 51 KiB and drops to one block per CU, and reconstructing the
-duplicate in registers costs the same two moves per fragment on the VALU pipe.
+The generic loop issued 22.2 VALU and 4.8 LDS instructions per WMMA on
+Q4_K `2560 -> 9216` at `M=512`. Two costs dominate. First, rocWMMA duplicates
+gfx11 wave32 operands in registers, adding 2.5 `ds_swizzle_b32` instructions
+per WMMA on the LDS pipe. An earlier experiment staged the duplicates
+explicitly, raising total LDS use to 51 KiB and cutting residency to one
+block per CU.
 Second, the scale application is four VALU per accumulator element per block
 (`int32 -> float` conversion, the scale product, the main FMA, and the minimum
 FMA), which is 16 VALU per WMMA by construction: each block updates eight
@@ -425,21 +424,41 @@ Tails are masked: rows outside the batch stage zeros (their scales and sums are
 zero) and output rows and channels outside `n_out` are not written. `n_in` must
 be a multiple of 128; every K-quant row layout is a multiple of 256.
 
-Measured resources on gfx1151: 133 VGPRs, 38-40 SGPRs, no spills, no scratch,
+Earlier generic kernel resources on gfx1151: 133 VGPRs, 38-40 SGPRs, no spills, no scratch,
 10 waves/SIMD resource limit with two blocks resident per CU, dynamic LDS
 30720. The quantizer reports 20 VGPRs and 16 waves/SIMD.
 
-Measured throughput at `M = 512` (sweep, five timed submissions after two
+Generic baseline throughput at `M = 512` (sweep, five timed submissions after two
 warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
 12.4-14.4 TFLOP/s across the three shapes, against 13.5-14.1, 12.6-13.4, and
 11.0-11.6 TFLOP/s before the layout and occupancy change. The route is still
-1.2-1.3x below llama.cpp's MMQ kernel on the same device; the remaining
-attribution is in [roadmap3.md](roadmap3.md#4-stage-s1-mmq-gemm-highest-value-73-of-the-gap).
+1.2-1.3x below llama.cpp's MMQ kernel in this baseline.
+[Original attribution](roadmap3.md#4-stage-s1-mmq-gemm-highest-value-73-of-the-gap)
 
 The q/k/v and qkv/gate groups read the same normalized tile, so the plan
 quantizes it once per group instead of once per projection
 (`prefillProjections` in `engine/gpu/plan.go`); a 512-row chunk runs 128
 `quant_q8_1` operations instead of 168.
+
+#### gfx1151 Q4_K specialization
+
+The native launcher selects the specialization for `M=512, K=2560,
+N=9216` with 16-byte aligned packed weights and Q8_1 digits. gfx1151
+compiles the direct WMMA path, and other device targets compile the
+generic kernel. The direct tile covers 128 channels by 64 tokens.
+Each half of the generic grid's x range covers the same 128-channel
+tiles for a different 64-token half. The grid keeps 576 blocks and the
+shared-memory allocation stays at 30 KiB.
+
+Within each 512-byte operand region, the specialized LDS layout stores
+two contiguous 16-value slices per row. Both halves of each wave load the
+same operand from LDS. A staging thread reads packed weight bytes once
+for two adjacent subblocks and writes both sets of digit slices into
+LDS. Each activation block uses 16-byte vector loads and stores. Its
+staging thread writes the FP32 scale and scaled sum once. The kernel
+completes both integer WMMA instructions and
+FP32 scale/min correction of each fragment before consuming the next
+fragment. [Performance and validation](prefill-optimization/acceptance/02-q4-ffn.md)
 
 ### 6.4 Dispatch
 

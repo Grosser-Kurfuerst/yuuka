@@ -8,13 +8,14 @@ reference build, and comparison conditions.
 ## Document index
 
 - [Iteration 1 baseline](01-baseline.md) — Fixed-chunk throughput, 8K chunk sweep, and GPU verification.
+- [Iteration 2 Q4_K FFN projection](02-q4-ffn.md) — Isolated MMQ candidates, CPU comparison, and pp512 A/B.
 
 ## Progress
 
 | Plan step | Scope | Status |
 | --- | --- | --- |
 | 1 | Reproduce the pre-optimization baseline | Accepted |
-| 2 | Specialize the Q4_K FFN projection | Pending |
+| 2 | Specialize the Q4_K FFN projection | Accepted |
 | 3 | Crop the last-layer FFN | Pending |
 | 4a | Extend measured MMQ improvements to additional shapes | Pending |
 | 4b | Reduce GDN input preparation and synchronization | Pending |

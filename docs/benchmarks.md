@@ -116,6 +116,10 @@ current ones by 0.5-1.6% at the longer prompts, which is the run-to-run noise of
 an unpinned clock on this device, so the same-session A/B above is the number to
 compare the LM head stage against.
 
+The [Q4_K FFN specialization acceptance](prefill-optimization/acceptance/02-q4-ffn.md)
+records the 2026-11-19 gfx1151 prefill comparison using F16 KV,
+including isolated MMQ, complete FFN and prompt-length medians.
+
 ## Decode: output length
 
 `yuuka bench --backend hip --prompt-tokens 128 --decode-tokens 128|256`,
@@ -486,7 +490,7 @@ Each of these is a measured decision that still holds in the current code:
   1.6-3.3x faster per GEMM from 256 rows upward but numerically rejected on
   tall-K shapes and needed an FP16 copy of every weight matrix; the int8 MMQ
   route replaced it.
-- **The MMQ staging and K-step shape are settled.** The adopted change stages
+- **The generic MMQ path uses a 128-value K step.** It stages
   both operands in WMMA fragment order (0.0% bank conflicts from 35.9%),
   expands Q4_K/Q5_K digits with word-wide masks, and uses a 128-value K step so
   two blocks stay resident per CU: 13.8 -> 17.3-18.5 TFLOP/s on Q4_K
@@ -494,7 +498,9 @@ Each of these is a measured decision that still holds in the current code:
   a 60 KiB double-buffered 256-value stage (one block per CU, 14.6 TFLOP/s),
   register prefetch of the next step's weights (192 VGPRs, 161-195 spills,
   6.4 TFLOP/s), a 64-value K step (16.4 TFLOP/s), and rebuilding the rocWMMA
-  gfx11 operand duplication to remove its `ds_swizzle_b32` cost.
+  gfx11 operand duplication by storing duplicate operands in LDS. The
+  [gfx1151 specialization](kernels.md#gfx1151-q4_k-specialization) uses
+  LDS broadcast and vectorized activation staging on the measured Q4_K cell.
 - **The chunkwise gated delta-net form is implemented but not selected.** It
   matches the per-token recurrence to `1.6e-7` and removes the per-token barrier
   chain, but takes 3.10 ms per recurrent layer against 2.01 ms for the
