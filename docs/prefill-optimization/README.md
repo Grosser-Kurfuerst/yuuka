@@ -7,10 +7,10 @@ KV, one request, an empty prefix cache and equal output requirements. The
 scope is the dense hybrid `qwen35` HIP path. Other Qwen models, including
 MoE, need their own supported runtime and measurements.
 
-**Status.** This is a follow-up plan based on measurements at `bfd36c0`.
-See the acceptance index for the current implementation status. The existing
-MMQ, split-register recurrence, paged attention and streaming LM head are
-the starting point.
+**Status.** Implementation and verification are recorded in the acceptance
+index. The matched-input tuned comparison cleared the 5% margin at 512,
+2048 and 8192 tokens. The 128-token result was within 1% of the reference.
+The measurements at `bfd36c0` are the starting point for this plan.
 The earlier experiments and rejected variants are recorded in the
 [previous roadmap](../roadmap3.md).
 

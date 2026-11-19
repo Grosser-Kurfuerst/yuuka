@@ -132,6 +132,10 @@ The [final query crop comparison](prefill-optimization/acceptance/06-final-query
 records K/V equivalence, output work per chunk and the resulting prompt rates.
 The [long attention comparison](prefill-optimization/acceptance/07-long-attention.md)
 records split-key numerics, merge costs, scratch and the 8K chunk sweep.
+The [official v1.0.0 matched-input comparison](prefill-optimization/acceptance/08-upstream-comparison.md)
+records host logit latency and the per-length gate. At measured chunk settings
+the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
+2048 and 8192 tokens respectively.
 
 ## Decode: output length
 

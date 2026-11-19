@@ -100,8 +100,9 @@ respectively.
    IDs to receiving logits, with weights and plans warm and session state
    reset between samples. Keep tokenization, model loading and sampling
    outside that interval. Report this series alongside the standalone
-   tools. The driver is proposed work. Link any reference executable only
-   into its own benchmark process.
+   tools. The [iteration 8 record](acceptance/08-upstream-comparison.md)
+   contains the driver build commands, inputs and output checks. Link the
+   reference executable only into its own benchmark process.
 
 For each stage run its targeted tests and the real-model greedy/long-context
 checks. For integration use the [project test commands](../testing.md#94-current-test-commands),
