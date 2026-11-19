@@ -834,6 +834,33 @@ memory-system effect. The kernel mapping behind it is described in
 [kernels.md](kernels.md#4-operator-family-map) and the fix in
 [roadmap.md](roadmap.md#root-causes).
 
+### Split-key decode attention
+
+Landed in [roadmap.md](roadmap.md) step 2. Measured 2026-11-19 on the same
+device and model (SHA-256 `00fe7986...`), `yuuka bench --kv-type f32
+--chunk-size 512`, greedy, warmup 2 and 3 repetitions, against the same
+llama.cpp build `b1b770d90`:
+
+| Test | before (`7b7aa4c`) | after | llama.cpp |
+| --- | ---: | ---: | ---: |
+| pp128/tg32 | 41.12 | 44.74 | 61.93 |
+| pp128/tg128 | 38.81 | 44.02 | 62.08 |
+| pp512/tg128 | 30.97 | 43.75 | 61.88 |
+| pp2048/tg32 | 17.42 | 42.90 | 61.60 |
+
+The decode rate is now flat within 4% from a 128-token to a 2048-token context;
+the remaining 5% against the 128-token row is the KV traffic itself. In
+`TestGPUProfileDecode`, which adds one submission gap per operation, decode
+attention costs 0.021 ms per layer at a 7-token context and 0.033 ms at 512
+(0.017 and 1.04 ms with the serial kernel). Unprofiled, an attention-only plan
+over the eight full-attention layers costs 21-24 us per layer at a 512-token
+context, 55/49/37 us at 1024, and 93/67/57 us at 2048 for F32/F16/Q8_0 KV.
+
+The 2048-token F32 figure moves 16 MB of KV per layer, which is 68 us at the
+235 GB/s read ceiling recorded in [roadmap.md](roadmap.md#open-questions), so
+what remains there is the pool bytes rather than the kernel; F16 and Q8_0 read
+half and a quarter of that.
+
 ## Decisions and rejected routes
 
 Each of these is a measured decision that still holds in the current code:

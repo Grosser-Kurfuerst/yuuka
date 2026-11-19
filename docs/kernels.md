@@ -127,7 +127,8 @@ hard-coded from another GPU.
 
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
 | `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
-| `paged_attention` | Decode | Block table, shared KV heads, long-context split |
+| `attention_paged_flash` / `attention_flash_combine` | Decode (selected) | Block table, one block per KV head and key tile, online softmax in registers, split partials merged by log-sum-exp |
+| `attention_paged` (serial) | Decode fallback and reference | One block per query head, sequential positions, per-head score workspace |
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
 | `moe_route` / `moe_expert_*` | Sparse MoE | Top-k routing, per-expert assignment bins, packed expert reads |
@@ -768,30 +769,59 @@ The measured position-7680 attention time is 643 ms with F32 KV, down from
 2030 ms before this change.
 
 Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
-unsupported capability error above 256. Decode attention remains the
-per-head kernel described in section 7.2. Flash Attention is not used for
-decode.
+unsupported capability error above 256. Decode attention uses the split-key
+kernel described in section 7.2.
 
 Chunked prefill splits a prompt into at most `chunk-size` rows (default 512,
 maximum 4096). KV writes for a chunk happen before its attention, so later
 chunks see the full causal prefix. The runtime builds and caches one plan per
 chunk length; only the final chunk executes the output tail.
 
-### 7.2 Decode: Paged Attention
+### 7.2 Decode: Split-Key Paged Attention
 
-`attention_paged_f32_kernel` runs one workgroup per query head:
+`attention_paged_flash_kernel` in `kernels/hip/attention/attention.hip` is the
+decode attention kernel. It splits the key range so the cost follows the KV
+bytes instead of the position count:
 
-- The workgroup stages the query head in shared memory and reduces the score
-  dot product across 256 threads.
+- Grid `(kv_heads, ntiles)`. One block owns one KV head and one contiguous tile
+  of key positions, and all `heads / kv_heads` query heads that share that KV
+  head. A KV row is therefore read once per block rather than once per query
+  head; on Qwen3.5 that is four query heads per block.
+- The tile is 32 positions up to a 1024-position capacity and 64 above it, so a
+  short context gets more blocks and a long context writes fewer partials. The
+  tile length is a kernel argument and the shared-memory arrays are sized for
+  64.
+- Score phase: each warp owns one position of the tile, reads the lane's part of
+  the K row (16 bytes of F32, 8 bytes of F16, one Q8_0 group per lane), and
+  reduces the dot products for every query head of the block across the wave.
+- Online softmax: one thread per query head reduces the tile maximum, every
+  thread rescales its running maximum, normalizer, and accumulators, one warp
+  per head exponentiates the tile, and one warp shuffles the tile weight sum.
+  One barrier per phase, three per tile.
+- Value phase: each thread owns two output dims, so a warp covers a 32-value
+  span of the V row; the tile weights come from shared memory as one vector
+  load per position.
 - Each logical position `p` maps to
   `block_table[p / block_size] * block_size + p % block_size`; K and V are read
   from the pool through that row. The block table and pool are device buffers.
-- Scores for one head use a per-head stride so one scores workspace serves all
-  heads. The causal length is `position + 1`.
-- GQA maps query head `h` to KV head `h / (heads/kv_heads)`.
-- The attention gate is applied as `sigmoid(gate)` before the output write.
-- The dynamic variant reads `position` from a device parameter buffer so a
-  captured HIP Graph can be replayed without changing kernel arguments.
+- The block writes one partial output vector per head and tile plus its running
+  maximum and normalizer. `attention_flash_combine_kernel` merges them with the
+  log-sum-exp rescaling, one 64-dim slice of one head per block, and applies the
+  attention gate as `sigmoid(gate)` before the output write.
+- The dynamic variant reads `position` from a device parameter buffer for both
+  the split kernel and the merge, so a captured HIP Graph replays without
+  changing kernel arguments.
+
+The scores workspace is the partials arena: `heads * ntiles * (head_dim + 2)`
+floats with `ntiles = ceil(capacity / tile)`, the outputs first and then two
+floats per head and tile. `decodeAttentionScratch` in `engine/gpu/model.go`
+allocates it and must agree with `flash_tile` in the kernel.
+
+Shapes outside the tiled kernel's template set keep the serial reference
+implementation `attention_paged_f32_kernel`, one block per query head with a
+sequential position loop: head dimensions above 256, head dimensions not a
+multiple of four, and `heads / kv_heads` outside 1, 2, 4, 8. It is also the
+byte-for-byte reference the tiled kernel is compared against.
 
 `attention_prefill_paged_f32_kernel` keeps the same eight-query-row workgroup
 tiling and online softmax as the contiguous prefill kernel, but resolves each

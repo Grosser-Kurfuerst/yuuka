@@ -42,7 +42,26 @@ const (
 // a submission gap per operation, so the absolute numbers are a diagnosis, not
 // a release measurement; see docs/testing.md section 6.3.
 func TestGPUProfileDecode(t *testing.T) {
-	reader, _, model, prompt := goldenPrompt(t)
+	reader, tok, model, prompt := goldenPrompt(t)
+	// YUUKA_TEST_DECODE_CONTEXT extends the prompt so the same attribution can be
+	// produced at a longer decode context, which is how the split-key attention
+	// per-layer cost is gated. Unset profiles the short golden prompt.
+	context := 64
+	if value := os.Getenv("YUUKA_TEST_DECODE_CONTEXT"); value != "" {
+		if _, err := fmt.Sscanf(value, "%d", &context); err != nil || context < 8 {
+			t.Fatalf("YUUKA_TEST_DECODE_CONTEXT=%q is not a token count", value)
+		}
+	}
+	if context > len(prompt) {
+		ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", context/8+2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ids) < context {
+			t.Fatalf("tokenizer produced %d tokens, need %d", len(ids), context)
+		}
+		prompt = ids[:context]
+	}
 	// YUUKA_TEST_DECODE_INT8 selects the int8 decode matvec so the
 	// same attribution can be produced for each variant: "fused" quantizes inside
 	// the matvec block, "prequantized" submits one quantization operation per
@@ -68,11 +87,11 @@ func TestGPUProfileDecode(t *testing.T) {
 	default:
 		t.Fatalf("YUUKA_TEST_DECODE_INT8=%q is not 'fused' or 'prequantized'", route8)
 	}
-	rt, err := newRuntime(reader, model, 64, opts)
+	rt, err := newRuntime(reader, model, context+64, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
-	t.Logf("decode matvec route: %s", route)
+	t.Logf("decode matvec route: %s, decode context %d", route, context)
 	defer rt.Close()
 	logits, err := rt.Forward(prompt)
 	if err != nil {
@@ -96,6 +115,33 @@ func TestGPUProfileDecode(t *testing.T) {
 	report := newDecodeReport(samples)
 	printDecodeReport(t, rt, report)
 	checkDecodeGates(t, report)
+	checkDecodeAttentionGate(t, report, context)
+}
+
+// decodeAttentionPerLayerGate is the split-key attention cost a 512-token decode
+// context must stay under. The serial position loop cost 1.04 ms per layer at
+// that context.
+const decodeAttentionPerLayerGate = 0.05
+
+// checkDecodeAttentionGate bounds the per-layer decode attention cost once the
+// context is long enough for the position range to dominate the step.
+func checkDecodeAttentionGate(t *testing.T, r *decodeReport, context int) {
+	t.Helper()
+	if context < 512 {
+		return
+	}
+	for _, row := range r.codes {
+		if row.code != hip.OpAttentionPaged || row.ops == 0 {
+			continue
+		}
+		perLayer := row.ms / float64(row.ops)
+		if perLayer > decodeAttentionPerLayerGate {
+			t.Fatalf("decode attention costs %.4f ms per layer at a %d-token context,"+
+				" the gate is %.3f ms", perLayer, context, decodeAttentionPerLayerGate)
+		}
+		t.Logf("gate: decode attention %.4f ms per layer at a %d-token context"+
+			" (gate %.3f ms)", perLayer, context, decodeAttentionPerLayerGate)
+	}
 }
 
 // decodeSample is one profiled operation with the model buffer that produced it

@@ -327,6 +327,37 @@ func (m *Model) allocTransient(bytes uint64) (*hip.Buffer, error) {
 // buffers are not included; this is used by tests to detect growth.
 func (m *Model) Allocations() int { return len(m.all) }
 
+// decodeAttentionWideContext and decodeAttentionTile select the number of key
+// positions one split-key decode attention block owns, and must match
+// flash_tile in kernels/hip/attention/attention.hip: 32 positions below the
+// threshold, 64 above it.
+const (
+	decodeAttentionWideContext = 1024
+	decodeAttentionTile        = 32
+	decodeAttentionWideTile    = 64
+)
+
+// decodeAttentionScratch returns the float count of the decode attention
+// workspace. The tiled kernel writes one partial output vector per head and tile
+// plus a running max and normalizer per head and tile, laid out as
+// heads * ntiles * (headDim + 2) floats with ntiles = ceil(capacity / tile).
+// The serial fallback needs heads * scoreStride floats, so the workspace is the
+// larger of the two. scoreStride is the per-head score stride the plan passes
+// (the model capacity), which bounds capacity.
+func decodeAttentionScratch(heads, headDim, scoreStride, capacity int) uint64 {
+	tile := decodeAttentionTile
+	if capacity > decodeAttentionWideContext {
+		tile = decodeAttentionWideTile
+	}
+	tiles := (capacity + tile - 1) / tile
+	tiled := heads * tiles * (headDim + 2)
+	serial := heads * scoreStride
+	if tiled > serial {
+		return uint64(tiled)
+	}
+	return uint64(serial)
+}
+
 func (m *Model) allocActivations() error {
 	cfg := m.config
 	var err error
@@ -351,7 +382,7 @@ func (m *Model) allocActivations() error {
 		{&m.act.ffnGate, uint64(cfg.FFNSize)},
 		{&m.act.ffnUp, uint64(cfg.FFNSize)},
 		{&m.act.logits, uint64(cfg.VocabSize)},
-		{&m.act.scores, uint64(cfg.HeadCount * m.capacity)},
+		{&m.act.scores, decodeAttentionScratch(cfg.HeadCount, int(cfg.HeadDim), m.capacity, m.capacity)},
 	}
 	for _, entry := range sizes {
 		buf, err := m.allocDevice(entry.n * 4)

@@ -275,6 +275,117 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
     return 0;
 }
 
+// test_flash_decode_long checks the split-key decode attention at a context
+// longer than one tile, including the graph replay path. Four query heads share
+// one KV head, the block table is the identity, and the scratch is sized the way
+// the launcher expects: heads * ntiles * (head_dim + 2) floats.
+int test_flash_decode_long(context & ctx, int head_dim, int position, int capacity,
+                           uint32_t dtype, bool use_graph) {
+    const int heads = 4, kv_heads = 1, kv_dim = kv_heads * head_dim;
+    const int block_size = 16;
+    const int blocks = capacity / block_size;
+    const int tile = capacity > 1024 ? 64 : 32;
+    const int ntiles = (capacity + tile - 1) / tile;
+    std::vector<int32_t> table(static_cast<size_t>(blocks));
+    for (int i = 0; i < blocks; ++i) table[size_t(i)] = i;
+    std::vector<float> host_k(size_t(capacity) * kv_dim);
+    std::vector<float> host_v(size_t(capacity) * kv_dim);
+    for (size_t i = 0; i < host_k.size(); ++i) {
+        host_k[i] = std::sin(0.11f * float(i)) + 0.2f * float(i % 5);
+        host_v[i] = std::cos(0.09f * float(i)) - 0.15f * float(i % 3);
+    }
+    std::vector<float> q(size_t(heads) * 2 * head_dim);
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = std::sin(0.19f * float(i) + 0.2f);
+    }
+    const uint64_t element = dtype == YUUKA_DTYPE_F16 ? 2 : 4;
+    // An F16 pool stores the half-precision form of the FP32 reference rows, so
+    // its comparison carries the storage rounding.
+    const float tolerance = dtype == YUUKA_DTYPE_F16 ? 1e-3f : 2e-4f;
+    yuuka_buffer * k_pool = upload(ctx, nullptr, host_k.size() * element);
+    yuuka_buffer * v_pool = upload(ctx, nullptr, host_v.size() * element);
+    yuuka_buffer * table_buf = upload(ctx, table.data(), table.size() * sizeof(int32_t));
+    yuuka_buffer * q_buf = upload(ctx, q.data(), q.size() * sizeof(float));
+    yuuka_buffer * out = upload(ctx, nullptr, size_t(heads) * head_dim * sizeof(float));
+    yuuka_buffer * scores = upload(ctx, nullptr,
+        size_t(heads) * size_t(ntiles) * size_t(head_dim + 2) * sizeof(float));
+    CHECK(k_pool && v_pool && table_buf && q_buf && out && scores);
+    if (dtype == YUUKA_DTYPE_F16) {
+        yuuka_buffer * k_src = upload(ctx, host_k.data(), host_k.size() * sizeof(float));
+        yuuka_buffer * v_src = upload(ctx, host_v.data(), host_v.size() * sizeof(float));
+        CHECK(k_src && v_src);
+        CHECK_STATUS(yuuka_cast_f32_to_f16(ctx.stream, k_pool, k_src, host_k.size(), ctx.event));
+        CHECK_STATUS(yuuka_cast_f32_to_f16(ctx.stream, v_pool, v_src, host_v.size(), ctx.event));
+        CHECK_STATUS(yuuka_event_wait(ctx.event));
+        yuuka_buffer_free(k_src);
+        yuuka_buffer_free(v_src);
+    } else {
+        CHECK(yuuka_memcpy_h2d(k_pool, host_k.data(), host_k.size() * sizeof(float)) == YUUKA_OK);
+        CHECK(yuuka_memcpy_h2d(v_pool, host_v.data(), host_v.size() * sizeof(float)) == YUUKA_OK);
+    }
+    yuuka_plan * plan = nullptr;
+    CHECK_STATUS(yuuka_plan_create(ctx.device, &plan));
+    yuuka_op op{};
+    op.code = YUUKA_OP_ATTENTION_PAGED;
+    op.buf[0] = q_buf;
+    op.buf[1] = k_pool;
+    op.buf[2] = v_pool;
+    op.buf[3] = out;
+    op.buf[4] = scores;
+    op.buf[5] = table_buf;
+    op.n[0] = kv_heads;
+    op.n[1] = heads;
+    op.n[2] = head_dim;
+    op.n[3] = kv_dim;
+    op.n[4] = capacity;
+    op.u[0] = block_size;
+    op.u[1] = capacity;
+    op.u[2] = dtype;
+    op.f[0] = 1.0f / std::sqrt(float(head_dim));
+    CHECK_STATUS(yuuka_plan_add(plan, &op));
+    CHECK_STATUS(yuuka_plan_execute(plan, ctx.stream, 0, position, 1, ctx.event));
+    CHECK_STATUS(yuuka_event_wait(ctx.event));
+    std::vector<float> got(size_t(heads) * head_dim);
+    CHECK(download(ctx, out, got.data(), got.size() * sizeof(float)));
+    std::vector<float> want;
+    reference_attention_dims(q, host_k, host_v, position, 1, heads, kv_heads, head_dim, want);
+    const float diff = max_diff(got, want);
+    if (diff >= 2e-4f) {
+        std::fprintf(stderr, "flash decode head_dim=%d position=%d dtype=%u max diff %g\n",
+                     head_dim, position, dtype, diff);
+        return 1;
+    }
+    if (use_graph) {
+        yuuka_buffer * dynamic = upload(ctx, nullptr, 2 * sizeof(int32_t));
+        CHECK(dynamic != nullptr);
+        yuuka_graph * graph = nullptr;
+        CHECK_STATUS(yuuka_graph_create(plan, ctx.stream, dynamic, 1, &graph));
+        for (int replay : {1, position / 2, position}) {
+            CHECK_STATUS(yuuka_dynamic_set(ctx.stream, dynamic, 0, uint32_t(replay)));
+            CHECK_STATUS(yuuka_graph_replay(graph, ctx.stream, ctx.event));
+            CHECK_STATUS(yuuka_event_wait(ctx.event));
+            std::vector<float> replayed(size_t(heads) * head_dim);
+            CHECK(download(ctx, out, replayed.data(), replayed.size() * sizeof(float)));
+            std::vector<float> expected;
+            reference_attention_dims(q, host_k, host_v, replay, 1, heads, kv_heads,
+                                     head_dim, expected);
+            CHECK(max_diff(replayed, expected) < tolerance);
+        }
+        yuuka_graph_destroy(graph);
+        yuuka_buffer_free(dynamic);
+    }
+    yuuka_plan_destroy(plan);
+    yuuka_buffer_free(k_pool);
+    yuuka_buffer_free(v_pool);
+    yuuka_buffer_free(table_buf);
+    yuuka_buffer_free(q_buf);
+    yuuka_buffer_free(out);
+    yuuka_buffer_free(scores);
+    std::printf("flash decode head_dim=%d position=%d dtype=%u graph=%d: ok (max diff %.3g)\n",
+                head_dim, position, dtype, int(use_graph), diff);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -559,6 +670,18 @@ int main() {
         return 1;
     }
     if (test_gqa_attention_group4(ctx, 4, 10, 1, 4, 16, false, 5) != 0) {
+        teardown(ctx);
+        return 1;
+    }
+    if (test_flash_decode_long(ctx, 64, 300, 320, YUUKA_DTYPE_F32, true) != 0) {
+        teardown(ctx);
+        return 1;
+    }
+    if (test_flash_decode_long(ctx, 256, 700, 704, YUUKA_DTYPE_F32, false) != 0) {
+        teardown(ctx);
+        return 1;
+    }
+    if (test_flash_decode_long(ctx, 256, 600, 640, YUUKA_DTYPE_F16, true) != 0) {
         teardown(ctx);
         return 1;
     }

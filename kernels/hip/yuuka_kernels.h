@@ -188,6 +188,11 @@ void launch_attention_f32(float * out, const float * q, const float * k_cache,
                           const float * v_cache, float * scores,
                           int kv_heads, int heads, int head_dim, int kv_dim,
                           int position, int capacity, float scale, hipStream_t stream);
+/* launch_attention_paged_f32 runs single-token paged attention. The tiled path
+ * (one block per KV head and key tile, split-key online softmax) writes its
+ * partials into scores, which must hold
+ * heads * ceil(score_stride / tile) * (head_dim + 2) floats for the tile the
+ * launcher chooses; the serial fallback needs heads * score_stride floats. */
 void launch_attention_paged_f32(float * out, const float * q, const void * k_pool,
                                 const void * v_pool, float * scores,
                                 const int32_t * block_table, int block_size,

@@ -7,11 +7,12 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Step 1 has landed: `scripts/decode_compare.sh` regenerates the
-token-rate and per-shape tables from one yuuka profile and one reference trace.
-Steps 2-6 are open and step 7 closes the record. This file is a plan, not a
-record: when a step lands, its measured result goes into
-[benchmarks.md](benchmarks.md) and the row in
+**Status.** Steps 1 and 2 have landed: `scripts/decode_compare.sh` regenerates
+the comparison tables, and decode attention is split over the key range, which
+made the decode rate flat in context (44.7/44.0/43.8/42.9 t/s for
+pp128/tg32, pp128/tg128, pp512/tg128, pp2048/tg32). Steps 3-6 are open and step
+7 closes the record. This file is a plan, not a record: when a step lands, its
+measured result goes into [benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
 **Scope.** The dense hybrid `qwen35` HIP path at batch 1. Fused mixed-shape
@@ -248,6 +249,7 @@ Steps 1–3 close the context-dependent gap; steps 4–5 close the flat gap; ste
 | --- | --- | --- | --- |
 | 1 | [Reproduce the comparison harness](#step-1-reproduce-the-comparison) | One command prints both engines at 128/512/2048 and the per-shape table | Script and docs |
 | | *Landed.* `scripts/decode_compare.sh` plus `scripts/decode_reference_shapes.py` reproduce the headline rows (0.63/0.66/0.55/0.50/0.28 on the 2026-11-19 rerun) and the per-shape table. | | |
+| | *Landed (step 2).* Split-key attention: 0.033 ms per layer at a 512-token context in `TestGPUProfileDecode`, `pp2048/tg32` 42.90 t/s, greedy tokens identical, logits within the recorded CPU difference. | | |
 | 2 | [Parallel decode attention over the key range](#step-2-parallelize-decode-attention-over-the-key-range) | 512-token context: ≤ 0.05 ms per layer, top-1 token and logits within the documented tolerance, `pp2048` ≥ 30 t/s | 4–8 files |
 | 3 | [Cover every KV format and the graph path](#step-3-cover-every-kv-format-and-the-graph-path) | All three pool formats and the captured graph produce the same tokens, ≤ 0.06 ms per layer from 0 to 2048 tokens | 3–6 files |
 | 4 | [Remap the decode matvec](#step-4-remap-the-decode-matvec) | ≥ 190 GB/s for every `N` ≥ 1024, step ≤ 15.5 ms, `pp128` ≥ 50 t/s | 4–8 files |
@@ -288,6 +290,20 @@ Acceptance: the script reproduces the baseline rows within the clock drift of
 an unpinned session. No dispatch or kernel change.
 
 ### Step 2: parallelize decode attention over the key range
+
+Landed as `attention_paged_flash_kernel` plus `attention_flash_combine_kernel`
+in `kernels/hip/attention/attention.hip`. One block owns one KV head and one
+key tile instead of one query head, so the four query heads that share a KV head
+read its K/V rows once; the split over the key range is what removes the
+position-dependent cost. The tile is 32 positions up to a 1024-position
+capacity and 64 above it, selected by `flash_tile` and mirrored by
+`decodeAttentionScratch` in `engine/gpu/model.go`, which allocates the partials
+arena. The F16 and Q8_0 pools and the dynamic (graph) variant take the same
+kernel, so step 3 became verification and measurement rather than a port. The
+serial kernel remains the reference implementation and the fallback for
+unsupported head widths and head/KV-head ratios.
+
+The plan below is the original design note and is kept for the rationale.
 
 Replace the serial position loop with a flash-decoding form.
 
