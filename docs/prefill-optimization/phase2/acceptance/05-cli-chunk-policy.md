@@ -156,3 +156,70 @@ The raw samples and temporary allocation probe are in
 The measurement iteration received `NO_BLOCKING_ISSUES` after one
 read-only review. The measured interval description was clarified
 and the relative links and `git diff --check` passed.
+
+## CLI policy implementation
+
+[Both CLI entry points](../../../../cmd/yuuka/main.go) resolve the
+prompt length after tokenization, including chat template rendering
+for `run` and corpus truncation for `bench`. The [HIP adapter](../../../../cmd/yuuka/backend_hip.go)
+applies the selected size through the existing `SetPrefillChunk`
+method. The selector checks gfx1151, F16 KV, the 32-layer 2560/9216
+hidden/FFN geometry with 16 query heads, four KV heads and head
+width 256, and the Q4_K_M file type. The inclusive band is
+1024–8192 tokens. The omitted flag selects 512 outside that band
+or configuration. The CLI recognizes explicit 512 as an override,
+and runtime cap and context clamping still apply.
+
+[Selector tests](../../../../cmd/yuuka/main_test.go) exercise the
+band edges, 1025-token tail, explicit values, GPU, model and KV
+eligibility. The policy has no server setting.
+
+A temporary HIP probe invoked the CLI's runtime adapter with omitted
+and resolved explicit flags for prompts of 1023, 1024, 1025, 1537, 2049,
+4097, 8192 and 8193 tokens. All four full-vocabulary logit rows
+(prefill and three decode steps) matched bitwise for each pair.
+The greedy continuation matched at every step. The permanent
+selector tests passed with and without the HIP build tag.
+
+Two additional reversed-order F16 comparisons (`1024,512,512,1024`)
+each used two warmups and five samples per process. Both lengths
+preserved the four greedy IDs. The 1537-token case ends with a
+513-row chunk under the new setting. Its 0.144009 difference is
+between different chunk boundaries. The omitted versus explicit
+1024 check at the same length is bitwise.
+
+| Prompt | 512 p50 [range] (ms) | 1024 p50 [range] (ms) | Change | Max logit diff |
+| ---: | ---: | ---: | ---: | ---: |
+| 1537 | 686.464 [680.084–693.976] | 670.449 [665.253–680.938] | −2.33% | 0.144009 |
+| 3073 | 1407.058 [1395.186–1423.900] | 1346.784 [1334.960–1354.160] | −4.28% | 0 |
+
+The candidate CLI command smoke used context 8320. For `run`,
+102 copies of the same sentence tokenize to 1021 IDs in raw mode
+and 1032 IDs after chat rendering. Omitted flags produced the text
+and peak allocation of the expected explicit settings. Raw mode
+allocated 3,265,250,856 bytes with automatic or explicit 512.
+Chat mode allocated 3,457,175,080 bytes with automatic or explicit
+1024. The other explicit value changed the allocation for each
+case. This verifies that the rendered token count drives selection.
+
+For `bench --prompt-tokens 2049 --decode-tokens 1 --warmup 2 --reps 5`,
+the omitted size used the same live peak as explicit 1024 with
+F16 and explicit 512 with F32 and Q8_0. The F16 engine TTFT p50 was 883 ms
+with the flag omitted, 920 ms with explicit 512 and 890 ms with
+explicit 1024 in these allocation-instrumented smoke runs. The
+unprofiled measurements above govern the performance decision.
+
+The CLI rejected explicit HIP sizes 0 and −1. A CPU generation
+with an explicit HIP size of zero completed normally, as before.
+Go build, vet, test and race and the HIP-tagged build and vet
+passed on the candidate.
+
+The revised CLI passed the full serial HIP suite on AI with the
+same fixture environment. The long split/direct, 1024-token
+chunk-invariance and capacity-clamp tests ran and passed. The
+five optional skips matched the baseline. The library is the
+same Release gfx1151 build that passed all ten CTests.
+
+The policy iteration received `NO_BLOCKING_ISSUES` after one
+read-only review. `gofmt`, relative links and `git diff --check`
+passed. No code changes were requested by the reviewer.

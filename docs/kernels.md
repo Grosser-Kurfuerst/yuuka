@@ -799,10 +799,16 @@ unsupported capability error above 256. Decode attention remains the
 per-head kernel described in section 7.2. Flash Attention is not used for
 decode.
 
-Chunked prefill splits a prompt into at most `chunk-size` rows (default 512,
-maximum 4096). KV writes for a chunk happen before its attention, so later
-chunks see the full causal prefix. The runtime builds and caches one plan per
-chunk length; only the final chunk executes the output tail.
+Chunked prefill splits a prompt into at most `chunk-size` rows (runtime
+default 512, maximum 4096). On gfx1151, `yuuka run` and `yuuka bench`
+use 1024 for 1024–8192 input tokens on the Qwen3.5-4B Q4_K_M
+geometry with F16 KV when `--chunk-size` is omitted. The CLI uses
+the token count after chat rendering or benchmark truncation. An
+explicit value takes precedence. See the [CLI chunk sweep and
+validation](prefill-optimization/phase2/acceptance/05-cli-chunk-policy.md).
+KV writes for a chunk happen before its attention, so later chunks
+see the full causal prefix. The runtime builds and caches one plan per
+chunk length. Only the final chunk executes the output tail.
 
 ### 7.2 Decode: Paged Attention
 
