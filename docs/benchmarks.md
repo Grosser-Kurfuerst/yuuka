@@ -65,6 +65,14 @@ Protocol:
   runs `TestGPUProfileDecode` for the per-operation attribution of one real
   decode step. The sweep keeps every matrix resident, so its GB/s figures are the
   hot-matrix upper bound of the real step.
+- `scripts/decode_compare.sh` reproduces the [llama.cpp comparison](#llamacpp-comparison)
+  and the [decode gap attribution](#decode-gap-attribution) against the
+  reference in one command: `yuuka bench` and `llama-bench` on the same GGUF at
+  the recorded prompt/decode cells, then the yuuka per-tensor attribution of
+  one decode step joined by `(dtype, K, N)` with a `rocprofv3` trace of the
+  reference decode loop (`scripts/decode_reference_shapes.py`). It fails when
+  the device is not `gfx1151` or the model hash differs from the recorded one.
+  Raw traces stay in a temporary directory and never enter the repository.
 - Only one benchmark process may use the GPU at a time; two processes sharing
   the device invalidate both results.
 - The llama.cpp reference is `strix-llama.cpp` commit `c8912d7f5` (build 12216,
@@ -798,7 +806,11 @@ remaining 0.5 ms is elementwise, copy, concat and convolution launches.
 
 Per-shape weight bandwidth of the same projections inside a step. yuuka
 launches one block per 32 output channels, the reference one block per two
-output rows:
+output rows. `scripts/decode_compare.sh` regenerates this table from one yuuka
+profile and one reference trace. On the 2026-11-19 rerun every yuuka cell
+reproduced within 4% and every reference cell within 3%, except
+`attn_output`, which the trace attributes 207.7 GB/s instead of the recorded
+185; the recorded row is kept until step 7 re-records the comparison:
 
 | Projection | dtype | K -> N | yuuka blocks | yuuka GB/s | ref blocks | ref GB/s |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
@@ -900,6 +912,7 @@ YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
 ./build/yuuka_gemv_decode_sweep
 scripts/kernel_resources.sh
 YUUKA_TEST_MODEL="$MODEL" scripts/decode_profile.sh   # decode matvec table
+YUUKA_TEST_MODEL="$MODEL" scripts/decode_compare.sh    # llama.cpp decode comparison
 YUUKA_TEST_MODEL="$MODEL" scripts/prefill_counters.sh # prefill counter table
 
 for p in 128 512 1024 2048 4096 8192; do

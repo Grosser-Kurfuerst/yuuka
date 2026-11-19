@@ -7,9 +7,11 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Steps 1-6 are open and step 7 closes the record; none of them is
-implemented yet. This file is a plan, not a record: when a step lands, its
-measured result goes into [benchmarks.md](benchmarks.md) and the row in
+**Status.** Step 1 has landed: `scripts/decode_compare.sh` regenerates the
+token-rate and per-shape tables from one yuuka profile and one reference trace.
+Steps 2-6 are open and step 7 closes the record. This file is a plan, not a
+record: when a step lands, its measured result goes into
+[benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
 **Scope.** The dense hybrid `qwen35` HIP path at batch 1. Fused mixed-shape
@@ -245,6 +247,7 @@ Steps 1–3 close the context-dependent gap; steps 4–5 close the flat gap; ste
 | Order | Deliverable | Gate to advance | Estimated scope |
 | --- | --- | --- | --- |
 | 1 | [Reproduce the comparison harness](#step-1-reproduce-the-comparison) | One command prints both engines at 128/512/2048 and the per-shape table | Script and docs |
+| | *Landed.* `scripts/decode_compare.sh` plus `scripts/decode_reference_shapes.py` reproduce the headline rows (0.63/0.66/0.55/0.50/0.28 on the 2026-11-19 rerun) and the per-shape table. | | |
 | 2 | [Parallel decode attention over the key range](#step-2-parallelize-decode-attention-over-the-key-range) | 512-token context: ≤ 0.05 ms per layer, top-1 token and logits within the documented tolerance, `pp2048` ≥ 30 t/s | 4–8 files |
 | 3 | [Cover every KV format and the graph path](#step-3-cover-every-kv-format-and-the-graph-path) | All three pool formats and the captured graph produce the same tokens, ≤ 0.06 ms per layer from 0 to 2048 tokens | 3–6 files |
 | 4 | [Remap the decode matvec](#step-4-remap-the-decode-matvec) | ≥ 190 GB/s for every `N` ≥ 1024, step ≤ 15.5 ms, `pp128` ≥ 50 t/s | 4–8 files |
@@ -263,6 +266,14 @@ regressions from arithmetic regressions.
 ## Step details
 
 ### Step 1: reproduce the comparison
+
+Landed in `scripts/decode_compare.sh` and `scripts/decode_reference_shapes.py`.
+The script checks the model hash and the `gfx1151` agent, runs the five
+protocol cells on both engines, and joins the yuuka per-tensor attribution with
+a reference trace by `(dtype, K, N)`. The reference K comes from the
+grid of the `quantize_q8_1` launch that precedes each `mul_mat_vec_q`, so no
+model-order assumption is needed; the join also asserts that both engines run
+the same number of operations per step for each signature.
 
 Add `scripts/decode_compare.sh`: it runs `yuuka bench` and `llama-bench` at
 128/512/2048 prompt tokens with the flags of the [protocol](#environment-and-protocol),
