@@ -777,6 +777,21 @@ a 64-token prompt with the top-1 token unchanged; that is the same magnitude as
 changing the KV storage format from F32 to F16 on the tiled kernel (0.011 on the
 same prompt), which is the accuracy regime the current route runs in.
 
+#### Split-key F16 prefill
+
+On gfx1151 the gated F16 path with 256-wide heads and four query heads per
+KV head supports a four-way key split for 512, 1024 and 2048 query rows in
+the measured window from position 6144 through token 8191. The executor
+uses the current position with the cached plan. Short prefixes and the
+single-query output tail use direct attention.
+
+A score-only pass over the leading 512 keys supplies a starting maximum
+for the later ranges. Each range keeps its own online FP32 maximum, sum
+and value accumulator. A wave merges the records for each row and head,
+then applies the output gate. ABI 8 binds the optional FP32 records and
+prefix maxima in slot 6. The plan reuses this scratch across layers on
+the same stream. [Split-key acceptance](prefill-optimization/acceptance/07-long-attention.md)
+
 The earlier group-of-four tiled kernel (`attention_prefill_paged_gqa_f32_kernel`)
 is removed: the MMA kernel serves the same group at every shape the tiled kernel
 won on, so keeping it would have left a slower path behind a silent condition.
@@ -785,12 +800,11 @@ Current limits:
 
 - Q8_0 KV is supported but not faster than F32 at short context; its benefit is
   cache memory.
-- The tiled fallback runs one workgroup per head; split-KV is not implemented.
-  It is 6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic, which is why
+- The tiled fallback runs one workgroup per head and is
+  6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic, which is why
   Q8_0 pools and short chunks keep the long-context gap.
-- The MMA kernel splits the value dimension across the four waves of a
-  workgroup only through the accumulator layout, not across workgroups, so a
-  16-row query tile is the smallest unit of parallelism.
+- Direct MMA uses 16-row query tiles. Split-key MMA adds parallel workgroups
+  over key ranges with the same query tile.
 - No mixed prefill/decode batch. Each step belongs to one request plan.
 - Block-table entries are immutable for a request; all blocks are allocated at
   admission, so replay and kernels never observe a changing table.

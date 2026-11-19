@@ -14,6 +14,7 @@ reference build, and comparison conditions.
 - [Iteration 4b prepared GDN](04b-gdn.md) — Recurrence preparation, lane mapping and state comparison.
 - [Iteration 5 FFN fusion](05-ffn-fusion.md) — Fused SwiGLU quantization, paired gate/up trial and full FFN timings.
 - [Iteration 6 final query](06-final-query.md) — Final-layer cache writes, displaced query and complete prompt comparison.
+- [Iteration 7 long attention](07-long-attention.md) — Split-key profiling, long-prompt numerics and the chunk sweep.
 
 ## Progress
 
@@ -26,5 +27,5 @@ reference build, and comparison conditions.
 | 4b | Reduce GDN input preparation and synchronization | Accepted |
 | 5 | Fuse SwiGLU with down-input quantization and evaluate paired gate/up | Accepted |
 | 6 | Crop the last-layer query after writing K/V | Accepted |
-| 7 | Split long-prefix attention and repeat the chunk sweep | Pending |
+| 7 | Split long-prefix attention and repeat the chunk sweep | Accepted |
 | 8 | Compare the four prompt lengths using identical inputs and output requirements | Pending |

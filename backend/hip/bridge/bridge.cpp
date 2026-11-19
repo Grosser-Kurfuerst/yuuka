@@ -1045,6 +1045,27 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
         !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small");
     }
+    const uint32_t split_flag = op.flags & YUUKA_OP_FLAG_PREFILL_SPLIT_MASK;
+    if (op.buf[6] != nullptr) {
+        if (dtype != YUUKA_DTYPE_F16 || head_dim != 256 || heads / kv_heads != 4 ||
+            op.u[3] != 0 ||
+            (op.flags & (YUUKA_OP_FLAG_PREFILL_BLAS | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED)) != 0) {
+            return fail(YUUKA_ERR_UNSUPPORTED, "split attention requires gated F16 GQA with head width 256");
+        }
+        uint64_t bytes = 0;
+        if (__builtin_mul_overflow(heads, rows, &bytes) || bytes > INT32_MAX ||
+            __builtin_mul_overflow(bytes, (4 * (head_dim + 2) + 1) * sizeof(float), &bytes) ||
+            op.off[6] % sizeof(float) != 0 || !buffer_range_ok(op.buf[6], op.off[6], bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "split attention scratch is too small or unaligned");
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (op.buf[6] == op.buf[i]) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "split attention scratch aliases buffer %d", i);
+            }
+        }
+    } else if (split_flag != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "forced split attention requires scratch");
+    }
     if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0) {
         if (dtype != YUUKA_DTYPE_F16 || op.u[3] != 0 || (op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_BLAS)) != 0) {
             return fail(YUUKA_ERR_UNSUPPORTED, "BLAS attention requires gated F16 KV");
@@ -1064,7 +1085,8 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
             !buffer_range_ok(op.buf[5], 0, scratchBytes)) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "BLAS attention scratch too small");
         }
-    } else if ((op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED)) != 0u) {
+    } else if ((op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED |
+                             YUUKA_OP_FLAG_PREFILL_SPLIT_MASK)) != 0u) {
         return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged attention flags");
     }
     return YUUKA_OK;
@@ -2040,12 +2062,18 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                 // the parent chunk's WMMA preference.
                 const bool prefer_wmma = (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) == 0 &&
                     yuuka::attention_wmma_preferred(int(rows + op.n[5]), int(position));
-                yuuka::launch_attention_prefill_paged_f32(
+                const uint32_t split_flag = op.flags & YUUKA_OP_FLAG_PREFILL_SPLIT_MASK;
+                const int forced_splits = split_flag == 0 ? 0 : 1 << ((split_flag >> 3) - 1);
+                const hipError_t error = yuuka::launch_attention_prefill_paged_f32(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
                     op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
                     int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
-                    int(first), op.f[0], op.u[2], int(op.u[3]), prefer_wmma, stream);
+                    int(first), op.f[0], op.u[2], int(op.u[3]), prefer_wmma,
+                    op_ptr<float>(op, 6), forced_splits, stream);
+                if (error != hipSuccess) {
+                    return fail(YUUKA_ERR_DEVICE, "split prefill attention: %s", hip_error(error));
+                }
             }
             break;
         }

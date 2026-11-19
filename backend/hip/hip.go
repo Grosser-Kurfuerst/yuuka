@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 7
+const RequiredABI = 8
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -1487,16 +1487,27 @@ func (p *Plan) AddAttentionPrefillPagedTiledFormatAt(q *Buffer, qOff uint64, kPo
 // execution position plus displacement. It preserves dispatch for the parent
 // chunk of displacement+rows and can force the scalar tiled implementation.
 func (p *Plan) AddAttentionPrefillPagedOffsetFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, tiled bool) error {
-	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
+	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table, nil,
 		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, displacement, false, tiled)
 }
 
+// AddAttentionPrefillPagedSplitFormatAt appends gated F16 attention with
+// scratch for up to four FP32 key ranges. The native launcher selects the
+// split count using the position supplied to Execute.
+func (p *Plan) AddAttentionPrefillPagedSplitFormatAt(q, kPool, vPool, out, table, partial *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	if partial == nil {
+		return errors.New("hip: split attention scratch is nil")
+	}
+	return p.addAttentionPrefillPagedFlag(q, 0, kPool, vPool, out, 0, table, partial,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, tensor.F16, 0, false, false)
+}
+
 func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
-	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
+	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table, nil,
 		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, 0, dense, false)
 }
 
-func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, dense, tiled bool) error {
+func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, partial *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, dense, tiled bool) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
 		kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity {
@@ -1517,6 +1528,12 @@ func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool
 	op.buf[2] = vPool.ptr
 	op.buf[3] = out.ptr
 	op.buf[4] = table.ptr
+	if partial != nil {
+		if err := p.check(partial); err != nil {
+			return err
+		}
+		op.buf[6] = partial.ptr
+	}
 	op.off[0] = C.uint64_t(qOff)
 	op.off[3] = C.uint64_t(outOff)
 	op.n[0] = C.uint64_t(kvHeads)

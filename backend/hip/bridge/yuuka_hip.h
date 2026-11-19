@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 7
+#define YUUKA_HIP_ABI_VERSION 8
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -147,6 +147,11 @@ typedef enum yuuka_op_code {
 // Forces the tiled paged prefill attention kernel where the FP16 MMA kernel
 // would otherwise be selected. Validation and measurement only.
 #define YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED 0x4u
+// These values are mutually exclusive choices in the split-count field.
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_MASK 0x18u
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_1 0x08u
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_2 0x10u
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_4 0x18u
 
 /* GEMM implementation selection carried in yuuka_op.u[1]. AUTO uses the
  * compiled default for the dtype. BLAS is the rocBLAS route and requires FP16
@@ -376,6 +381,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 block table; flags bit 1 enables experimental
  *                           BLAS F16 KV path with buf5 FP16 scratch;
+ *                           optional buf6 holds split-key FP32 scratch
+ *                           with four [rows,heads,head_dim+2] records and
+ *                           one [rows,heads] prefix maximum array;
  *                           n={kv_heads,heads,head_dim,kv_dim,rows,displacement};
  *                           first query position is execute position plus
  *                           displacement tokens;

@@ -130,6 +130,8 @@ The [FFN fusion comparison](prefill-optimization/acceptance/05-ffn-fusion.md)
 records the isolated quantizer check, complete FFN time and prompt rates.
 The [final query crop comparison](prefill-optimization/acceptance/06-final-query.md)
 records K/V equivalence, output work per chunk and the resulting prompt rates.
+The [long attention comparison](prefill-optimization/acceptance/07-long-attention.md)
+records split-key numerics, merge costs, scratch and the 8K chunk sweep.
 
 ## Decode: output length
 

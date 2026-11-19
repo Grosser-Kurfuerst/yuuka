@@ -6,6 +6,10 @@ The last 512 rows alone cost 127.3 vs 86.1 ms. The latter figures include
 the upstream partial-result merge. Re-measure after final-layer cropping
 because it changes the number of query rows.
 
+The [iteration 7 record](acceptance/07-long-attention.md) gives the selected
+dispatch, prefix maximum preparation and actual scratch usage. The steps below
+describe the initial independent-range experiment.
+
 ## Split the key range for long prefixes
 
 1. **Keep the short-prefix kernel as the control.** Start from

@@ -1511,6 +1511,95 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
+bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
+                                  yuuka_event * event, std::mt19937 & rng,
+                                  int position) {
+    constexpr int rows = 17, heads = 16, kv_heads = 4, head_dim = 256;
+    constexpr int kv_dim = kv_heads * head_dim, block_size = 16;
+    const int capacity = position + rows;
+    const int blocks = (capacity + block_size - 1) / block_size;
+    constexpr size_t outputs = rows * heads * head_dim;
+    constexpr size_t scratch_bytes = rows * heads * (4 * (head_dim + 2) + 1) * sizeof(float);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> query(2 * outputs);
+    for (float & x : query) x = dist(rng);
+    std::vector<uint16_t> key(size_t(blocks) * block_size * kv_dim), value(key.size());
+    for (uint16_t & x : key) x = float_to_half(dist(rng));
+    for (uint16_t & x : value) x = float_to_half(dist(rng));
+    std::vector<int32_t> table(static_cast<size_t>(blocks));
+    for (int i = 0; i < blocks; ++i) table[i] = blocks - i - 1;
+    Buffer qb, kb, vb, ob, tb, sb, short_scratch;
+    bool ok = alloc(device, qb, query.size() * sizeof(float)) &&
+              alloc(device, kb, key.size() * sizeof(uint16_t)) &&
+              alloc(device, vb, value.size() * sizeof(uint16_t)) &&
+              alloc(device, ob, outputs * sizeof(float)) &&
+              alloc(device, tb, table.size() * sizeof(int32_t)) &&
+              alloc(device, sb, scratch_bytes) &&
+              alloc(device, short_scratch, scratch_bytes - 1) &&
+              upload_vec(qb, query) && upload_vec(kb, key) && upload_vec(vb, value) &&
+              upload_vec(tb, table);
+    const auto run = [&](uint32_t flag, std::vector<float> & out) {
+        yuuka_plan * plan = nullptr;
+        if (!check(yuuka_plan_create(device, &plan), "split attention plan")) return false;
+        yuuka_op op{};
+        op.code = YUUKA_OP_ATTENTION_PREFILL_PAGED;
+        op.flags = flag;
+        op.buf[0] = qb.buf;
+        op.buf[1] = kb.buf;
+        op.buf[2] = vb.buf;
+        op.buf[3] = ob.buf;
+        op.buf[4] = tb.buf;
+        op.n[0] = kv_heads;
+        op.n[1] = heads;
+        op.n[2] = head_dim;
+        op.n[3] = kv_dim;
+        op.n[4] = rows;
+        op.u[0] = block_size;
+        op.u[1] = capacity;
+        op.u[2] = YUUKA_DTYPE_F16;
+        op.f[0] = 1.0f / std::sqrt(float(head_dim));
+        bool success = true;
+        if (flag != 0) {
+            success = yuuka_plan_add(plan, &op) == YUUKA_ERR_INVALID_ARGUMENT;
+            op.buf[6] = short_scratch.buf;
+            success = success && yuuka_plan_add(plan, &op) == YUUKA_ERR_INVALID_ARGUMENT;
+            op.buf[6] = sb.buf;
+            op.off[6] = 1;
+            success = success && yuuka_plan_add(plan, &op) == YUUKA_ERR_INVALID_ARGUMENT;
+            op.off[6] = 0;
+        }
+        success = success && check(yuuka_plan_add(plan, &op), "add split attention") &&
+            execute(plan, stream, event, position) && download_vec(ob, out);
+        if (success && flag == YUUKA_OP_FLAG_PREFILL_SPLIT_4 && position == 0) {
+            float empty[head_dim + 2] = {};
+            success = check(yuuka_memcpy_d2h(empty, sb.buf, sizeof(empty)), "empty attention partial") &&
+                empty[0] == -INFINITY;
+            for (int i = 1; i < head_dim + 2; ++i) success = success && empty[i] == 0.0f;
+        }
+        yuuka_plan_destroy(plan);
+        return success;
+    };
+    std::vector<float> control(outputs), got(outputs), repeated(outputs);
+    ok = ok && run(0, control);
+    int splits = 1;
+    for (uint32_t flag : {YUUKA_OP_FLAG_PREFILL_SPLIT_1, YUUKA_OP_FLAG_PREFILL_SPLIT_2,
+                          YUUKA_OP_FLAG_PREFILL_SPLIT_4}) {
+        if (!ok) break;
+        ok = run(flag, got) && run(flag, repeated) && got == repeated;
+        double max_abs = 0.0;
+        for (size_t i = 0; i < outputs && ok; ++i) {
+            const double diff = std::fabs(double(got[i]) - control[i]);
+            ok = std::isfinite(diff) && diff <= 5e-3 * (1.0 + std::fabs(control[i]));
+            max_abs = std::max(diff, max_abs);
+        }
+        std::printf("split attention position=%d splits=%d: %s (max abs %.3g)\n",
+                    position, splits, ok ? "ok" : "FAILED", max_abs);
+        splits *= 2;
+    }
+    for (Buffer * buf : {&qb, &kb, &vb, &ob, &tb, &sb, &short_scratch}) release(*buf);
+    return ok;
+}
+
 enum class RecurrentPath { PerToken, Chunkwise, Prepared };
 
 bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
@@ -1913,6 +2002,8 @@ int main() {
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
     ok = test_attention_prefill_mma(device, stream, event, rng) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 0) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 270) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::PerToken) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::Chunkwise) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 64, RecurrentPath::PerToken) && ok;

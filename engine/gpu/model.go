@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
@@ -40,27 +41,28 @@ type activations struct {
 }
 
 type prefillActivations struct {
-	attentionBlas *hip.Buffer
-	x             *hip.Buffer
-	norm          *hip.Buffer
-	q             *hip.Buffer
-	k             *hip.Buffer
-	v             *hip.Buffer
-	attn          *hip.Buffer
-	tmp           *hip.Buffer
-	qkv           *hip.Buffer
-	z             *hip.Buffer
-	beta          *hip.Buffer
-	alpha         *hip.Buffer
-	conv          *hip.Buffer
-	gdnNorm       *hip.Buffer
-	ffnGate       *hip.Buffer
-	ffnUp         *hip.Buffer
-	xF16          *hip.Buffer
-	yF16          *hip.Buffer
-	xQ8           *hip.Buffer
-	xDS           *hip.Buffer
-	tokens        *hip.Buffer
+	attentionBlas  *hip.Buffer
+	attentionSplit *hip.Buffer
+	x              *hip.Buffer
+	norm           *hip.Buffer
+	q              *hip.Buffer
+	k              *hip.Buffer
+	v              *hip.Buffer
+	attn           *hip.Buffer
+	tmp            *hip.Buffer
+	qkv            *hip.Buffer
+	z              *hip.Buffer
+	beta           *hip.Buffer
+	alpha          *hip.Buffer
+	conv           *hip.Buffer
+	gdnNorm        *hip.Buffer
+	ffnGate        *hip.Buffer
+	ffnUp          *hip.Buffer
+	xF16           *hip.Buffer
+	yF16           *hip.Buffer
+	xQ8            *hip.Buffer
+	xDS            *hip.Buffer
+	tokens         *hip.Buffer
 }
 
 // Options configures a shared GPU model and its KV pool.
@@ -401,6 +403,19 @@ func (m *Model) configurePrefill(rows int) error {
 		{&p.tokens, uint64(rows) * 4},
 	}
 	p.attentionBlas = nil
+	p.attentionSplit = nil
+	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
+	measuredRows := rows == 512 || rows == 1024 || rows == 2048
+	if arch == "gfx1151" && measuredRows && m.capacity >= 6144+512 &&
+		m.kvType == tensor.F16 && cfg.HeadDim == 256 && cfg.HeadCount == 4*cfg.KVHeadCount &&
+		!m.forceTiledAttention {
+		values := 4*(cfg.HeadDim+2) + 1
+		bytes := uint64(rows) * uint64(cfg.HeadCount) * uint64(values) * 4
+		entries = append(entries, struct {
+			dst   **hip.Buffer
+			bytes uint64
+		}{&p.attentionSplit, bytes})
+	}
 	m.attentionBlasEnabled = m.attentionBlasCapable
 	if m.attentionBlasEnabled {
 		// Per-chunk reusable FP16 Q/K/V, attention-score, and PV matrices.

@@ -228,13 +228,19 @@ void launch_attention_prefill_paged_wmma_f32(
     int head_dim, int kv_dim, int rows, int position, float scale,
     uint32_t dtype, int dense, hipStream_t stream);
 
-void launch_attention_prefill_paged_f32(float * out, const float * q,
+hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
                                         const void * k_pool, const void * v_pool,
                                         const int32_t * block_table, int block_size,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        bool prefer_wmma, hipStream_t stream);
+                                        bool prefer_wmma, float * partial, int forced_splits,
+                                        hipStream_t stream);
+
+hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q,
+        const void * k_pool, const void * v_pool, const int32_t * block_table,
+        int block_size, int kv_heads, int heads, int kv_dim, int rows,
+        int position, float scale, float * partial, int splits, hipStream_t stream);
 // Experimental GEMM-based attention with gathered FP16 KV, batched QK/PV
 // matrix multiplication, causal softmax, and gated final FP32 output.
 int launch_attention_prefill_paged_blas_f16(

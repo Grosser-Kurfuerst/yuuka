@@ -886,23 +886,35 @@ void launch_kv_write_paged_dynamic_f32(void * k_pool, void * v_pool,
         k_pool, v_pool, k, v, rows, kv_dim, block_table, dynamic, block_size, dtype);
 }
 
-void launch_attention_prefill_paged_f32(float * out, const float * q,
+hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
                                         const void * k_pool, const void * v_pool,
                                         const int32_t * block_table, int block_size,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        bool prefer_wmma, hipStream_t stream) {
+                                        bool prefer_wmma, float * partial, int forced_splits,
+                                        hipStream_t stream) {
     if (rows <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
         block_size <= 0) {
-        return;
+        return hipSuccess;
+    }
+    if (partial != nullptr) {
+        const bool measured_rows = rows == 512 || rows == 1024 || rows == 2048;
+        const int measured_splits = measured_rows && position >= 6144 &&
+            position + rows <= 8192 ? 4 : 0;
+        const int splits = forced_splits != 0 ? forced_splits : measured_splits;
+        if (splits != 0) {
+            return launch_attention_prefill_paged_split_f16(
+                out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
+                kv_dim, rows, position, scale, partial, splits, stream);
+        }
     }
     if (prefer_wmma &&
         attention_wmma_supported(heads, kv_heads, head_dim, block_size, dtype)) {
         launch_attention_prefill_paged_wmma_f32(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
             head_dim, kv_dim, rows, position, scale, dtype, dense, stream);
-        return;
+        return hipSuccess;
     }
     const int vec = (head_dim + 31) / 32;
     const size_t shared =
@@ -918,6 +930,7 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
             head_dim, kv_dim, rows, position, scale, dtype);
     }
+    return hipSuccess;
 }
 
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
