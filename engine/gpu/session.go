@@ -273,7 +273,7 @@ func (s *Session) PrefillLogits(tokens []int32) ([][]float32, error) {
 			_ = s.logitsPlan.Close()
 			s.logitsPlan = nil
 		}
-		plan, err := s.model.buildPrefillPlan(s, len(tokens), true)
+		plan, err := s.model.buildPrefillPlan(s, len(tokens), prefillAllLogits)
 		if err != nil {
 			return nil, err
 		}
@@ -334,7 +334,7 @@ func (s *Session) prefillPlan(rows int) (*hip.Plan, error) {
 	if plan, ok := s.prefillPlans[rows]; ok {
 		return plan, nil
 	}
-	plan, err := s.model.buildPrefillPlan(s, rows, false)
+	plan, err := s.model.buildPrefillPlan(s, rows, prefillLastLogit)
 	if err != nil {
 		return nil, err
 	}

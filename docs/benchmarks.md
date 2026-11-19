@@ -119,6 +119,9 @@ compare the LM head stage against.
 The [Q4_K FFN specialization acceptance](prefill-optimization/acceptance/02-q4-ffn.md)
 records the 2026-11-19 gfx1151 prefill comparison using F16 KV,
 including isolated MMQ, complete FFN and prompt-length medians.
+The [final FFN acceptance](prefill-optimization/acceptance/03-final-ffn.md)
+records the next F16 KV comparison, with one FFN row in the ordinary
+prefill output tail.
 
 ## Decode: output length
 

@@ -9,6 +9,7 @@ reference build, and comparison conditions.
 
 - [Iteration 1 baseline](01-baseline.md) — Fixed-chunk throughput, 8K chunk sweep, and GPU verification.
 - [Iteration 2 Q4_K FFN projection](02-q4-ffn.md) — Isolated MMQ candidates, CPU comparison, and pp512 A/B.
+- [Iteration 3 final FFN](03-final-ffn.md) — Output-tail compaction, logits and cache equivalence, and the whole-prompt timings.
 
 ## Progress
 
@@ -16,7 +17,7 @@ reference build, and comparison conditions.
 | --- | --- | --- |
 | 1 | Reproduce the pre-optimization baseline | Accepted |
 | 2 | Specialize the Q4_K FFN projection | Accepted |
-| 3 | Crop the last-layer FFN | Pending |
+| 3 | Crop the last-layer FFN | Accepted |
 | 4a | Extend measured MMQ improvements to additional shapes | Pending |
 | 4b | Reduce GDN input preparation and synchronization | Pending |
 | 5 | Fuse SwiGLU with down-input quantization and evaluate paired gate/up | Pending |

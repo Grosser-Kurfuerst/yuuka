@@ -3,9 +3,10 @@
 In the measured model the 32nd and final block uses full attention. Earlier
 layers produce hidden rows needed by later layers. In the final layer,
 future decode steps need the complete K/V history, while ordinary generation
-needs the output for the last prompt row only. Today `buildPrefillPlan`
-places `MarkTail` after every layer's FFN. At chunk 512 the final FFN alone
-cost 4.9 ms at pp512. At 8K the last layer's attention through its FFN
+needs the output for the last prompt row only. Before iteration 3,
+`buildPrefillPlan` placed `MarkTail` after the final layer's FFN.
+With chunk 512 that FFN alone cost 4.9 ms at pp512. At 8K the last
+layer's attention through its FFN
 residual cost about **188 ms across the first 15 nonfinal chunks**. This
 includes their FFNs. Remeasure the end-to-end saving after cropping.
 [Layer loop](../../engine/gpu/plan.go#L376) · [Session execution](../../engine/gpu/session.go#L218)
@@ -23,6 +24,10 @@ Use the existing general graph for other last-layer types and the all-logits
 plan. [Layer selection](../../model/qwen35/config.go#L280) · [Speculative path](../../engine/gpu/session.go#L246)
 
 ## Step 1. Move the final FFN into the output tail
+
+The implementation uses the parent chunk's projection routes. The
+[iteration 3 record](acceptance/03-final-ffn.md) compares both arithmetic
+options and gives the numerical and performance results.
 
 1. In `buildPrefillPlan`, run the last layer's attention and residual as
    today. For ordinary generation, mark its subsequent FFN and output ops

@@ -676,12 +676,26 @@ func (p *Plan) Add(x, delta *Buffer, n int64) error {
 }
 
 func (p *Plan) AddCopy(dst, src *Buffer, n int64) error {
+	return p.AddCopyAt(dst, 0, src, 0, n)
+}
+
+// AddCopyAt appends an FP32 copy at byte offsets. Ranges in the same buffer
+// must be disjoint or identical.
+func (p *Plan) AddCopyAt(dst *Buffer, dstOff uint64, src *Buffer, srcOff uint64, n int64) error {
 	if err := p.check(dst, src); err != nil {
 		return err
+	}
+	if n <= 0 || dstOff%4 != 0 || srcOff%4 != 0 {
+		return errors.New("hip: invalid FP32 copy count or offset")
+	}
+	if dst.ptr == src.ptr && dstOff != srcOff && uint64(n) > (max(dstOff, srcOff)-min(dstOff, srcOff))/4 {
+		return errors.New("hip: overlapping FP32 copy ranges")
 	}
 	op := C.yuuka_op{code: C.YUUKA_OP_COPY}
 	op.buf[0] = dst.ptr
 	op.buf[1] = src.ptr
+	op.off[0] = C.uint64_t(dstOff)
+	op.off[1] = C.uint64_t(srcOff)
 	op.n[0] = C.uint64_t(n)
 	return p.add(op)
 }

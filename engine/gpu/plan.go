@@ -12,7 +12,13 @@ import (
 // prefillMatmul appends the measured implementation for one prefill matmul.
 func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
 	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64) error {
-	switch hip.SelectPrefillPath(w.dtype, rows, nIn, nOut) {
+	return m.prefillMatmulPath(plan, w, x, xOff, out, outOff, nIn, nOut, rows,
+		hip.SelectPrefillPath(w.dtype, rows, nIn, nOut))
+}
+
+func (m *Model) prefillMatmulPath(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
+	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64, path hip.PrefillPath) error {
+	switch path {
 	case hip.PrefillBatchedGemv:
 		return plan.AddGemvBatchAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
 	case hip.PrefillBLAS:
@@ -352,8 +358,16 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	return plan.Add(m.act.x, m.act.tmp, hidden)
 }
 
+type prefillOutput uint8
+
+const (
+	prefillLastLogit prefillOutput = iota
+	prefillAllLogits
+	prefillLastLogitFullFFN // Full-row reference for correctness comparisons.
+)
+
 // buildPrefillPlan constructs the chunked prompt graph for one session.
-func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Plan, error) {
+func (m *Model) buildPrefillPlan(s *Session, rows int, outputMode prefillOutput) (*hip.Plan, error) {
 	plan, err := m.device.NewPlan()
 	if err != nil {
 		return nil, err
@@ -361,6 +375,8 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 	cfg := m.config
 	p := &m.prefill
 	rows64 := int64(rows)
+	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
+	crop := outputMode == prefillLastLogit && cfg.BlockCount > 0 && !cfg.IsRecurrent(cfg.BlockCount-1)
 	embedding, err := m.weight("token_embd.weight")
 	if err != nil {
 		return nil, err
@@ -392,11 +408,26 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 				return nil, err
 			}
 		}
-		if err := m.addPrefillFFN(plan, prefix, postNorm, rows64); err != nil {
+		ffnRows := rows64
+		if crop && i == cfg.BlockCount-1 {
+			// Full attention has already written all K/V rows. The final
+			// FFN's only consumer is the requested last prompt logit.
+			plan.MarkTail()
+			if rows > 1 {
+				if err := plan.AddCopyAt(p.x, 0, p.x, lastOff, int64(cfg.HiddenSize)); err != nil {
+					return nil, err
+				}
+			}
+			ffnRows, lastOff = 1, 0
+		}
+		// Preserve the parent chunk's projection arithmetic for the compact row.
+		if err := m.addPrefillFFN(plan, prefix, postNorm, ffnRows, rows64); err != nil {
 			return nil, err
 		}
 	}
-	plan.MarkTail()
+	if !crop {
+		plan.MarkTail()
+	}
 	outputNorm, err := m.weight("output_norm.weight")
 	if err != nil {
 		return nil, err
@@ -409,7 +440,7 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 	if err != nil {
 		return nil, err
 	}
-	if allLogits {
+	if outputMode == prefillAllLogits {
 		if rows > maxSpecDraft {
 			return nil, fmt.Errorf("gpu: speculative logits rows %d exceed %d", rows, maxSpecDraft)
 		}
@@ -437,7 +468,6 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 		}
 		return plan, nil
 	}
-	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
 	if err := plan.AddRMSNormAt(p.x, lastOff, outputNorm.buf, p.norm, 0,
 		int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
 		return nil, err
@@ -650,7 +680,7 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 	return plan.Add(p.x, p.tmp, rows*hidden)
 }
 
-func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows int64) error {
+func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows, dispatchRows int64) error {
 	cfg := m.config
 	p := &m.prefill
 	gate, err := m.weight(prefix + "ffn_gate.weight")
@@ -674,8 +704,8 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 	// Fuse the gate/up pair when both matmuls select the custom WMMA path.
 	// The fused kernel shares one activation tile and applies SwiGLU in the
 	// epilogue, so neither intermediate is written.
-	gatePath := hip.SelectPrefillPath(gate.dtype, rows, hidden, ffn)
-	upPath := hip.SelectPrefillPath(up.dtype, rows, hidden, ffn)
+	gatePath := hip.SelectPrefillPath(gate.dtype, dispatchRows, hidden, ffn)
+	upPath := hip.SelectPrefillPath(up.dtype, dispatchRows, hidden, ffn)
 	fused := gate.dtype == up.dtype && gatePath == hip.PrefillWMMA
 	if fused {
 		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, p.norm, 0,
@@ -695,10 +725,10 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 			return err
 		}
 	} else {
-		if err := m.prefillMatmul(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows); err != nil {
+		if err := m.prefillMatmulPath(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows, gatePath); err != nil {
 			return err
 		}
-		if err := m.prefillMatmul(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows); err != nil {
+		if err := m.prefillMatmulPath(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows, upPath); err != nil {
 			return err
 		}
 	}
@@ -707,7 +737,8 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 			return err
 		}
 	}
-	if err := m.prefillMatmul(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows); err != nil {
+	downPath := hip.SelectPrefillPath(down.dtype, dispatchRows, ffn, hidden)
+	if err := m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath); err != nil {
 		return err
 	}
 	return plan.Add(p.x, p.tmp, rows*hidden)
