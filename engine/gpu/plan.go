@@ -27,6 +27,8 @@ func (m *Model) prefillMatmulPath(plan *hip.Plan, w weight, x *hip.Buffer, xOff 
 	switch path {
 	case hip.PrefillBatchedGemv:
 		return plan.AddGemvBatchAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
+	case hip.PrefillStreaming:
+		return plan.AddLMHeadAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
 	case hip.PrefillBLAS:
 		if err := plan.AddCastF16At(x, xOff, m.prefill.xF16, 0, rows*nIn); err != nil {
 			return err

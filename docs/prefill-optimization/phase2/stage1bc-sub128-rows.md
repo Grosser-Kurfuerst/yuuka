@@ -1,9 +1,11 @@
 # Stage 1b/1c: Sub-128-row projections and GDN preparation
 
 > **Status:** Instrumentation landed in `b833b4e` and **Step 1c landed in `260094f`**
-> ([Stage 1c acceptance](acceptance/03-sub128-gdn.md)). **Step 1b is blocked on
-> numerical acceptance** and has not landed
-> ([Stage 1b trial record](acceptance/04-sub128-projections.md)).
+> ([Stage 1c acceptance](acceptance/03-sub128-gdn.md)). **Step 1b-1** uses FP32
+> streaming for eligible K-quant projections through 16 rows. See the
+> [accepted implementation](acceptance/04a-streaming-short-tails.md).
+> The short Q8_1 MMQ route described below is a rejected trial.
+> Step 1b-2 covers FP16 WMMA for 17–127 rows.
 
 Implementation plan for Steps 1b and 1c of the
 [Phase 2 roadmap](roadmap.md#stage-1-p1-eliminate-prompt-length-and-tail-chunk-cliffs-4-independent-steps).

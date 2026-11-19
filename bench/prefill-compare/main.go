@@ -26,6 +26,7 @@ import (
 type config struct {
 	model, tokens, logits               string
 	prompt, chunk, warmups, repetitions int
+	greedySteps                         int
 	writeTokens                         bool
 }
 
@@ -38,6 +39,7 @@ func main() {
 	flag.IntVar(&cfg.chunk, "chunk", 512, "maximum prefill rows")
 	flag.IntVar(&cfg.warmups, "warmup", 2, "untimed repetitions")
 	flag.IntVar(&cfg.repetitions, "reps", 5, "timed repetitions")
+	flag.IntVar(&cfg.greedySteps, "greedy-steps", 0, "report this many decode top-1 tokens after the prefill top-1")
 	flag.BoolVar(&cfg.writeTokens, "write-tokens", false, "tokenize the fixed benchmark prompt into the token file")
 	flag.Parse()
 	if err := run(cfg); err != nil {
@@ -48,7 +50,8 @@ func main() {
 
 func run(cfg config) (err error) {
 	if cfg.model == "" || cfg.tokens == "" || cfg.prompt <= 0 || cfg.prompt > math.MaxInt32-64 ||
-		cfg.chunk <= 0 || cfg.chunk > 4096 || cfg.warmups < 0 || cfg.repetitions <= 0 {
+		cfg.chunk <= 0 || cfg.chunk > 4096 || cfg.warmups < 0 || cfg.repetitions <= 0 ||
+		cfg.greedySteps < 0 || cfg.greedySteps > 64 {
 		return errors.New("invalid benchmark arguments")
 	}
 	reader, err := gguf.Open(cfg.model)
@@ -125,18 +128,28 @@ func run(cfg config) (err error) {
 			samples = append(samples, elapsed.Nanoseconds())
 		}
 	}
-	top := 0
-	for i, value := range logits {
-		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			return fmt.Errorf("nonfinite logit at position %d", i)
-		}
-		if value > logits[top] {
-			top = i
-		}
+	top, err := logitTop(logits)
+	if err != nil {
+		return err
 	}
 	if cfg.logits != "" {
 		if err := writeBinary(cfg.logits, logits); err != nil {
 			return err
+		}
+	}
+	var greedy []int
+	if cfg.greedySteps > 0 {
+		greedy = append(greedy, top)
+		for range cfg.greedySteps {
+			logits, err = session.Decode(int32(greedy[len(greedy)-1]))
+			if err != nil {
+				return err
+			}
+			token, err := logitTop(logits)
+			if err != nil {
+				return err
+			}
+			greedy = append(greedy, token)
 		}
 	}
 	return json.NewEncoder(os.Stdout).Encode(struct {
@@ -145,7 +158,21 @@ func run(cfg config) (err error) {
 		Warmups   int     `json:"warmup"`
 		Top       int     `json:"top1"`
 		SamplesNS []int64 `json:"samples_ns"`
-	}{cfg.prompt, chunk, cfg.warmups, top, samples})
+		Greedy    []int   `json:"greedy,omitempty"`
+	}{cfg.prompt, chunk, cfg.warmups, top, samples, greedy})
+}
+
+func logitTop(logits []float32) (int, error) {
+	top := 0
+	for i, value := range logits {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return 0, fmt.Errorf("nonfinite logit at position %d", i)
+		}
+		if value > logits[top] {
+			top = i
+		}
+	}
+	return top, nil
 }
 
 func writeBinary(path string, data any) error {

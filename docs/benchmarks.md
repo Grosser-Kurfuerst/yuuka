@@ -80,7 +80,7 @@ Current tree, same commit:
 | --- | --- |
 | `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE) | 9 / 9 pass |
 | `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
-| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00309944`, greedy tokens match |
+| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00004673` with [short-chunk FP32 streaming](prefill-optimization/phase2/acceptance/04a-streaming-short-tails.md), greedy tokens match |
 | `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.9e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
 | `tests/hip/prefill_test.cpp` LM head checks | every dtype within `1.3e-4` of the host dot products for 1/3/16 rows, bitwise reproducible |
 | `TestPlanLMHeadMatchesDequant` | Q8_0 bitwise equal to the dequantized CPU dot; Q6_K within `2e-6` |

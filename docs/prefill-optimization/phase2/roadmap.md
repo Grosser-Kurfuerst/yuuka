@@ -149,7 +149,7 @@ next and isolates numerical changes:
 | **1** | **Step 1a** (`rows >= 128` Direct MMQ) | [stage1a-direct-rows.md](stage1a-direct-rows.md) | **Landed** (`3caea06`, [01](acceptance/01-direct-rows.md)) | Removes the `{128, 512, 2048}` cliff (`128 -> 129` `+45.92 ms` projections) and adds the row-masking mechanism in Direct MMQ that Step 1b later reuses for `<128` rows. |
 | **2** | **Steps 5a & 5b** (prefix-cache `Snapshot` gating & ordering) | [stage5ab-snapshot-critical-path.md](stage5ab-snapshot-critical-path.md) | **Landed** (`6e267d7`, `c09cd06`, [02](acceptance/02-snapshot-critical-path.md)) | Pure Go `serving` change (`~22` production LoC, zero kernel/ABI/numerical risk) pulled ahead of `1c/1b` to eliminate dead/critical-path D2H + logit serialization before benchmarking server SSE TTFT on `1c/1b`. |
 | **3** | **Step 1c** (`rows < 128` GDN crossover) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#31-step-1c-prepared-gdn-below-128-rows) | **Landed** (`b833b4e`, `260094f`, [03](acceptance/03-sub128-gdn.md)) | ~5-line threshold change in `plan.go` (`gdnPreparedMinRows = 2`), byte-identical to control (per Phase 1 `04b-gdn.md`); landing it before `1b` fixes GDN while isolating `1b`'s projection arithmetic changes. |
-| **4** | **Step 1b** (`rows < 128` projection crossover) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#32-step-1b-sub-128-projection-routes) | **Blocked** ([04](acceptance/04-sub128-projections.md)) | Changes projection arithmetic (`PrefillStreaming` FP32 / masked `Q8_1` MMQ) once GDN is fixed; currently blocked on numerical tolerances (`Q8_1` short-chunk drift) and cross-prompt FP32 bounds. |
+| **4** | **Step 1b** (short projection routing) | [Sub-128 projections](stage1bc-sub128-rows.md) | **1b-1 landed**, 1b-2 pending | FP32 streaming accelerates eligible K-quants at 1–16 rows. FP16 WMMA handles the medium short chunks. [Acceptance](acceptance/04a-streaming-short-tails.md) |
 | **5** | **Step 1d** (CLI default chunk re-sweep) | [Stage 1d — CLI chunk policy](stage1d-cli-chunk-policy.md) | Pending (`1b`) | Must run *after* `1a–1c` so the `chunk = 512 / 1024 / 2048` crossover is tuned on the updated tail and sub-128 kernels rather than stale penalties. |
 | **6** | **Stage 2** (`ssm_alpha`/`ssm_beta` `Q8_0`) | [Stage 2 — Narrow Q8_0 projections](stage2-narrow-q8-projections.md) | Pending | Highest remaining per-chunk tax (`6.2–9.3 ms`) once boundary cliffs are gone; Candidate 2a precedes Candidate 2b to keep FP32 gate precision unless 2b is needed. |
 | **7** | **Stage 3** (`Q6_K` Direct WMMA) | [Stage 3 — Direct Q6_K MMQ](stage3-q6k-direct-mmq.md) | Pending | Benefits all arbitrary `>= 128` lengths automatically after Step 1a routes them to Direct MMQ (`9216->2560` first, then `2560->1024`). |
@@ -204,11 +204,10 @@ verified steps:
     `512+18` vs `530`: verify identical greedy top-1 and 3-step continuation, and record
     logit max-abs delta). Projection time on `127`, `512+1`, `512+18`, `600` (`512+88`),
     and `2048+2` drops monotonically with row count.
-  - *Status*: **Blocked on numerical acceptance** (not landed in `HEAD`). Initial `Q8_1`
-    MMQ (`>= 17` rows) candidate exceeded the `0.3` max logit bound (`2.805252` at `127`
-    rows) and pushed `TestGPUAttentionPathsAgree` to `0.495347 > 0.05` at `64` rows; an
-    FP32 streaming-only trial (`<= 16` rows) regressed CPU error on additional Chinese/English
-    `1–2` row inputs. [Stage 1b trial record](acceptance/04-sub128-projections.md)
+  - *Status*: FP32 streaming through 16 rows passed acceptance in Step 1b-1
+    ([record](acceptance/04a-streaming-short-tails.md)). The earlier short Q8_1
+    MMQ candidate remains rejected ([trial](acceptance/04-sub128-projections.md)).
+    Step 1b-2 covers FP16 WMMA for medium short chunks.
 - **Step 1c — Sub-128 GDN preparation crossover**
   ([implementation plan](stage1bc-sub128-rows.md), lands before Step 1b because it is
   expected to be byte-identical):

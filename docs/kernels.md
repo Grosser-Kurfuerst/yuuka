@@ -582,6 +582,7 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 
 | Condition | Selected path |
 | --- | --- |
+| K-quant, `K % 256 == 0`, `N >= 1024`, `1 <= M <= 16` | FP32 streaming matvec |
 | `M < 4` | Batched GEMV |
 | Quantized, `M < 8`, and `K > N` | Batched GEMV |
 | K-quant, `N >= 64`, `M >= 128` | Int8 MMQ (Q8_1 activations, int32 WMMA) |
@@ -593,9 +594,14 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 
 The custom kernel is selected only where the sweep showed it faster than the
 compared baseline, and a library route only where it is both faster and inside
-the numeric gates. The K-quant MMQ row is bounded from below by the Q8_1 pass
-and the 128-token tile (it loses to WMMA below 128 rows) and requires
-`N >= 64` because narrower output tiles waste more than half the tile. It
+the numeric gates. The short K-quant route uses `AddLMHeadAt` and retains
+FP32 activations. For complete 16-row blocks with aligned activations, the
+kernel stages four contiguous floats per load. Its point products and wave
+reduction use the same arithmetic as the scalar staging path.
+See the [short-tail acceptance record](prefill-optimization/phase2/acceptance/04a-streaming-short-tails.md).
+The K-quant MMQ route starts at 128 rows to keep the measured sub-128
+numerical contract. It requires `N >= 64` because narrower output tiles
+waste more than half the tile. It
 replaces the dequantize-plus-rocBLAS route for K-quants entirely: that route was
 2-17% faster on wide shapes at 512 rows but is numerically rejected on tall
 shapes (see 6.2), and it needed an FP16 copy of the weight matrix per call. F16
@@ -710,7 +716,7 @@ uses the same digits to 5.7e-4 relative. `tests/hip/prefill_test.cpp` checks all
 the independent host dot products for one, three, and sixteen rows and requires
 a repeated run to be bitwise identical; `TestPlanLMHeadMatchesDequant` checks
 Q6_K and Q8_0 against dequantized CPU dots (Q8_0 is bitwise equal), and the
-model-level gates are unchanged (`TestGPUMatchesCPU` 0.00309944,
+model-level gates are unchanged (`TestGPUMatchesCPU` 0.00004673,
 `TestGPUChunkedPrefillLongContext` top-1 `33075` with zero difference).
 
 A shape the kernel does not cover keeps the per-row GEMV tail; nothing silently
