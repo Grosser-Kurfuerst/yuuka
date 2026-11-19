@@ -236,6 +236,19 @@ void launch_embedding_dynamic_f32(float * out, const void * weights,
                                   const int32_t * dynamic, uint64_t row_bytes,
                                   int64_t cols, uint32_t dtype, hipStream_t stream);
 
+/* Remapped decode matvec: one wave per output row, sixteen K values per lane,
+ * no shared-memory staging and no barrier inside K. gemv_row_available reports
+ * whether the shape is covered (a 512-value K step and a supported dtype);
+ * the launchers are only valid when it returns true and rows is one. */
+bool gemv_row_available(uint32_t dtype, uint64_t n_in);
+void launch_gemv_row_f32out(float * out, const float * x, const void * w,
+                            const float * res, uint64_t n_in, uint64_t n_out,
+                            uint32_t dtype, hipStream_t stream);
+void launch_gemv_row_pair_f32out(float * out0, float * out1, const float * x,
+                                 const void * w0, const void * w1, uint64_t n_in,
+                                 uint64_t n_out0, uint64_t n_out1, uint32_t dtype,
+                                 int swiglu, hipStream_t stream);
+
 /* Chunked prefill operators. Every row-pointer argument is a contiguous
  * [rows, width] buffer in row-major order. position is the token position of
  * row zero. */

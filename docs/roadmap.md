@@ -7,11 +7,13 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Steps 1-3 have landed: `scripts/decode_compare.sh` regenerates the
-comparison tables, decode attention is split over the key range, which made the
-decode rate flat in context (44.7/44.0/43.8/42.9 t/s for pp128/tg32,
-pp128/tg128, pp512/tg128, pp2048/tg32), and all three KV formats plus the graph
-path take the same kernel. Steps 4-6 are open and step 7 closes the record. This file is a plan, not a record: when a step lands, its
+**Status.** Steps 1-4 have landed. Decode attention is split over the key range,
+so the rate is flat in context, and the decode matvec is remapped to one wave per
+output row: `pp128/tg128` 60.16 t/s (ratio 0.97), `pp512/tg128` 59.74, and
+`pp2048/tg32` 58.16, so both target context points (60 and 55 t/s) are met.
+The per-shape bandwidth target is not: the wide shapes reach 179-230 GB/s but the
+1024- and 4096-input projections stay at 93-158, and the step is 17.3 ms against
+the 15.5 ms row. Steps 5-6 are open and step 7 closes the record. This file is a plan, not a record: when a step lands, its
 measured result goes into [benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
@@ -251,6 +253,7 @@ Steps 1–3 close the context-dependent gap; steps 4–5 close the flat gap; ste
 | | *Landed.* `scripts/decode_compare.sh` plus `scripts/decode_reference_shapes.py` reproduce the headline rows (0.63/0.66/0.55/0.50/0.28 on the 2026-11-19 rerun) and the per-shape table. | | |
 | | *Landed (step 2).* Split-key attention: 0.033 ms per layer at a 512-token context in `TestGPUProfileDecode`, `pp2048/tg32` 42.90 t/s, greedy tokens identical, logits within the recorded CPU difference. | | |
 | | *Landed (step 3).* F32/F16/Q8_0 and the captured graph take the same kernel: 0.0335/0.0353/0.0318 ms per layer at 512 tokens, replayed tokens identical, and 0.096/0.071/0.061 ms at 2048. The 0.06 ms row at 2048 holds for Q8_0; see the step note for the F32/F16 byte floor. | | |
+| | *Landed (step 4).* One wave per output row, sixteen K values per lane, no barrier inside K: matvec 130.3 -> 176.6 GB/s effective, step 23.4 -> 17.3 ms, `pp128/tg128` 38.8 -> 60.16 t/s, `pp2048/tg32` 17.4 -> 58.16. Per-shape 190 GB/s and the 15.5 ms step are not met; see the step note. | | |
 | 2 | [Parallel decode attention over the key range](#step-2-parallelize-decode-attention-over-the-key-range) | 512-token context: ≤ 0.05 ms per layer, top-1 token and logits within the documented tolerance, `pp2048` ≥ 30 t/s | 4–8 files |
 | 3 | [Cover every KV format and the graph path](#step-3-cover-every-kv-format-and-the-graph-path) | All three pool formats and the captured graph produce the same tokens, ≤ 0.06 ms per layer from 0 to 2048 tokens | 3–6 files |
 | 4 | [Remap the decode matvec](#step-4-remap-the-decode-matvec) | ≥ 190 GB/s for every `N` ≥ 1024, step ≤ 15.5 ms, `pp128` ≥ 50 t/s | 4–8 files |
@@ -377,6 +380,26 @@ produces identical tokens; per-layer attention cost ≤ 0.06 ms up to a 2048-tok
 context in all three formats.
 
 ### Step 4: remap the decode matvec
+
+Landed as `gemv_row_kernel` and `gemv_row_pair_kernel` in
+`kernels/hip/gemv/gemv_row.hip`, selected inside the streaming dispatch for a
+one-row block whose K is a multiple of 512; other row counts and K widths keep
+`lm_head_kernel`, and the per-row GEMV stays the fallback. `decode_span16` in
+`kernels/hip/quant.cuh` decodes sixteen K values per lane, the activation values
+are read once per wave step and reused by both rows of the wave, and no barrier
+sits inside K. Residual and gate/up/SwiGLU epilogues are both ported.
+
+Measured: the matvec family moves from 20.9 ms at 130.3 GB/s to 15.44 ms at
+176.6 GB/s in step, the decode step from 23.4 to 17.31 ms profiled (22.2 to
+16.6 ms unprofiled), and `pp128/tg128` from 38.81 to 60.16 t/s. The 190 GB/s
+per-shape row is met by `ffn_gate` and `lm_head` and missed by the narrow and
+short-K projections; the step target of 15.5 ms is missed by 1.8 ms. The
+rejected variants: 32 K values per lane (131 GB/s, register pressure), four rows
+per wave with eight waves per block (156 GB/s, grid), four waves per block
+(156 GB/s at four rows per wave), and shared-memory staging of the activation
+step (163 GB/s, the barriers cost more than the L1 reads they remove).
+
+The original design note follows.
 
 Change the mapping, not the arithmetic, so the change is numerically
 attributable.

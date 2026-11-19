@@ -187,11 +187,18 @@ barrier sits inside the K loop. Measured 90-287 GB/s on the same shapes at 2.1-8
 instructions per weight fewer, and 0.16 LDS instructions per weight against up to
 2.66.
 
-The rule, in output width at `n_in = 2560` and one row: the streaming form wins
-from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1), so the
-selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
-family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
-recurrent projections are the only decode shapes that land on the fallback.
+**Remapped row** (`gemv_row_kernel`, section 5.4): the one-row decode form of
+the streaming family. One wave owns one output row, sixteen K values per lane
+over a 512-value step, no shared-memory staging and no barrier inside K.
+
+The rule, in output width at `n_in = 2560` and one row: the streaming family
+wins from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1),
+so the selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the
+GEMV family, and 1-16 rows. Within that, a block of exactly one row whose K is a
+multiple of 512 takes the remapped form and everything else takes the
+channel-parallel form. Shapes outside the family keep the per-row kernel. The
+32-output recurrent projections are the only decode shapes that land on the
+fallback.
 
 **Epilogues and the two-matrix form.** The same kernel carries two
 plan-selected extensions. `GEMV_RESIDUAL` adds a residual row to every output
@@ -232,11 +239,45 @@ identical tokens, and `tests/hip/gemv_test.cpp` checks every dtype against the
 host dot product at 2e-3 relative and against the per-row kernel at 2.4e-4
 absolute.
 
+### 5.4 Remapped one-row matvec
+
+`gemv_row_kernel` in `kernels/hip/gemv/gemv_row.hip` is the selected decode
+matvec. It changes the mapping rather than the arithmetic, so a regression is
+attributable to dispatch rather than to numerics:
+
+- Grid `ceil(n_out / 8)`: one block covers eight output rows (four waves, two
+  rows per wave), so a 1024-output projection launches 128 blocks instead of 32.
+- A lane owns sixteen consecutive K values and decodes them from one 8- to
+  16-byte span of the packed row through `decode_span16`, which is the wide form
+  of `decode_span4`: Q4_K and Q5_K spans are 16-byte aligned vector loads, F16
+  and F32 spans are 32- and 64-byte reads, and Q6_K, Q8_0, Q4_0, and Q5_0 rows
+  have strides that are not a multiple of sixteen bytes, so their spans are
+  copied with four 32-bit loads.
+- A wave steps K in 512-value steps, reads its sixteen activation values once
+  per step, and reuses them for both of its rows. The activation row is small
+  enough to stay in L1, so the kernel stages nothing in shared memory and has no
+  barrier inside the K loop; the only sync is the wave shuffle tree per row.
+- The epilogue adds the residual row when the plan fuses it, and
+  `gemv_row_pair_kernel` walks a second packed matrix over the same activation
+  values for the gate/up pair with the SwiGLU product folded in.
+
+Measured in step at a 7-token context (`TestGPUProfileDecode`, profiled, 176.6
+GB/s effective over the matvec family, against 130.3 GB/s before the remap):
+`ffn_gate` 193.6, `lm_head` 229.8, `ffn_down` Q6_K 189.7, `attn_qkv` 178.8,
+`ffn_down` Q4_K 158.4, `attn_q` 166.8, `attn_gate` 158.3, `ssm_out` 133.7,
+`attn_output` 125.5, and `attn_k` 93.3 GB/s. The narrow and short-K shapes keep
+a per-row cost that the wide shapes amortize: at 4096 input values a 2560-output
+projection spends roughly 27 ns per output row on top of its weight bytes, which
+is what leaves `attn_output` and `ssm_out` below the 190 GB/s target. The
+channel-parallel form stays compiled for other row counts and K widths and as
+the numerical reference.
+
 #### 5.3.1 Measured decode shapes
 
 One submission per plan, matrix resident, five warmups and twenty-five timed
 submissions; `kernel` is the traced kernel time from
-`scripts/decode_profile.sh`, which excludes the launch the host column includes:
+`scripts/decode_profile.sh`, which excludes the launch the host column includes.
+These cells predate the remap in 5.4 and describe the channel-parallel form:
 
 | Shape | dtype | per-row GB/s | streaming GB/s |
 | --- | --- | ---: | ---: |

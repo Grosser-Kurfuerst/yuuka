@@ -19,12 +19,14 @@ import (
 // decode kernel lands, because each change moves them by design: 97.6 ms before
 // the streaming matvec family, 89.4 ms after the streaming LM head, 31.6 ms
 // after the matvec family moved to the streaming kernel, 24.3 ms after the fused
-// gated delta-net, and the values below after the residual and gate/up fusions.
-// The measured history stays in docs/benchmarks.md.
+// gated delta-net, 23.4 ms after the residual and gate/up fusions, and the
+// values below after decode attention was split over the key range and the
+// matvec was remapped to one wave per row. The measured history stays in
+// docs/benchmarks.md.
 const (
 	decodeBaselineOps     = 379
-	decodeBaselineTotalMS = 23.400
-	decodeBaselineGemvMS  = 21.050
+	decodeBaselineTotalMS = 17.300
+	decodeBaselineGemvMS  = 15.440
 )
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated
@@ -108,7 +110,14 @@ func TestGPUProfileDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token := argmax(logits)
+	// One unprofiled decode step warms the decode-only weight rows and the KV
+	// pages, so the attribution does not carry the first-touch fault of
+	// blk.0.ssm_beta, which is otherwise the slowest single operation.
+	warm, err := rt.Step(argmax(logits))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := argmax(warm)
 	times, err := rt.ProfileStep(token)
 	if err != nil {
 		t.Fatal(err)

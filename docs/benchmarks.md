@@ -834,6 +834,43 @@ memory-system effect. The kernel mapping behind it is described in
 [kernels.md](kernels.md#4-operator-family-map) and the fix in
 [roadmap.md](roadmap.md#root-causes).
 
+### Remapped decode matvec
+
+Landed in [roadmap.md](roadmap.md) step 4. Measured 2026-11-19 on the same
+device and model, `yuuka bench --kv-type f32 --chunk-size 512`, greedy, warmup 2
+and 3 repetitions, against llama.cpp build `b1b770d90`:
+
+| Test | before step 4 | after step 4 | llama.cpp |
+| --- | ---: | ---: | ---: |
+| pp128/tg128 | 44.02 | 60.16 | 62.08 |
+| pp512/tg128 | 43.75 | 59.74 | 61.88 |
+| pp2048/tg32 | 42.90 | 58.16 | 61.60 |
+
+`TestGPUProfileDecode` moves from 18.79 ms to 17.31 ms and the matvec family
+from 16.07 ms at 169.6 GB/s to 15.44 ms at 176.6 GB/s in the same session; the
+profile now runs one unprofiled decode step first, so neither figure carries the
+first-touch fault of the decode-only `ssm_beta` row. In-step weight bandwidth,
+the channel-parallel streaming kernel against the remapped one:
+
+| Projection | dtype | K -> N | before GB/s | after GB/s |
+| --- | --- | --- | ---: | ---: |
+| `ffn_gate`, `ffn_up` | Q4_K | 2560 -> 9216 x2 | 141.3 | 193.6 |
+| `lm_head` | Q6_K | 2560 -> 248320 | 187.6 | 229.8 |
+| `attn_qkv` | Q5_K | 2560 -> 8192 | 131.3 | 178.8 |
+| `ffn_down` | Q6_K | 9216 -> 2560 | 133.3 | 189.7 |
+| `attn_q` | Q4_K | 2560 -> 8192 | 123.7 | 166.8 |
+| `attn_gate` | Q4_K | 2560 -> 4096 | 113.2 | 158.3 |
+| `ffn_down` | Q4_K | 9216 -> 2560 | 94.4 | 158.4 |
+| `ssm_out` | Q5_K | 4096 -> 2560 | 102.5 | 133.7 |
+| `attn_output` | Q4_K | 4096 -> 2560 | 97.1 | 125.5 |
+| `attn_k` | Q4_K | 2560 -> 1024 | 49.9 | 93.3 |
+| `attn_v` | Q6_K | 2560 -> 1024 | 74.1 | 136.1 |
+
+The wide shapes reach the reference's 209 GB/s band and `lm_head` passes it. The
+1024- and 4096-input projections carry a per-output-row cost of roughly 27 ns on
+top of their weight bytes, which is what leaves them at 93-158 GB/s and is what
+the 190 GB/s row in the roadmap still asks for.
+
 ### Split-key decode attention
 
 Landed in [roadmap.md](roadmap.md) step 2. Measured 2026-11-19 on the same
