@@ -274,14 +274,14 @@ size_t attention_wmma_shared_bytes(int head_dim);
 
 // attention_wmma_preferred reports whether the FP16 MMA prefill attention kernel
 // beats the tiled kernel at a chunk length and context position.
-bool attention_wmma_preferred(int rows, int position);
+bool attention_wmma_preferred(int rows, int position, uint32_t dtype);
 
 // attention_wmma_supported reports whether the FP16 MMA prefill attention kernel
 // covers a shape and KV format.
 bool attention_wmma_supported(int heads, int kv_heads, int head_dim,
                               int block_size, uint32_t dtype);
 
-void launch_attention_prefill_paged_wmma_f32(
+hipError_t launch_attention_prefill_paged_wmma_f32(
     float * out, const float * q, const void * k_pool, const void * v_pool,
     const int32_t * block_table, int block_size, int kv_heads, int heads,
     int head_dim, int kv_dim, int rows, int position, float scale,

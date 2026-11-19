@@ -19,15 +19,14 @@ import (
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/memory"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
-	"github.com/yuuka-ai/yuuka/tensor"
 	"github.com/yuuka-ai/yuuka/tokenizer"
 )
 
 type config struct {
-	model, tokens, logits               string
+	model, tokens, logits, kvType       string
 	prompt, chunk, warmups, repetitions int
 	greedySteps                         int
-	writeTokens                         bool
+	writeTokens, forceTiled             bool
 }
 
 func main() {
@@ -41,6 +40,8 @@ func main() {
 	flag.IntVar(&cfg.repetitions, "reps", 5, "timed repetitions")
 	flag.IntVar(&cfg.greedySteps, "greedy-steps", 0, "report this many decode top-1 tokens after the prefill top-1")
 	flag.BoolVar(&cfg.writeTokens, "write-tokens", false, "tokenize the fixed benchmark prompt into the token file")
+	flag.StringVar(&cfg.kvType, "kv-type", "f16", "KV storage format: f32, f16, or q8_0")
+	flag.BoolVar(&cfg.forceTiled, "tiled-attention", false, "force the tiled paged attention reference")
 	flag.Parse()
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -91,11 +92,16 @@ func run(cfg config) (err error) {
 	const blockSize = 16
 	capacity := cfg.prompt + 64
 	chunk := min(cfg.chunk, cfg.prompt)
+	format, err := qwen35.ParseKVFormat(cfg.kvType)
+	if err != nil {
+		return err
+	}
 	device, err := gpu.Open(reader, model, gpu.Options{
-		Blocks:       (capacity + blockSize - 1) / blockSize,
-		BlockSize:    blockSize,
-		PrefillChunk: chunk,
-		KVType:       tensor.F16,
+		Blocks:              (capacity + blockSize - 1) / blockSize,
+		BlockSize:           blockSize,
+		PrefillChunk:        chunk,
+		KVType:              format.DType(),
+		ForceTiledAttention: cfg.forceTiled,
 	})
 	if err != nil {
 		return err

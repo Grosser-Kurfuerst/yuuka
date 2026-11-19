@@ -189,24 +189,31 @@ func checkGPULongSplitAttention(t *testing.T, rt *Runtime, ids []int32) {
 			m.prefill.attentionSplit = scratch
 		}
 		m.prefillGen++
-		logits, err := rt.session.Prefill(ids, true)
+		return prefillAndGreedyLogits(t, rt, ids)
+	}
+	want := run(false)
+	checkAttentionLogits(t, run(true), want, 0.30)
+}
+
+func prefillAndGreedyLogits(t *testing.T, rt *Runtime, ids []int32) [][]float32 {
+	t.Helper()
+	logits, err := rt.session.Prefill(ids, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := [][]float32{append([]float32(nil), logits...)}
+	for range 3 {
+		logits, err = rt.session.Decode(int32(top1(logits)))
 		if err != nil {
 			t.Fatal(err)
 		}
-		result := [][]float32{append([]float32(nil), logits...)}
-		for range 3 {
-			logits, err = rt.session.Decode(int32(top1(logits)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			result = append(result, append([]float32(nil), logits...))
-		}
-		return result
+		result = append(result, append([]float32(nil), logits...))
 	}
-	want := run(false)
-	got := run(true)
-	// Use the existing cross-route long-attention tolerance for F16/Q8_1.
-	const tolerance = 0.3
+	return result
+}
+
+func checkAttentionLogits(t *testing.T, got, want [][]float32, tolerance float64) {
+	t.Helper()
 	for step := range want {
 		var maxDiff float64
 		for i, v := range got[step] {
@@ -217,5 +224,68 @@ func checkGPULongSplitAttention(t *testing.T, rt *Runtime, ids []int32) {
 				step, maxDiff, top1(got[step]), top1(want[step]))
 		}
 		t.Logf("step %d: max logit diff %.6g, top-1 %d", step, maxDiff, top1(got[step]))
+	}
+}
+
+// TestGPUQ8AttentionPathsAgree compares paged readers within one KV format.
+func TestGPUQ8AttentionPathsAgree(t *testing.T) {
+	path := os.Getenv("YUUKA_TEST_MODEL")
+	if path == "" {
+		t.Skip("YUUKA_TEST_MODEL unset")
+	}
+	reader, err := gguf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	model, err := qwen35.Load(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := tokenizer.NewFromGGUF(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const promptA = "The quick brown fox jumps over the lazy dog. "
+	const promptB = "The only global variable sets the program's default concurrency limit. A second workload starts on Tuesday at six o'clock. "
+	type attentionCase struct {
+		name, prompt  string
+		length, chunk int
+		tolerance     float64
+	}
+	cases := []attentionCase{{"short-tiled", promptA, 64, 64, 0.05}}
+	if os.Getenv("YUUKA_TEST_ATTENTION_LONG") == "1" {
+		for _, chunk := range []int{512, 1024, 2048} {
+			cases = append(cases,
+				attentionCase{fmt.Sprintf("8192-A-%d", chunk), promptA, 8192, chunk, 0.30},
+				attentionCase{fmt.Sprintf("8192-B-%d", chunk), promptB, 8192, chunk, 0.30})
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, err := tok.Encode(strings.Repeat(tc.prompt, tc.length/8+2))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ids) < tc.length {
+				t.Fatalf("prompt has %d tokens, want %d", len(ids), tc.length)
+			}
+			run := func(forceTiled bool) [][]float32 {
+				t.Helper()
+				rt, err := newRuntime(reader, model, tc.length+16, Options{
+					KVType: tensor.Q8_0, ForceTiledAttention: forceTiled,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer rt.Close()
+				if err := rt.SetPrefillChunk(tc.chunk); err != nil {
+					t.Fatal(err)
+				}
+				return prefillAndGreedyLogits(t, rt, ids[:tc.length])
+			}
+			want := run(true)
+			checkAttentionLogits(t, run(false), want, tc.tolerance)
+		})
 	}
 }

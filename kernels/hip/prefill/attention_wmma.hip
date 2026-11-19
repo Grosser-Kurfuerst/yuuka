@@ -23,6 +23,9 @@ constexpr int kPrefixSeedKeys = 512;
 // and its measurements are recorded in kernels.md.
 constexpr int kWmmaMinRows = 64;
 constexpr int kWmmaMinPrefix = 256;
+// Keeping the first 512 Q8_0 positions on tiled attention meets the
+// same-format full-model logit gate at the measured 512-row chunk size.
+constexpr int kQ8WmmaMinPosition = 512;
 // A 16x16 FP32 accumulator spreads 256 values over one wave, eight per lane.
 // Lane l holds element e at output row 2*e + (l >> 4), column l & 15.
 constexpr int kWmmaLaneElems = 8;
@@ -43,10 +46,24 @@ __device__ __forceinline__ int64_t wmma_paged_row(const int32_t * block_table,
     return static_cast<int64_t>(block) * block_size + (pos % block_size);
 }
 
-// stage_kv_tile gathers one 16-key tile of K and V through the block table and
-// writes it as FP16. An F16 pool is copied, an F32 pool is converted, and keys
-// outside the tile's causal bound are zeroed. Each key row segment is
-// contiguous in the pool, so the copy moves four values per step.
+// Q8_0 scales and digit pairs are two-byte aligned even when an odd
+// 34-byte block is not four-byte aligned.
+__device__ __forceinline__ void stage_q8_kv_values(
+    __half * dst, const uint8_t * block, int column) {
+    const float scale = load_f16_device(block);
+    const auto * digits = reinterpret_cast<const uint16_t *>(block + 2 + column);
+    const uint16_t lo = digits[0];
+    const uint16_t hi = digits[1];
+    auto * out = reinterpret_cast<__half2 *>(dst);
+    out[0] = __floats2half2_rn(scale * static_cast<int8_t>(lo),
+                               scale * static_cast<int8_t>(lo >> 8));
+    out[1] = __floats2half2_rn(scale * static_cast<int8_t>(hi),
+                               scale * static_cast<int8_t>(hi >> 8));
+}
+
+// stage_kv_tile gathers a tile of K and V through the block table and
+// writes it as FP16. It moves four contiguous values per step and zeroes
+// key slots outside the causal bound.
 template <uint32_t DType, int HD, bool KeyOnly = false>
 __device__ __forceinline__ void stage_kv_tile(
     __half * kh, __half * vh, const void * k_pool, const void * v_pool,
@@ -80,6 +97,13 @@ __device__ __forceinline__ void stage_kv_tile(
                 *reinterpret_cast<uint2 *>(vh + kk * HD + d) =
                     *reinterpret_cast<const uint2 *>(vsrc);
             }
+        } else if constexpr (DType == YUUKA_DTYPE_Q8_0) {
+            static_assert(!KeyOnly);
+            const int64_t offset = row * kv_row_bytes(DType, kv_dim) + (col / 32) * 34;
+            const int digit = static_cast<int>(col % 32);
+            stage_q8_kv_values(kdst, static_cast<const uint8_t *>(k_pool) + offset, digit);
+            stage_q8_kv_values(vh + kk * HD + d,
+                               static_cast<const uint8_t *>(v_pool) + offset, digit);
         } else {
             static_assert(!KeyOnly);
             const float * ksrc =
@@ -372,7 +396,7 @@ __global__ void merge_attention_partials_f32(float * out, const float * q,
 }
 
 template <uint32_t DType, int HD>
-void launch_attention_wmma_dtype(
+hipError_t launch_attention_wmma_dtype(
     float * out, const float * q, const void * k_pool, const void * v_pool,
     const int32_t * block_table, int block_size, int heads, int kv_dim,
     int rows, int position, float scale, int dense, dim3 grid, size_t shared,
@@ -382,7 +406,7 @@ void launch_attention_wmma_dtype(
             reinterpret_cast<const void *>(
                 &attention_prefill_paged_wmma_kernel<DType, HD, true>),
             hipFuncAttributeMaxDynamicSharedMemorySize, shared);
-        (void)attribute;
+        if (attribute != hipSuccess) return attribute;
         attention_prefill_paged_wmma_kernel<DType, HD, true>
             <<<grid, kWmmaThreads, shared, stream>>>(out, q, k_pool, v_pool,
                                                      block_table, block_size,
@@ -393,12 +417,34 @@ void launch_attention_wmma_dtype(
             reinterpret_cast<const void *>(
                 &attention_prefill_paged_wmma_kernel<DType, HD, false>),
             hipFuncAttributeMaxDynamicSharedMemorySize, shared);
-        (void)attribute;
+        if (attribute != hipSuccess) return attribute;
         attention_prefill_paged_wmma_kernel<DType, HD, false>
             <<<grid, kWmmaThreads, shared, stream>>>(out, q, k_pool, v_pool,
                                                      block_table, block_size,
                                                      heads, kv_dim, rows,
                                                      position, scale, nullptr, 1);
+    }
+    return hipGetLastError();
+}
+
+template <uint32_t DType>
+hipError_t launch_attention_wmma_width(
+    float * out, const float * q, const void * k_pool, const void * v_pool,
+    const int32_t * block_table, int block_size, int heads, int head_dim,
+    int kv_dim, int rows, int position, float scale, int dense, dim3 grid,
+    size_t shared, hipStream_t stream) {
+    if (head_dim == 64) {
+        return launch_attention_wmma_dtype<DType, 64>(
+            out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
+            position, scale, dense, grid, shared, stream);
+    } else if (head_dim == 128) {
+        return launch_attention_wmma_dtype<DType, 128>(
+            out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
+            position, scale, dense, grid, shared, stream);
+    } else {
+        return launch_attention_wmma_dtype<DType, 256>(
+            out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
+            position, scale, dense, grid, shared, stream);
     }
 }
 
@@ -456,7 +502,12 @@ size_t attention_wmma_shared_bytes(int head_dim) {
            kWmmaHeads * kWmmaQTile * kWmmaKTile * sizeof(__half);
 }
 
-bool attention_wmma_preferred(int rows, int position) {
+bool attention_wmma_preferred(int rows, int position, uint32_t dtype) {
+    if (dtype == YUUKA_DTYPE_Q8_0) {
+        // Two tiled chunks are needed for the measured 1024-row route.
+        const int min_position = rows == 1024 ? 2048 : kQ8WmmaMinPosition;
+        return position >= min_position;
+    }
     return rows >= kWmmaMinRows || position + rows >= kWmmaMinPrefix;
 }
 
@@ -465,7 +516,8 @@ bool attention_wmma_supported(int heads, int kv_heads, int head_dim,
     if (block_size <= 0 || kv_heads <= 0 || head_dim <= 0) {
         return false;
     }
-    if (dtype != YUUKA_DTYPE_F32 && dtype != YUUKA_DTYPE_F16) {
+    if (dtype != YUUKA_DTYPE_F32 && dtype != YUUKA_DTYPE_F16 &&
+        dtype != YUUKA_DTYPE_Q8_0) {
         return false;
     }
     if (heads != kv_heads * kWmmaHeads) {
@@ -477,7 +529,7 @@ bool attention_wmma_supported(int heads, int kv_heads, int head_dim,
     return attention_wmma_shared_bytes(head_dim) <= 64 * 1024;
 }
 
-void launch_attention_prefill_paged_wmma_f32(
+hipError_t launch_attention_prefill_paged_wmma_f32(
     float * out, const float * q, const void * k_pool, const void * v_pool,
     const int32_t * block_table, int block_size, int kv_heads, int heads,
     int head_dim, int kv_dim, int rows, int position, float scale, uint32_t dtype,
@@ -486,33 +538,17 @@ void launch_attention_prefill_paged_wmma_f32(
     const dim3 grid(static_cast<unsigned>(kv_heads),
                     static_cast<unsigned>((rows + kWmmaQTile - 1) / kWmmaQTile));
     if (dtype == YUUKA_DTYPE_F16) {
-        if (head_dim == 64) {
-            launch_attention_wmma_dtype<YUUKA_DTYPE_F16, 64>(
-                out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim,
-                rows, position, scale, dense, grid, shared, stream);
-        } else if (head_dim == 128) {
-            launch_attention_wmma_dtype<YUUKA_DTYPE_F16, 128>(
-                out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim,
-                rows, position, scale, dense, grid, shared, stream);
-        } else {
-            launch_attention_wmma_dtype<YUUKA_DTYPE_F16, 256>(
-                out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim,
-                rows, position, scale, dense, grid, shared, stream);
-        }
-        return;
-    }
-    if (head_dim == 64) {
-        launch_attention_wmma_dtype<YUUKA_DTYPE_F32, 64>(
-            out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
-            position, scale, dense, grid, shared, stream);
-    } else if (head_dim == 128) {
-        launch_attention_wmma_dtype<YUUKA_DTYPE_F32, 128>(
-            out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
-            position, scale, dense, grid, shared, stream);
+        return launch_attention_wmma_width<YUUKA_DTYPE_F16>(
+            out, q, k_pool, v_pool, block_table, block_size, heads, head_dim, kv_dim,
+            rows, position, scale, dense, grid, shared, stream);
+    } else if (dtype == YUUKA_DTYPE_Q8_0) {
+        return launch_attention_wmma_width<YUUKA_DTYPE_Q8_0>(
+            out, q, k_pool, v_pool, block_table, block_size, heads, head_dim, kv_dim,
+            rows, position, scale, dense, grid, shared, stream);
     } else {
-        launch_attention_wmma_dtype<YUUKA_DTYPE_F32, 256>(
-            out, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
-            position, scale, dense, grid, shared, stream);
+        return launch_attention_wmma_width<YUUKA_DTYPE_F32>(
+            out, q, k_pool, v_pool, block_table, block_size, heads, head_dim, kv_dim,
+            rows, position, scale, dense, grid, shared, stream);
     }
 }
 

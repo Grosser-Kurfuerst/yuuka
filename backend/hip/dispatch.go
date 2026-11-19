@@ -202,19 +202,24 @@ func SelectDecodeGemvPath(dtype tensor.DType, nIn, nOut int64, int8Matvec bool) 
 // PrefillAttentionMMA reports whether the FP16 MMA paged prefill attention
 // kernel is selected for a shape. It mirrors the C++ rule in
 // kernels/hip/prefill/attention_wmma.hip: the kernel serves the four query
-// heads that share a KV head, needs an FP16-storable pool and a head width of
-// 64, 128, or 256, and only wins once the chunk or the prefix is long enough to
-// fill the device. A shape it rejects keeps the tiled kernel, which is correct
-// for every format.
+// heads that share a KV head, reads F32, F16 or Q8_0 KV at head widths
+// 64, 128 or 256. The short-prefix policy keeps Q8_0 tiled until position
+// 512, or 2048 for a 1024-row parent. Other formats use the shared crossover.
 func PrefillAttentionMMA(heads, kvHeads, headDim, rows, position int, dtype tensor.DType) bool {
-	if heads != 4*kvHeads || headDim <= 0 || rows <= 0 {
+	if kvHeads <= 0 || heads != 4*kvHeads || headDim <= 0 || rows <= 0 {
 		return false
 	}
-	if dtype != tensor.F32 && dtype != tensor.F16 {
+	if dtype != tensor.F32 && dtype != tensor.F16 && dtype != tensor.Q8_0 {
 		return false
 	}
 	if headDim != 64 && headDim != 128 && headDim != 256 {
 		return false
+	}
+	if dtype == tensor.Q8_0 {
+		if rows == 1024 {
+			return position >= 2048
+		}
+		return position >= 512
 	}
 	return rows >= 64 || position+rows >= 256
 }

@@ -1711,42 +1711,64 @@ bool test_attention_prefill(yuuka_device * device, yuuka_stream * stream,
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
-// test_attention_prefill_mma exercises the FP16 MMA paged prefill attention
-// kernel: four query heads per KV head, head width 256, and a 64-row chunk at
-// position 0, which is the smallest shape that selects it. The pool is FP32 and
-// the kernel stages FP16 operands, so the reference comparison uses a relative
-// tolerance; the plan also runs the tiled kernel on the same input, reports the
-// difference between the two device results, and re-runs the MMA plan to check
-// that the result is reproducible.
+// Compare tiled and WMMA attention to a CPU oracle over the same stored KV.
 bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
-                                yuuka_event * event, std::mt19937 & rng) {
-    const int heads = 16, kv_heads = 4, head_dim = 256;
+                                yuuka_event * event, std::mt19937 & rng,
+                                yuuka_dtype dtype = YUUKA_DTYPE_F32, int head_dim = 256,
+                                bool dense = false, int position = 0, int rows = 64) {
+    const int heads = 16, kv_heads = 4, block_size = 16;
     const int kv_dim = kv_heads * head_dim;
-    const int block_size = 16, capacity = 128, position = 0, rows = 64;
+    const int query_width = dense ? head_dim : 2 * head_dim;
+    const int blocks = (position + rows + block_size - 1) / block_size + 1;
+    const int capacity = blocks * block_size;
+    const bool packed = dtype == YUUKA_DTYPE_Q8_0;
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
-    std::vector<float> q(size_t(rows) * heads * 2 * head_dim);
+    std::vector<float> q(size_t(rows) * heads * query_width);
     std::vector<float> kc(size_t(capacity) * kv_dim), vc(size_t(capacity) * kv_dim);
     for (float & x : q) x = dist(rng);
     for (float & x : kc) x = dist(rng);
     for (float & x : vc) x = dist(rng);
     const float scale = 1.0f / std::sqrt(float(head_dim));
     // Permute the block order so a kernel that ignores the table disagrees.
-    const int blocks = capacity / block_size;
     std::vector<int32_t> block_table(static_cast<size_t>(blocks), 0);
     for (int i = 0; i < blocks; ++i) block_table[size_t(i)] = blocks - 1 - i;
     std::vector<float> pk(kc.size()), pv(vc.size());
-    for (int r = 0; r < capacity; ++r) {
-        const int64_t dst = int64_t(block_table[size_t(r / block_size)]) * block_size + (r % block_size);
-        std::memcpy(&pk[size_t(dst) * kv_dim], &kc[size_t(r) * kv_dim], size_t(kv_dim) * 4);
-        std::memcpy(&pv[size_t(dst) * kv_dim], &vc[size_t(r) * kv_dim], size_t(kv_dim) * 4);
+    std::vector<uint8_t> q8k, q8v;
+    if (packed) {
+        q8k = pack_weights(dtype, rng, kv_dim, capacity);
+        q8v = pack_weights(dtype, rng, kv_dim, capacity);
     }
+    const auto decode_pool_row = [kv_dim](uint8_t * source, float * decoded) {
+        for (int c = 0; c < kv_dim; c += 32) {
+            uint8_t * block = source + (c / 32) * 34;
+            put_half(block, 0.002f * float(1 + c / 32 % 5));
+            const float d = half_to_float(uint16_t(block[0] | block[1] << 8));
+            for (int j = 0; j < 32; ++j) decoded[c + j] = d * int8_t(block[2 + j]);
+        }
+    };
+    for (int r = 0; r < capacity; ++r) {
+        const size_t dst = size_t(block_table[r / block_size]) * block_size + r % block_size;
+        if (packed) {
+            const size_t offset = dst * row_bytes(dtype, kv_dim);
+            decode_pool_row(q8k.data() + offset, kc.data() + size_t(r) * kv_dim);
+            decode_pool_row(q8v.data() + offset, vc.data() + size_t(r) * kv_dim);
+        } else {
+            std::memcpy(pk.data() + dst * kv_dim, kc.data() + size_t(r) * kv_dim, size_t(kv_dim) * 4);
+            std::memcpy(pv.data() + dst * kv_dim, vc.data() + size_t(r) * kv_dim, size_t(kv_dim) * 4);
+        }
+    }
+    const size_t pool_bytes = capacity * row_bytes(dtype, kv_dim);
+    const void * key_data = packed ? static_cast<const void *>(q8k.data()) : pk.data();
+    const void * value_data = packed ? static_cast<const void *>(q8v.data()) : pv.data();
     Buffer qb, kb, vb, ob, tb, ot;
-    bool ok = alloc(device, qb, q.size() * 4) && alloc(device, kb, pk.size() * 4) &&
-              alloc(device, vb, pv.size() * 4) &&
+    bool ok = alloc(device, qb, q.size() * 4) && alloc(device, kb, pool_bytes) &&
+              alloc(device, vb, pool_bytes) &&
               alloc(device, ob, size_t(rows) * heads * head_dim * 4) &&
               alloc(device, ot, size_t(rows) * heads * head_dim * 4) &&
               alloc(device, tb, block_table.size() * 4) && upload_vec(qb, q) &&
-              upload_vec(kb, pk) && upload_vec(vb, pv) && upload_vec(tb, block_table);
+              check(yuuka_memcpy_h2d(kb.buf, key_data, pool_bytes), "upload attention keys") &&
+              check(yuuka_memcpy_h2d(vb.buf, value_data, pool_bytes), "upload attention values") &&
+              upload_vec(tb, block_table);
     std::vector<float> got(size_t(rows) * heads * head_dim);
     std::vector<float> got_tiled(size_t(rows) * heads * head_dim);
     std::vector<float> again(size_t(rows) * heads * head_dim);
@@ -1768,7 +1790,8 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
             op.n[4] = rows;
             op.u[0] = block_size;
             op.u[1] = capacity;
-            op.u[2] = YUUKA_DTYPE_F32;
+            op.u[2] = dtype;
+            op.u[3] = dense;
             op.f[0] = scale;
             ok = check(yuuka_plan_add(plan, &op), "add attention prefill mma");
             if (ok) {
@@ -1790,7 +1813,7 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
             const int pos = position + r;
             for (int h = 0; h < heads && ok; ++h) {
                 const int kvh = h / (heads / kv_heads);
-                const float * qp = q.data() + size_t(r * heads + h) * 2 * head_dim;
+                const float * qp = q.data() + size_t(r * heads + h) * query_width;
                 std::vector<float> scores(size_t(pos + 1));
                 float max_s = -INFINITY;
                 for (int p = 0; p <= pos; ++p) {
@@ -1811,12 +1834,14 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
                     for (int p = 0; p <= pos; ++p) {
                         value += scores[size_t(p)] / total * vc[size_t(p * kv_dim + kvh * head_dim + d)];
                     }
-                    const float gate = qp[head_dim + d];
-                    value *= 1.0f / (1.0f + std::exp(-gate));
+                    if (!dense) value /= 1.0f + std::exp(-qp[head_dim + d]);
                     const size_t idx = size_t(r * heads + h) * head_dim + d;
                     max_abs = std::max(max_abs, double(std::fabs(got[idx] - value)));
                     max_tiled = std::max(max_tiled, double(std::fabs(got[idx] - got_tiled[idx])));
-                    if (std::fabs(got[idx] - value) > 5e-3f * (1.0f + std::fabs(value))) {
+                    const float tolerance = 5e-3f * (1.0f + std::fabs(value));
+                    if (!std::isfinite(got[idx]) || !std::isfinite(got_tiled[idx]) ||
+                        std::fabs(got[idx] - value) > tolerance ||
+                        std::fabs(got[idx] - got_tiled[idx]) > tolerance) {
                         std::fprintf(stderr, "attention mma mismatch [%d,%d,%d]: %.6f vs %.6f\n",
                                      r, h, d, got[idx], value);
                         ok = false;
@@ -1830,9 +1855,9 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
                 }
             }
         }
-        std::printf("mma attention prefill: %s (max abs vs f32 reference %.3g, "
-                    "vs tiled kernel %.3g)\n",
-                    ok ? "ok" : "FAILED", max_abs, max_tiled);
+        std::printf("mma attention dtype=%u width=%d dense=%d rows=%d position=%d: %s "
+                    "(max abs vs CPU %.3g, vs tiled %.3g)\n",
+                    dtype, head_dim, dense, rows, position, ok ? "ok" : "FAILED", max_abs, max_tiled);
     }
     release(tb);
     release(ot);
@@ -2377,6 +2402,12 @@ int main() {
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
     ok = test_attention_prefill_mma(device, stream, event, rng) && ok;
+    for (int width : {64, 128, 256}) {
+        ok = test_attention_prefill_mma(device, stream, event, rng,
+                                       YUUKA_DTYPE_Q8_0, width, false, 512) && ok;
+        ok = test_attention_prefill_mma(device, stream, event, rng,
+                                       YUUKA_DTYPE_Q8_0, width, true, 527, 19) && ok;
+    }
     ok = test_attention_prefill_split(device, stream, event, rng, 0) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 270) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 6143, 512, 0) && ok;

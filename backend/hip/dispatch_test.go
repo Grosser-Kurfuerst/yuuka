@@ -110,3 +110,21 @@ func TestSelectPrefillPath(t *testing.T) {
 		}
 	}
 }
+
+func TestPrefillAttentionMMAQ8Prefix(t *testing.T) {
+	for _, tc := range []struct {
+		rows, position int
+		want           bool
+	}{
+		{512, 511, false},
+		{512, 512, true},
+		{1024, 2047, false},
+		{1024, 2048, true},
+		{2048, 512, true},
+	} {
+		got := PrefillAttentionMMA(16, 4, 256, tc.rows, tc.position, tensor.Q8_0)
+		if got != tc.want {
+			t.Errorf("rows=%d position=%d: chose WMMA=%t, want %t", tc.rows, tc.position, got, tc.want)
+		}
+	}
+}

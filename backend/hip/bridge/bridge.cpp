@@ -2450,7 +2450,7 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                 // The displacement omits leading query rows without changing
                 // the parent chunk's WMMA preference.
                 const bool prefer_wmma = (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) == 0 &&
-                    yuuka::attention_wmma_preferred(int(rows + op.n[5]), int(position));
+                    yuuka::attention_wmma_preferred(int(rows + op.n[5]), int(position), op.u[2]);
                 const uint32_t split_flag = op.flags & YUUKA_OP_FLAG_PREFILL_SPLIT_MASK;
                 const int forced_splits = split_flag == 0 ? 0 : 1 << ((split_flag >> 3) - 1);
                 const hipError_t error = yuuka::launch_attention_prefill_paged_f32(
@@ -2461,7 +2461,7 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                     int(first), op.f[0], op.u[2], int(op.u[3]), prefer_wmma,
                     op_ptr<float>(op, 6), forced_splits, stream);
                 if (error != hipSuccess) {
-                    return fail(YUUKA_ERR_DEVICE, "split prefill attention: %s", hip_error(error));
+                    return fail(YUUKA_ERR_DEVICE, "paged prefill attention: %s", hip_error(error));
                 }
             }
             break;

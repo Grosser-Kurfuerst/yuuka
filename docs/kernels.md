@@ -884,19 +884,26 @@ the gated layout exclusively.
 kernel. `launch_attention_prefill_paged_f32` selects it when all of the
 following hold, and falls back to the tiled per-head kernel otherwise:
 
-- the pool is F32 or F16, so an FP16 tile staging is either lossless or a
-  documented rounding step (Q8_0 stays on the tiled kernel);
+- the pool stores F32, F16, or Q8_0 KV rows;
 - `heads == 4 * kv_heads`, so one workgroup can serve the four query heads that
   share a KV head;
 - `head_dim` is 64, 128, or 256, the widths the kernel is instantiated for;
 - `rows >= 64` or `position + rows >= 256`: below that the chunk offers too few
-  16-row query tiles to fill 40 CUs, and the tiled kernel measures faster.
+  16-row query tiles to fill 40 CUs, and the tiled kernel measures faster;
+- Q8_0 uses tiled attention for chunks starting before position 512, or before
+  position 2048 for a 1024-row parent. The tiled prefix preserves the measured
+  same-format logit tolerance.
 
 Geometry. A workgroup is four waves, one per query head of the group, and owns a
 16-row query tile. Each wave keeps the whole `16 x head_dim` output block in
 accumulator registers (128 registers per lane at head width 256), so the value
 product never leaves the wave. K and V tiles of 16 keys are staged in shared
-memory once per workgroup and reused by all four heads.
+memory once per workgroup and reused by all four heads. The Q8_0
+reader addresses physical page rows in their packed byte stride. Each
+32-digit block has one FP16 scale. The gather multiplies the signed
+digits by the scale in FP32 and converts to half for the shared tile.
+Causal padding writes zeros without reading any masked key slots.
+[Q8_0 WMMA acceptance](prefill-optimization/phase2/acceptance/08c-q8-kv-wmma.md)
 
 Score orientation. The score product runs as `S^T = K Q^T` rather than
 `S = Q K^T`, so both operands are row major in shared memory: K keeps the
@@ -955,7 +962,7 @@ starting at positions 6144 through 14336, inclusive. The 64- and 513-row
 tails use the split route for start positions 7680 through 14336 when
 the configured chunk has reserved split scratch. The executor uses the
 current query position with the cached plan. Short prefixes, other row
-counts and the single-query output tail use direct attention.
+counts and the single-query output tail use the unsplit policy.
 [Phase 2 split cells](prefill-optimization/phase2/acceptance/08b-f16-split-cells.md)
 
 A score-only pass over the leading 512 keys supplies a starting maximum
@@ -973,9 +980,8 @@ Current limits:
 
 - Q8_0 KV is supported but not faster than F32 at short context; its benefit is
   cache memory.
-- The tiled fallback runs one workgroup per head and is
-  6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic, which is why
-  Q8_0 pools and short chunks keep the long-context gap.
+- The tiled fallback runs one workgroup per head and is limited by scalar
+  FP32 arithmetic. It serves the Q8_0 short prefix and unsupported WMMA shapes.
 - Direct MMA uses 16-row query tiles. Split-key MMA adds parallel workgroups
   over key ranges with the same query tile.
 - No mixed prefill/decode batch. Each step belongs to one request plan.

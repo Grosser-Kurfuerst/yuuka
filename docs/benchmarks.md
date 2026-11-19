@@ -112,9 +112,10 @@ gave 1345.1 / 1626.2 / 1673.9 / 1409.2 tok/s at the four lengths, so the stage i
 +12.4% / +8.0% / +1.9% / +2.0%. The gain follows the 8.4 ms the tail saves per
 chunk, which is a larger share of the shorter prompts. F32 and F16 KV are within
 4% of each other at every length, because both run the same attention kernel;
-Q8_0 keeps the tiled kernel and diverges from 2048 tokens, where attention
-starts to dominate. The F16 and Q8_0 rows are the pre-LM-head measurements and
-were not repeated.
+Q8_0 used tiled attention in these samples and diverged from 2048 tokens.
+The F16 and Q8_0 columns are the pre-LM-head measurements. See the later
+[Q8_0 WMMA measurements](prefill-optimization/phase2/acceptance/08c-q8-kv-wmma.md)
+for the paired packed-KV comparison.
 
 Before this stage the same table read 1380.1 / 1704.8 / 1715.2 / 1441.7 tok/s for
 F32 KV at `161fbba`. That earlier row was measured after the FP16 MMA prefill
@@ -756,7 +757,8 @@ The remaining gaps, in order of size:
    further time yuuka does not measure separately here.
 3. Long-context prefill, 1.5x at 8192: the FP16 MMA attention kernel closed
    most of this gap, so what remains is the quantized GEMM plus the delta-net
-   chunk, not attention. Q8_0 KV keeps the tiled kernel and stays at 0.40.
+   chunk in this comparison. Q8_0 KV used tiled attention and measured a
+   0.40 ratio in that historical comparison.
 4. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
    into one weight pass; yuuka re-reads the weights per request because fused
    mixed-shape decode batching is not implemented.
@@ -801,10 +803,11 @@ Each of these is a measured decision that still holds in the current code:
   The 64x64/K32 and 32x64 variants remain the dispatch choice for the paths they
   serve, and the wide K-quant shapes in this report come from the int8 MMQ route
   instead.
-- **Prefill attention is settled on the FP16 MMA kernel** for F32 and F16 pools
-  from 64 rows or a 256-token prefix; the tiled kernel stays for Q8_0, for
-  shapes the MMA kernel does not cover, and below that crossover (measured
-  1.2-2.4x faster there). Staging K transposed per key tile instead of Q once
+- **Prefill attention uses FP16 MMA** for supported F32, F16 and Q8_0 shapes
+  from 64 rows or a 256-token prefix. Q8_0 additionally requires a chunk start
+  at position 512 or later, or 2048 or later for 1024-row parents. Tiled
+  attention covers other shapes and the short prefix (measured 1.2-2.4x
+  faster there for F32). Staging K transposed per key tile instead of Q once
   per workgroup, and keeping the accumulator at 192 registers instead of
   `__launch_bounds__(128, 2)`, were measured and rejected: the first costs 128
   scalar shared-memory loads per key tile, the second spilled 21 slots into the
