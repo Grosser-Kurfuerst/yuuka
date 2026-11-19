@@ -684,6 +684,25 @@ yuuka_status validate_recurrent_chunk_plan_op(const yuuka_op & op) {
                         "recurrent chunk buffer %d is too small", i);
         }
     }
+    if (op.buf[13] != nullptr) {
+        if (op.buf[12] != nullptr || state != 128 || rows > UINT16_MAX ||
+            conv_dim > INT32_MAX || groups > INT32_MAX || heads > INT32_MAX) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prepared recurrent chunk geometry");
+        }
+        uint64_t bytes = 0;
+        const uint64_t width = conv_dim - inner + 2 * heads;
+        if (__builtin_mul_overflow(rows, width, &elems) ||
+            !checked_float_bytes(elems, &bytes) || (op.off[13] % sizeof(float)) != 0 ||
+            !buffer_range_ok(op.buf[13], op.off[13], bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prepared recurrent chunk scratch span");
+        }
+        for (int i = 0; i < 12; ++i) {
+            if (op.buf[i] == op.buf[13] && op.off[i] < op.off[13] + bytes &&
+                op.off[13] < op.off[i] + need[i] * sizeof(float)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "prepared recurrent chunk scratch overlaps buffer %d", i);
+            }
+        }
+    }
     return YUUKA_OK;
 }
 
@@ -1751,7 +1770,7 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                 op_ptr<const float>(op, 6), op_ptr<const float>(op, 7),
                 op_ptr<const float>(op, 8), op_ptr<const float>(op, 9),
                 op_ptr<float>(op, 11), op_ptr<float>(op, 10),
-                op_ptr<float>(op, 12),
+                op_ptr<float>(op, 12), op_ptr<float>(op, 13),
                 int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
                 int(op.n[4]), int(op.n[5]), int(op.u[0]), op.f[0], op.f[1],
                 stream);

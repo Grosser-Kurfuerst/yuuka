@@ -1421,9 +1421,13 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
+enum class RecurrentPath { PerToken, Chunkwise, Prepared };
+
 bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
                           yuuka_event * event, std::mt19937 & rng, int state,
-                          bool chunked) {
+                          RecurrentPath path) {
+    const bool chunked = path == RecurrentPath::Chunkwise;
+    const bool prepared = path == RecurrentPath::Prepared;
     const int rows = 128, groups = 16, heads = 32, kernel = 4;
     const int inner = heads * state, conv_dim = 2 * groups * state + inner;
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
@@ -1448,7 +1452,10 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
 
     // The chunked path keeps two chunk x chunk matrices per chunk and head.
     const size_t chunks = size_t((rows + 31) / 32);
-    const size_t scratch_elems = chunked ? chunks * heads * 2 * 32 * 32 : 0;
+    constexpr size_t scratch_offset = 16;
+    const size_t prepared_width = 2 * groups * state + 2 * heads;
+    const size_t scratch_bytes = chunked ? chunks * heads * 2 * 32 * 32 * sizeof(float)
+        : prepared ? scratch_offset + rows * prepared_width * sizeof(float) : 0;
     Buffer qb, zb, ab, bb, cwb, dtb, avb, nb, csb, rsb, convb, ob, scb;
     bool ok = alloc(device, qb, qkv.size() * 4) && alloc(device, zb, z.size() * 4) &&
               alloc(device, ab, alpha.size() * 4) && alloc(device, bb, beta.size() * 4) &&
@@ -1456,14 +1463,14 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
               alloc(device, avb, a.size() * 4) && alloc(device, nb, norm.size() * 4) &&
               alloc(device, csb, conv_state.size() * 4) && alloc(device, rsb, rec_state.size() * 4) &&
               alloc(device, convb, qkv.size() * 4) && alloc(device, ob, z.size() * 4) &&
-              (!chunked || alloc(device, scb, scratch_elems * 4)) &&
+              (scratch_bytes == 0 || alloc(device, scb, scratch_bytes)) &&
               upload_vec(qb, qkv) && upload_vec(zb, z) && upload_vec(ab, alpha) &&
               upload_vec(bb, beta) && upload_vec(cwb, conv_w) && upload_vec(dtb, dt) &&
               upload_vec(avb, a) && upload_vec(nb, norm) && upload_vec(csb, conv_state) &&
               upload_vec(rsb, rec_state);
     yuuka_plan * plan = nullptr;
     if (ok) ok = check(yuuka_plan_create(device, &plan), "plan create");
-    if (ok) {
+    const auto add_chunk = [&](int start, int count) {
         yuuka_op op{};
         op.code = YUUKA_OP_RECURRENT_CHUNK;
         op.buf[0] = csb.buf;
@@ -1481,7 +1488,17 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
         if (chunked) {
             op.buf[12] = scb.buf;
         }
-        op.n[0] = rows;
+        if (prepared) {
+            op.buf[13] = scb.buf;
+            op.off[13] = scratch_offset;
+        }
+        op.off[2] = size_t(start) * conv_dim * sizeof(float);
+        op.off[3] = size_t(start) * inner * sizeof(float);
+        op.off[4] = size_t(start) * heads * sizeof(float);
+        op.off[5] = op.off[4];
+        op.off[10] = op.off[3];
+        op.off[11] = op.off[2];
+        op.n[0] = count;
         op.n[1] = groups;
         op.n[2] = heads;
         op.n[3] = state;
@@ -1490,7 +1507,29 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
         op.u[0] = kernel;
         op.f[0] = 1e-6f;
         op.f[1] = 1.0f / std::sqrt(float(state));
-        ok = check(yuuka_plan_add(plan, &op), "add recurrent chunk");
+        if (prepared && start == 0) {
+            yuuka_op invalid = op;
+            invalid.off[13] = scratch_bytes;
+            if (yuuka_plan_add(plan, &invalid) != YUUKA_ERR_INVALID_ARGUMENT) return false;
+            invalid = op;
+            ++invalid.off[13];
+            if (yuuka_plan_add(plan, &invalid) != YUUKA_ERR_INVALID_ARGUMENT) return false;
+            invalid = op;
+            invalid.buf[12] = scb.buf;
+            if (yuuka_plan_add(plan, &invalid) != YUUKA_ERR_INVALID_ARGUMENT) return false;
+            invalid = op;
+            invalid.buf[13] = convb.buf;
+            if (yuuka_plan_add(plan, &invalid) != YUUKA_ERR_INVALID_ARGUMENT) return false;
+            invalid = op;
+            invalid.n[1] += uint64_t(1) << 56;
+            if (yuuka_plan_add(plan, &invalid) != YUUKA_ERR_INVALID_ARGUMENT) return false;
+        }
+        return check(yuuka_plan_add(plan, &op), "add recurrent chunk");
+    };
+    if (ok) {
+        constexpr int first_chunk = 57;
+        ok = prepared ? add_chunk(0, first_chunk) && add_chunk(first_chunk, rows - first_chunk)
+                      : add_chunk(0, rows);
     }
     if (ok) ok = execute(plan, stream, event, 0);
     std::vector<float> got(size_t(rows * inner));
@@ -1569,7 +1608,13 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
             double row_max = 0;
             for (int j = 0; j < inner; ++j) {
                 const size_t i = size_t(rr * inner + j);
-                row_max = std::max(row_max, double(std::fabs(got[i] - expected[i])));
+                const double diff = std::fabs(double(got[i]) - double(expected[i]));
+                if (!std::isfinite(diff)) {
+                    std::fprintf(stderr, "nonfinite recurrent output at index %zu\n", i);
+                    ok = false;
+                    break;
+                }
+                row_max = std::max(row_max, diff);
             }
             max_abs = std::max(max_abs, row_max);
             if (row_max > 2e-4 * (1.0 + std::fabs(double(expected[size_t(rr * inner)])))) {
@@ -1600,8 +1645,8 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
             }
         }
         for (size_t i = 0; i < rec_state.size(); ++i) {
-            if (std::fabs(double(got_rec_state[i]) - double(rec_state[i])) >
-                2e-4 * (1.0 + std::fabs(double(rec_state[i])))) {
+            const double diff = std::fabs(double(got_rec_state[i]) - double(rec_state[i]));
+            if (!std::isfinite(diff) || diff > 2e-4 * (1.0 + std::fabs(double(rec_state[i])))) {
                 std::fprintf(stderr, "recurrent matrix state mismatch at %zu\n", i);
                 ok = false;
                 break;
@@ -1609,30 +1654,23 @@ bool test_recurrent_chunk(yuuka_device * device, yuuka_stream * stream,
         }
         // Second execution with the original state must be bitwise identical.
         // The chunked path consumes alpha and beta in place, so restore them.
+        bool deterministic = false;
         if (upload_vec(csb, conv_state0) && upload_vec(rsb, rec_state0) &&
             upload_vec(ab, alpha) && upload_vec(bb, beta) &&
             execute(plan, stream, event, 0)) {
             std::vector<float> again(size_t(rows * inner));
             std::vector<float> conv_again(size_t(rows * conv_dim));
-            if (download_vec(ob, again) && download_vec(convb, conv_again)) {
-                double det = 0;
-                for (size_t i = 0; i < got.size(); ++i) {
-                    det = std::max(det, double(std::fabs(got[i] - again[i])));
-                }
-                double cdet = 0;
-                for (size_t i = 0; i < conv_again.size(); ++i) {
-                    cdet = std::max(cdet, double(std::fabs(got_conv[i] - conv_again[i])));
-                }
-                if (det != 0.0 || cdet != 0.0) {
-                    std::fprintf(stderr,
-                                 "recurrent chunk is not deterministic: out %.3g conv %.3g\n",
-                                 det, cdet);
-                    ok = false;
-                }
-            }
+            std::vector<float> state_again(rec_state.size()), history_again(conv_state.size());
+            deterministic = download_vec(ob, again) && download_vec(convb, conv_again) &&
+                download_vec(rsb, state_again) && download_vec(csb, history_again) &&
+                again == got && conv_again == got_conv && state_again == got_rec_state &&
+                history_again == got_conv_state;
         }
+        if (!deterministic) std::fprintf(stderr, "recurrent chunk repeatability failed\n");
+        ok = ok && deterministic;
         std::printf("recurrent chunk state=%d %s: %s (max abs %.3g)\n", state,
-                    chunked ? "chunked" : "per-token", ok ? "ok" : "FAILED", max_abs);
+                    prepared ? "prepared" : chunked ? "chunked" : "per-token",
+                    ok ? "ok" : "FAILED", max_abs);
     }
     if (plan != nullptr) yuuka_plan_destroy(plan);
     release(scb);
@@ -1784,9 +1822,10 @@ int main() {
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
     ok = test_attention_prefill_mma(device, stream, event, rng) && ok;
-    ok = test_recurrent_chunk(device, stream, event, rng, 128, false) && ok;
-    ok = test_recurrent_chunk(device, stream, event, rng, 128, true) && ok;
-    ok = test_recurrent_chunk(device, stream, event, rng, 64, false) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::PerToken) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::Chunkwise) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 64, RecurrentPath::PerToken) && ok;
+    ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::Prepared) && ok;
 
     yuuka_event_destroy(event);
     yuuka_stream_destroy(stream);

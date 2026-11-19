@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 4
+#define YUUKA_HIP_ABI_VERSION 5
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -329,6 +329,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   RECURRENT_CHUNK:     buf0 conv_state, buf1 matrix_state, buf2 qkv, buf3 z,
  *                        buf4 alpha, buf5 beta, buf6 conv weights, buf7 dt,
  *                        buf8 a, buf9 norm, buf10 out, buf11 conv scratch;
+ *                        optional buf12 triangular scratch or buf13 prepared
+ *                        FP32 Q[rows,groups,128], K[rows,groups,128],
+ *                        decay[rows,heads], beta[rows,heads] (state=128);
  *                        n={rows,groups,heads,state,conv_dim,inner};
  *                        u[0]=conv kernel; f[0]=eps; f[1]=q scale
  *   EMBEDDING_BATCH:     buf0 weight table, buf1 out, buf2 int32 tokens;

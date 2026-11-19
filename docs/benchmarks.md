@@ -124,6 +124,8 @@ records the next F16 KV comparison, with one FFN row in the ordinary
 prefill output tail.
 The [MMQ shape expansion](prefill-optimization/acceptance/04a-mmq-shapes.md)
 records projection shape medians and the short- and long-prompt A/B.
+The [prepared GDN comparison](prefill-optimization/acceptance/04b-gdn.md)
+records the recurrence timings and the model-state comparison by lane mapping.
 
 ## Decode: output length
 

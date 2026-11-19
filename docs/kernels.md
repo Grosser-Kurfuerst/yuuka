@@ -21,15 +21,15 @@ Phase 3 adds the prefill family: rocWMMA FP16 and quantized GEMM for `F16`,
 `F32`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K`; a rocBLAS FP16
 baseline with an explicit FP32-to-FP16 cast; causal GQA Flash Attention over
 prompt chunks; chunked prefill with per-chunk KV writes; row-batched RMSNorm,
-head RMSNorm, RoPE, embedding, and KV-write kernels; and a fused gated delta-net
-chunk kernel that performs convolution, L2 normalization, state update, and
-gated RMSNorm in two launches per layer. `backend/hip.SelectPrefillPath` is the
+head RMSNorm, RoPE, embedding, and KV-write kernels; and a gated delta-net
+chunk operation that performs convolution, L2 normalization, state update,
+and gated RMSNorm. `backend/hip.SelectPrefillPath` is the
 measured dispatch table described in section 9.
 
 Phase 4 adds the paged KV family: decode and prefill attention kernels that
 resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
-token and position from device memory, and a C ABI (version 4) for
+token and position from device memory, and a versioned C ABI for
 device-to-device block copies and HIP Graph capture/replay. KV pools support
 F32 (default), F16, and Q8_0; see section 7.3. Prefill attention runs on the
 FP16 MMA kernel for F32 and F16 pools whose shape it covers, and on the scalar
@@ -840,25 +840,26 @@ traffic without reducing occupancy:
   plain `kernel-1`-tap FIR over the raw chunk, because the carry state holds
   only the previous raw inputs, so one thread per output element replaces a
   serial per-channel walk over the chunk; a second small kernel writes the
-  trailing raw inputs for the next chunk. That is four launches per layer on the
-  register path (convolution, carry state, recurrence, gated RMSNorm) against
-  three before, and the convolution dropped from 26.4 ms to 8.7 ms per 512-row
-  chunk, with the outputs unchanged because the tap summation order is the
-  same. The register-resident path (`gdn_chunk_splitreg_f32_kernel`) covers
+  trailing raw inputs for the next chunk. The convolution dropped from 26.4 ms
+  to 8.7 ms per 512-row chunk, with the outputs unchanged because the tap
+  summation order is the same. The register-resident path covers
   state size 128, where four lanes cooperate on one state column and each lane
   holds 32 of the 128 state rows in registers for the whole chunk. A layer
-  exposes `heads * (state / 32)` workgroups instead of `heads` workgroups; q/k
-  normalization is recomputed per workgroup, and the per-row cost is two block
-  barriers for the q/k and decay/beta handoff. The q and k partial reductions
-  are wave shuffles combined through shared memory, and the per-column `S^T k`
-  and `S^T q` dot products are summed across the four lanes with shuffles.
+  exposes `heads * (state / 32)` workgroups. On gfx1151, for chunks of at
+  least 128 rows whose FFN gate buffer fits the preparation span, a separate
+  launch writes the normalized Q/K per token and key group, and the decay
+  and beta per token and head. The core reads these FP32 arrays with no
+  per-token block barriers. The FFN and recurrence use the scratch in stream
+  order. The scratch slot is available from C ABI 5 and is mutually exclusive
+  with the triangular scratch slot. Without either span, the register core
+  recomputes Q/K per column workgroup using two block barriers per row.
+  Both cores sum `S^T k` and `S^T q` across the four lanes with shuffles.
   Gated RMSNorm runs as a separate row kernel over each `(row, head)` pair,
   because splitting columns across workgroups would otherwise break the
   per-head normalization domain. State sizes other than 128 use the fused
   one-column-per-thread kernel, which reads and writes the state for every row.
   Both paths keep the row-major state layout shared with the decode kernel.
-  The register path is the measured fast path; see the attribution in
-  [benchmarks.md](benchmarks.md).
+  [Prepared recurrence measurements](prefill-optimization/acceptance/04b-gdn.md)
 
 ## 9. Gated delta-net
 

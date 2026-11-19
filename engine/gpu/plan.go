@@ -5,6 +5,7 @@ package gpu
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
 )
@@ -643,6 +644,14 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		return err
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
+	var prepared *hip.Buffer
+	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
+	preparedWidth := uint64(convDim - inner + 2*rank)
+	if arch == "gfx1151" && stateSize == 128 && rows >= 128 &&
+		preparedWidth <= p.ffnGate.Bytes()/4/uint64(rows) {
+		// The FFN writes this buffer after the recurrent op on the same stream.
+		prepared = p.ffnGate
+	}
 	if err := plan.AddRecurrentChunkAt(hip.RecurrentChunkArgs{
 		ConvState:   s.conv[layerIndex],
 		State:       s.recState[layerIndex],
@@ -656,21 +665,16 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		Norm:        norm.buf,
 		Conv:        p.conv,
 		Out:         p.gdnNorm,
-		// The chunkwise gated delta-net kernel is implemented and validated
-		// against this path (see kernels/hip/prefill/gdn_chunk.hip), but it is
-		// slower on gfx1151: its dense products run on the FMA pipe with the
-		// state in registers and are LDS-latency bound, so the per-token kernel
-		// stays selected. Supplying Scratch here selects the chunked path.
-		Scratch:   nil,
-		Rows:      rows,
-		Groups:    int64(cfg.SSMGroupCount),
-		Heads:     rank,
-		StateSize: stateSize,
-		ConvDim:   convDim,
-		Inner:     inner,
-		Kernel:    int64(cfg.SSMConvKernel),
-		Eps:       cfg.RMSNormEps,
-		QScale:    qScale,
+		Prepared:    prepared,
+		Rows:        rows,
+		Groups:      int64(cfg.SSMGroupCount),
+		Heads:       rank,
+		StateSize:   stateSize,
+		ConvDim:     convDim,
+		Inner:       inner,
+		Kernel:      int64(cfg.SSMConvKernel),
+		Eps:         cfg.RMSNormEps,
+		QScale:      qScale,
 	}); err != nil {
 		return err
 	}

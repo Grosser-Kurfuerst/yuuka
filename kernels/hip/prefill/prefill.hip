@@ -386,8 +386,7 @@ __global__ void gdn_chunk_f32_kernel(float * rec, const float * conv,
 // one column, each holding 32 of its 128 state rows. A layer therefore exposes
 // heads * (State / 32) workgroups instead of heads workgroups, and the only
 // block barriers are the two required by the q/k and decay/beta handoff per
-// token row. q/k normalization is recomputed per workgroup; that work is
-// negligible next to the state update.
+// token row. Each column workgroup recomputes Q/K normalization.
 template <int State>
 __global__ void gdn_chunk_splitreg_f32_kernel(float * rec, const float * conv,
                                               const float * alpha, const float * beta,
@@ -474,6 +473,105 @@ __global__ void gdn_chunk_splitreg_f32_kernel(float * rec, const float * conv,
     #pragma unroll
     for (int j = 0; j < kChunk; ++j) {
         matrix[(r0 + j) * State + col] = column[j];
+    }
+}
+
+__global__ void gdn_prepare_splitreg_f32_kernel(
+        const float * conv, const float * alpha, const float * beta,
+        const float * dt, const float * a, float * q, float * k,
+        float * decay, float * beta_gate, int groups, int heads, int conv_dim,
+        float eps, float q_scale) {
+    constexpr int state = 128;
+    const int group = blockIdx.x;
+    const int64_t row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int64_t key_offset = (row * groups + group) * state;
+    const float q_raw = conv[row * conv_dim + group * state + tid];
+    const float k_raw = conv[row * conv_dim + (groups + group) * state + tid];
+    const float q_sum = warp_reduce_sum(q_raw * q_raw);
+    const float k_sum = warp_reduce_sum(k_raw * k_raw);
+    __shared__ float q_part[4];
+    __shared__ float k_part[4];
+    if ((tid & 31) == 0) {
+        q_part[tid / 32] = q_sum;
+        k_part[tid / 32] = k_sum;
+    }
+    for (int64_t head = group + static_cast<int64_t>(tid) * groups;
+         head < heads; head += static_cast<int64_t>(state) * groups) {
+        const int64_t index = row * heads + head;
+        const float raw = alpha[index] + dt[head];
+        const float softplus = raw > 20.0f ? raw : log1pf(expf(raw));
+        decay[index] = expf(softplus * a[head]);
+        beta_gate[index] = 1.0f / (1.0f + expf(-beta[index]));
+    }
+    __syncthreads();
+    float q_total = 0.0f;
+    float k_total = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        q_total += q_part[w];
+        k_total += k_part[w];
+    }
+    q[key_offset + tid] = q_raw * q_scale * rsqrtf(q_total + eps);
+    k[key_offset + tid] = k_raw * rsqrtf(k_total + eps);
+}
+
+constexpr int kGdnPreparedLanes = 4;
+
+__global__ void gdn_chunk_prepared_f32_kernel(
+        float * rec, const float * conv, const float * q, const float * k,
+        const float * decay, const float * beta, float * out, int rows,
+        int groups, int heads, int conv_dim, int inner) {
+    constexpr int state = 128;
+    constexpr int lanes = kGdnPreparedLanes;
+    constexpr int cols = 128 / lanes;
+    constexpr int part_rows = state / lanes;
+    const int head = blockIdx.x;
+    const int col = blockIdx.y * cols + threadIdx.x / lanes;
+    const int part = threadIdx.x % lanes;
+    const int first = part * part_rows;
+    const int key_dim = groups * state;
+    const int key_offset = (head % groups) * state + first;
+    float * matrix = rec + static_cast<int64_t>(head) * state * state + first * state + col;
+    float column[part_rows];
+    #pragma unroll
+    for (int j = 0; j < part_rows; ++j) {
+        column[j] = matrix[j * state];
+    }
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * qr = q + r * key_dim + key_offset;
+        const float * kr = k + r * key_dim + key_offset;
+        const float d = decay[r * heads + head];
+        const float b = beta[r * heads + head];
+        float sk = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < part_rows; ++j) {
+            column[j] *= d;
+            sk = fmaf(column[j], kr[j], sk);
+        }
+        #pragma unroll
+        for (int distance = 1; distance < lanes; distance *= 2) {
+            sk += __shfl_xor_sync(0xffffffffffffffffull, sk, distance);
+        }
+        const float value = conv[r * conv_dim + 2 * key_dim + head * state + col];
+        const float delta = (value - sk) * b;
+        float result = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < part_rows; ++j) {
+            column[j] = fmaf(kr[j], delta, column[j]);
+            result = fmaf(column[j], qr[j], result);
+        }
+        #pragma unroll
+        for (int distance = 1; distance < lanes; distance *= 2) {
+            result += __shfl_xor_sync(0xffffffffffffffffull, result, distance);
+        }
+        if (part == 0) {
+            out[r * inner + head * state + col] = result;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < part_rows; ++j) {
+        matrix[j * state] = column[j];
     }
 }
 
@@ -827,7 +925,7 @@ void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 float * alpha, float * beta,
                                 const float * conv_weights, const float * dt,
                                 const float * a, const float * norm, float * conv,
-                                float * out, float * scratch, int rows,
+                                float * out, float * scratch, float * prepared, int rows,
                                 int groups, int heads, int state_size,
                                 int conv_dim, int inner, int conv_kernel,
                                 float eps, float q_scale, hipStream_t stream) {
@@ -847,6 +945,20 @@ void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
             launch_gdn_chunked_f32(rec_state, conv, alpha, beta, dt, a, out,
                                    scratch, rows, groups, heads, state_size,
                                    conv_dim, inner, eps, q_scale, stream);
+        } else if (prepared != nullptr) {
+            const int64_t key_count = static_cast<int64_t>(rows) * groups * 128;
+            float * q = prepared;
+            float * k = q + key_count;
+            float * decay = k + key_count;
+            float * beta_gate = decay + static_cast<int64_t>(rows) * heads;
+            const dim3 prep_grid(static_cast<unsigned>(groups), static_cast<unsigned>(rows));
+            gdn_prepare_splitreg_f32_kernel<<<prep_grid, 128, 0, stream>>>(
+                conv, alpha, beta, dt, a, q, k, decay, beta_gate,
+                groups, heads, conv_dim, eps, q_scale);
+            const dim3 grid(static_cast<unsigned>(heads), kGdnPreparedLanes);
+            gdn_chunk_prepared_f32_kernel<<<grid, 128, 0, stream>>>(
+                rec_state, conv, q, k, decay, beta_gate, out,
+                rows, groups, heads, conv_dim, inner);
         } else {
             // The split-register kernel is the reference form of the same
             // recurrence and the fallback when no chunk scratch is supplied.

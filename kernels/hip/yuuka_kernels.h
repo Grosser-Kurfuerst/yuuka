@@ -275,15 +275,15 @@ void launch_gdn_chunked_f32(float * rec, float * conv, float * alpha,
 
 // launch_recurrent_chunk_f32 runs the convolution, the gated delta-net
 // recurrence, and the gated RMSNorm of one recurrent layer chunk. alpha and
-// beta are overwritten with the activated gates. scratch holds the chunked
-// path's triangular intermediates and may be null, in which case state sizes
-// other than 128 take the per-token fallback.
+// beta are overwritten only on the triangular path selected by scratch.
+// A separate prepared span can hold normalized Q/K and activated gates for
+// the register path. State sizes other than 128 use the generic kernel.
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 const float * qkv, const float * z,
                                 float * alpha, float * beta,
                                 const float * conv_weights, const float * dt,
                                 const float * a, const float * norm, float * conv,
-                                float * out, float * scratch, int rows,
+                                float * out, float * scratch, float * prepared, int rows,
                                 int groups, int heads, int state_size,
                                 int conv_dim, int inner, int conv_kernel,
                                 float eps, float q_scale, hipStream_t stream);

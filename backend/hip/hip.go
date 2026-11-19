@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 4
+const RequiredABI = 5
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -1514,8 +1514,12 @@ type RecurrentChunkArgs struct {
 	Out         *Buffer
 	OutOff      uint64
 	// Scratch holds two chunk x chunk matrices per 32-token chunk and head for
-	// the chunked path. It may be nil, which selects the per-token kernel.
-	Scratch   *Buffer
+	// the chunkwise path. It is mutually exclusive with Prepared.
+	Scratch *Buffer
+	// Prepared holds FP32 Q, K, decay and beta during a 128-state recurrence.
+	// With no scratch buffers, preparation runs inside the per-token core.
+	Prepared *Buffer
+
 	Rows      int64
 	Groups    int64
 	Heads     int64
@@ -1552,6 +1556,11 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 				got, chunks*2*32*32*a.Heads)
 		}
 	}
+	if a.Prepared != nil {
+		if err := p.check(a.Prepared); err != nil {
+			return err
+		}
+	}
 	op := C.yuuka_op{code: C.YUUKA_OP_RECURRENT_CHUNK}
 	op.buf[0] = a.ConvState.ptr
 	op.buf[1] = a.State.ptr
@@ -1570,6 +1579,9 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 	op.off[10] = C.uint64_t(a.OutOff)
 	if a.Scratch != nil {
 		op.buf[12] = a.Scratch.ptr
+	}
+	if a.Prepared != nil {
+		op.buf[13] = a.Prepared.ptr
 	}
 	op.n[0] = C.uint64_t(a.Rows)
 	op.n[1] = C.uint64_t(a.Groups)
