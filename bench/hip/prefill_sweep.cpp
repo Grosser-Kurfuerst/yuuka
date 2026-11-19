@@ -1,7 +1,7 @@
 // prefill_sweep compares prefill matrix implementations on gfx1151:
 // per-row GEMV, batched GEMV, custom rocWMMA GEMM, the rocBLAS route, and the
-// dequant-plus-rocBLAS route for K-quant weights. It is an offline
-// dispatch-table input, not a hot-path tool.
+// dequant-plus-rocBLAS route for K-quant weights. Use --direct-mmq to
+// isolate MMQ at all model shapes and representative row boundaries.
 
 #include "yuuka_hip.h"
 
@@ -229,6 +229,47 @@ void run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
     release(wb);
 }
 
+bool run_direct_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+                    yuuka_dtype dtype, int64_t n_in, int64_t n_out, int64_t rows) {
+    const uint64_t rb = row_bytes(dtype, n_in);
+    const int block_bytes = dtype == YUUKA_DTYPE_Q4_K ? 144 : 176;
+    std::mt19937 rng(12345);
+    std::vector<uint8_t> weights(rb * n_out);
+    for (auto & value : weights) value = static_cast<uint8_t>(rng());
+    for (size_t i = 0; i < weights.size(); i += block_bytes) {
+        weights[i] = weights[i + 2] = 0x11;
+        weights[i + 1] = weights[i + 3] = 0x1c;
+    }
+    const std::vector<float> x(n_in * rows, 0.25f);
+    Buffer wb, xb, ob, qs, ds;
+    bool ok = alloc(device, wb, weights.size()) && alloc(device, xb, x.size() * 4) &&
+              alloc(device, ob, n_out * rows * 4) && alloc(device, qs, x.size()) &&
+              alloc(device, ds, x.size() / 32 * 8) &&
+              check(yuuka_memcpy_h2d(wb.buf, weights.data(), weights.size()), "h2d w") &&
+              check(yuuka_memcpy_h2d(xb.buf, x.data(), x.size() * 4), "h2d x") &&
+              check(yuuka_quantize_q8_1(stream, qs.buf, ds.buf, xb.buf, n_in, rows, event),
+                    "quantize") &&
+              check(yuuka_event_wait(event), "quantize wait");
+    if (ok) {
+        const auto result = bench_rows(device, stream, event, nullptr, "mmq", 9, [&]() {
+            ok = check(yuuka_gemm_mmq(stream, ob.buf, qs.buf, ds.buf, wb.buf, n_in,
+                                      n_out, rows, dtype, event), "mmq");
+        }, [&]() { return ok && check(yuuka_event_wait(event), "mmq wait"); });
+        ok = result.ok;
+        if (ok) {
+            std::printf("%s M=%lld N=%lld K=%lld mmq=%.6fms\n", dtype_name(dtype),
+                        static_cast<long long>(rows), static_cast<long long>(n_out),
+                        static_cast<long long>(n_in), result.ms);
+        }
+    }
+    release(ds);
+    release(qs);
+    release(ob);
+    release(xb);
+    release(wb);
+    return ok;
+}
+
 // run_lm_head compares the streaming LM head against one GEMV submission per
 // row for the shapes the prefill tail actually asks for. The output matrix is
 // the widest in the model and is read once, so the crossover between the two
@@ -297,7 +338,12 @@ void run_lm_head(yuuka_device * device, yuuka_stream * stream, yuuka_event * eve
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    const bool direct = argc == 2 && std::strcmp(argv[1], "--direct-mmq") == 0;
+    if (argc != 1 && !direct) {
+        std::fprintf(stderr, "usage: %s [--direct-mmq]\n", argv[0]);
+        return 2;
+    }
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
         std::fprintf(stderr, "SKIP: no HIP device: %s\n", yuuka_last_error());
@@ -308,6 +354,29 @@ int main() {
     if (!check(yuuka_stream_create(device, &stream), "stream") ||
         !check(yuuka_event_create(device, &event), "event")) {
         return 1;
+    }
+    if (direct) {
+        constexpr auto q4 = YUUKA_DTYPE_Q4_K;
+        constexpr auto q5 = YUUKA_DTYPE_Q5_K;
+        const struct {
+            yuuka_dtype dtype;
+            int64_t n_in;
+            int64_t n_out;
+        } cells[] = {
+            {q4, 2560, 1024}, {q4, 2560, 4096}, {q4, 2560, 8192}, {q4, 2560, 9216},
+            {q4, 4096, 2560}, {q4, 9216, 2560}, {q5, 2560, 8192}, {q5, 4096, 2560},
+        };
+        bool ok = true;
+        for (const auto & cell : cells) {
+            for (int64_t m : {128, 129, 192, 511, 512, 1024, 2048, 4096}) {
+                ok = run_direct_mmq(device, stream, event, cell.dtype, cell.n_in,
+                                    cell.n_out, m) && ok;
+            }
+        }
+        yuuka_event_destroy(event);
+        yuuka_stream_destroy(stream);
+        yuuka_device_close(device);
+        return ok ? 0 : 1;
     }
     const yuuka_dtype dtypes[] = {YUUKA_DTYPE_F16, YUUKA_DTYPE_Q8_0, YUUKA_DTYPE_Q4_K,
                                   YUUKA_DTYPE_Q5_K, YUUKA_DTYPE_Q6_K};

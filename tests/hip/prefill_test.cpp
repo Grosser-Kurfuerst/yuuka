@@ -583,6 +583,54 @@ bool test_gemm_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * e
     return ok;
 }
 
+bool test_gemm_mmq_row_tail(yuuka_device * device, yuuka_stream * stream,
+                            yuuka_event * event, std::mt19937 & rng) {
+    constexpr auto dtype = YUUKA_DTYPE_Q4_K;
+    constexpr int64_t width = 2560, channels = 1024, full_rows = 256;
+    constexpr float sentinel = -12345.0f;
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> x(width * full_rows);
+    for (float & value : x) value = dist(rng);
+    const auto packed = pack_weights(dtype, rng, width, channels);
+    const std::vector<float> initial(channels * full_rows, sentinel);
+    Buffer wb, xb, qs, ds, out;
+    bool ok = alloc(device, wb, packed.size()) && alloc(device, xb, x.size() * 4) &&
+              alloc(device, qs, x.size()) && alloc(device, ds, x.size() / 32 * 8) &&
+              alloc(device, out, initial.size() * 4) &&
+              upload(wb, packed.data(), packed.size()) && upload_vec(xb, x);
+    const auto run = [&](int64_t rows, std::vector<float> & output) {
+        return upload_vec(out, initial) &&
+               check(yuuka_gemm_mmq(stream, out.buf, qs.buf, ds.buf, wb.buf, width,
+                                    channels, rows, dtype, event), "mmq tail gemm") &&
+               check(yuuka_event_wait(event), "mmq tail wait") && download_vec(out, output);
+    };
+    std::vector<float> reference(initial.size()), got(initial.size());
+    ok = ok && check(yuuka_quantize_q8_1(stream, qs.buf, ds.buf, xb.buf, width,
+                                        full_rows, event), "mmq tail quantize") &&
+         check(yuuka_event_wait(event), "mmq tail quantize wait") && run(full_rows, reference);
+    for (int64_t rows : {129, 191, 255}) {
+        if (!ok || !run(rows, got)) {
+            ok = false;
+            break;
+        }
+        const size_t valid = size_t(rows * channels);
+        if (std::memcmp(got.data(), reference.data(), valid * sizeof(float)) != 0 ||
+            std::memcmp(got.data() + valid, initial.data() + valid,
+                        (got.size() - valid) * sizeof(float)) != 0) {
+            std::fprintf(stderr, "MMQ tail changed valid rows or wrote past row %lld\n",
+                         static_cast<long long>(rows));
+            ok = false;
+            break;
+        }
+    }
+    release(out);
+    release(ds);
+    release(qs);
+    release(xb);
+    release(wb);
+    return ok;
+}
+
 bool test_silu_mul_quant_q8_1(yuuka_device * device, yuuka_stream * stream,
                              yuuka_event * event, std::mt19937 & rng) {
     constexpr uint64_t width = 256, rows = 17, channels = 65, offset = 16;
@@ -1967,6 +2015,16 @@ int main() {
                        2560, 1024, 128, rng) && ok;
     ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K, "mmq Q5_K direct SSM out",
                        4096, 2560, 128, rng) && ok;
+    std::mt19937 tail_rng(137);
+    for (int64_t rows : {129, 192, 511}) {
+        ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q4_K, "mmq Q4_K partial K",
+                           2560, 1024, rows, tail_rng) && ok;
+    }
+    ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q4_K, "mmq Q4_K partial gate",
+                       2560, 4096, 129, tail_rng) && ok;
+    ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K, "mmq Q5_K partial SSM out",
+                       4096, 2560, 140, tail_rng) && ok;
+    ok = test_gemm_mmq_row_tail(device, stream, event, tail_rng) && ok;
     ok = test_blas(device, stream, event, rng) && ok;
     const struct {
         yuuka_dtype dtype;

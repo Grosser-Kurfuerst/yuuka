@@ -166,6 +166,11 @@ verified steps:
     first-content latency drops by at least 10 ms, and `pp128`, `pp512`, `pp2048`, and
     `pp8192` stay within `±1%`. Step 1a alone cannot reach `pp129 <= 78 ms` because Q6_K
     stays on generic MMQ padded to 256 rows until Stage 3.
+  - *Measured*: pp129 improved from 113.107 to 86.931 ms, pp511 from 256.411
+    to 217.648 ms, and the 140-token SSE first-content run from 125.826 to
+    97.752 ms. At pp8192, chunk 1024 improved from 4517.265 to 3906.133 ms
+    and chunk 4096 from 4514.581 to 3957.490 ms. Same-chunk logits matched
+    bitwise in all 18 cells. [Stage 1a acceptance](acceptance/01-direct-rows.md)
 - **Step 1b — Sub-128 projection crossover (`rows < 128`, GDN held fixed)**:
   - *Changes*: Benchmark masked `64`-row Direct MMQ, `wmma_k32`, `gemv_batch`, and the
     multi-row streaming kernel ([lm_head.hip](../../../kernels/hip/gemm/lm_head.hip), `1..16` rows)

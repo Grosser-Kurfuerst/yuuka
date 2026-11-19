@@ -541,7 +541,7 @@ its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/ph
 #### gfx1151 direct MMQ specialization
 
 The native launcher selects direct MMQ for the measured shapes in the
-table, `M` in 128, 512 or 2048, and 16-byte aligned packed weights and
+table, `M >= 128`, and 16-byte aligned packed weights and
 Q8_1 digits. gfx1151 compiles the direct WMMA path. Other device targets
 compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 
@@ -555,7 +555,11 @@ compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 The original Q4_K FFN cell `M=512, K=2560, N=9216` uses its compile-time
 dimensions. The other cells pass dimensions into the same tile algorithm.
 Each half of the generic grid's x range covers the same 128-channel
-tiles for a different 64-token half. The shared-memory allocation is 30 KiB.
+tiles for a different 64-token half. A workgroup returns before the first
+barrier if its half has no valid tokens. A partial half zeros invalid
+activation digits and scales and suppresses stores for those rows. Batches
+whose row count is a multiple of 128 use variants compiled without mask code,
+including the fixed FFN. The shared-memory allocation is 30 KiB.
 
 Within each 512-byte operand region, the specialized LDS layout stores
 two contiguous 16-value slices per row. Both halves of each wave load the
