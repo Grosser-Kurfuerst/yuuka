@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 9
+const RequiredABI = 10
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -780,6 +780,23 @@ func (p *Plan) AddGemvPairAt(a *Buffer, aOff uint64, b *Buffer, bOff uint64, x *
 	op.u[0] = C.uint32_t(dtypeA)
 	op.u[1] = C.uint32_t(dtypeB)
 	op.u[2] = C.uint32_t(epilogue)
+	return p.add(op)
+}
+
+// AddPrefillQ8Pair appends two equal-shaped Q8_0 projections over a shared
+// FP32 tile on gfx1151. WMMA rounds both operands to FP16 and accumulates
+// in FP32. Both row-major FP32 outputs have rows*nOut values.
+func (p *Plan) AddPrefillQ8Pair(a, b, x, outA, outB *Buffer, nIn, nOut, rows int64) error {
+	if nIn <= 0 || nOut <= 0 || rows <= 0 {
+		return errors.New("hip: prefill Q8_0 pair dimensions must be positive")
+	}
+	if err := p.check(a, b, x, outA, outB); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_PREFILL_Q8_0_PAIR}
+	op.buf[0], op.buf[1], op.buf[2], op.buf[3], op.buf[4] = a.ptr, b.ptr, x.ptr, outA.ptr, outB.ptr
+	op.n[0], op.n[1], op.n[2] = C.uint64_t(nIn), C.uint64_t(nOut), C.uint64_t(rows)
+	op.u[0], op.u[1] = C.YUUKA_DTYPE_Q8_0, C.YUUKA_DTYPE_Q8_0
 	return p.add(op)
 }
 

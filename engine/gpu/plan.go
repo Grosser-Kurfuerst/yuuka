@@ -842,17 +842,28 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillProjections(plan, p.norm, hidden, rows, []prefillProjection{
+	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
+	pair := arch == "gfx1151" && hidden == 2560 && rank == 32 &&
+		rows >= 128 && rows <= 2048 && beta.dtype == tensor.Q8_0 && alpha.dtype == tensor.Q8_0
+	projections := []prefillProjection{
 		{w: qkv, out: p.qkv, nOut: convDim},
 		{w: gate, out: p.z, nOut: inner},
 		{w: beta, out: p.beta, nOut: rank},
 		{w: alpha, out: p.alpha, nOut: rank},
-	}); err != nil {
+	}
+	if pair {
+		projections = projections[:2]
+	}
+	if err := m.prefillProjections(plan, p.norm, hidden, rows, projections); err != nil {
 		return err
+	}
+	if pair {
+		if err := plan.AddPrefillQ8Pair(beta.buf, alpha.buf, p.norm, p.beta, p.alpha, hidden, rank, rows); err != nil {
+			return err
+		}
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
 	var prepared *hip.Buffer
-	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
 	preparedWidth := uint64(convDim - inner + 2*rank)
 	if arch == "gfx1151" && stateSize == 128 && rows >= gdnPreparedMinRows &&
 		preparedWidth <= p.ffnGate.Bytes()/4/uint64(rows) {

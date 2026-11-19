@@ -150,6 +150,14 @@ func TestGPUStreamingTailsMatchControl(t *testing.T) {
 	checkPrefillAgainstControl(t, control, []int{513, 2050}, 2e-3)
 }
 
+func TestGPUNarrowQ8PairMatchesControl(t *testing.T) {
+	control := os.Getenv("YUUKA_TEST_PREFILL_NARROW_CONTROL")
+	if control == "" {
+		t.Skip("YUUKA_TEST_PREFILL_NARROW_CONTROL is not set")
+	}
+	checkPrefillAgainstControl(t, control, []int{128, 129, 511, 512, 1024, 2048}, 0)
+}
+
 func checkPrefillAgainstControl(t *testing.T, control string, prompts []int, tolerance float64) {
 	t.Helper()
 	reader, tok, model, _ := goldenPrompt(t)

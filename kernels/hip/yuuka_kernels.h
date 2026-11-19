@@ -128,6 +128,9 @@ void launch_lm_head_pair_f32out(float * out0, float * out1, const float * x,
                                 const void * w0, const void * w1, uint64_t n_in,
                                 uint64_t n_out0, uint64_t n_out1, uint32_t dtype,
                                 int swiglu, hipStream_t stream);
+void launch_prefill_q8_0_pair(float * out0, float * out1, const float * x,
+                              const void * w0, const void * w1, uint64_t n_in,
+                              uint64_t n_out, uint64_t rows, hipStream_t stream);
 void launch_lm_head_f32out(float * out, const float * x, const void * w,
                            uint64_t n_in, uint64_t n_out, uint64_t rows,
                            uint32_t dtype, hipStream_t stream);

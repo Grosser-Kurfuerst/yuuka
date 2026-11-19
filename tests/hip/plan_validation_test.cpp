@@ -4,6 +4,7 @@
 #include "yuuka_hip.h"
 
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 
 namespace {
@@ -376,6 +377,42 @@ int main() {
             narrow_in.n[0] = 192;
             ok = expect(yuuka_plan_add(plan, &narrow_in), YUUKA_ERR_UNSUPPORTED,
                         "GEMV_RESIDUAL unaligned input") && ok;
+
+            yuuka_op narrow_pair{};
+            narrow_pair.code = YUUKA_OP_PREFILL_Q8_0_PAIR;
+            narrow_pair.buf[0] = narrow_pair.buf[1] = packed;
+            narrow_pair.buf[2] = narrow_pair.buf[3] = narrow_pair.buf[4] = rows;
+            narrow_pair.off[1] = 2176;
+            narrow_pair.off[3] = 2048;
+            narrow_pair.off[4] = 2240;
+            narrow_pair.n[0] = 128;
+            narrow_pair.n[1] = 16;
+            narrow_pair.n[2] = 3;
+            narrow_pair.u[0] = narrow_pair.u[1] = YUUKA_DTYPE_Q8_0;
+            yuuka_device_info info{};
+            ok = expect(yuuka_device_info_get(device, &info), YUUKA_OK, "device info") && ok;
+            const bool gfx1151 = std::strncmp(info.gcn_arch, "gfx1151", 7) == 0;
+            ok = expect(yuuka_plan_add(plan, &narrow_pair),
+                        gfx1151 ? YUUKA_OK : YUUKA_ERR_UNSUPPORTED,
+                        "PREFILL_Q8_0_PAIR valid disjoint ranges") && ok;
+            if (gfx1151) {
+                yuuka_op invalid = narrow_pair;
+                invalid.off[4] -= 4;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_INVALID_ARGUMENT,
+                            "PREFILL_Q8_0_PAIR overlapping outputs") && ok;
+                invalid = narrow_pair;
+                invalid.off[2] = 4;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_INVALID_ARGUMENT,
+                            "PREFILL_Q8_0_PAIR invalid input alignment") && ok;
+                invalid = narrow_pair;
+                invalid.buf[1] = tiny;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_INVALID_ARGUMENT,
+                            "PREFILL_Q8_0_PAIR truncated weights") && ok;
+                invalid = narrow_pair;
+                invalid.u[1] = YUUKA_DTYPE_F16;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_UNSUPPORTED,
+                            "PREFILL_Q8_0_PAIR incompatible dtype") && ok;
+            }
             yuuka_buffer_free(rows);
             yuuka_buffer_free(packed);
         }

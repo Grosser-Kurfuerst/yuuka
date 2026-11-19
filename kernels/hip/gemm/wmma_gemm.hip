@@ -859,6 +859,104 @@ void launch_wmma_swiglu_selected(float * out, const float * x,
 
 namespace yuuka {
 
+// The paired narrow kernel feeds WMMA directly from registers. The upper
+// half-wave starts with the second eight K values, as in rocWMMA's GFX11
+// operand layout. FP16 conversions and the K16 accumulation order match the
+// existing single-matrix path.
+#if defined(__gfx1151__)
+using NarrowOperand = _Float16 __attribute__((ext_vector_type(16)));
+using NarrowAccumulator = float __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ void narrow_half4(NarrowOperand & operand, int group,
+                                             float a, float b, float c, float d) {
+    using Words = uint32_t __attribute__((ext_vector_type(8)));
+    auto words = __builtin_bit_cast(Words, operand);
+    words[group * 2] = __builtin_bit_cast(uint32_t, __floats2half2_rn(a, b));
+    words[group * 2 + 1] = __builtin_bit_cast(uint32_t, __floats2half2_rn(c, d));
+    operand = __builtin_bit_cast(NarrowOperand, words);
+}
+
+__device__ __forceinline__ NarrowOperand narrow_q8_operand(const uint8_t * digits,
+                                                           float scale, int half_wave) {
+    NarrowOperand operand{};
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t word = load_u32_pair(digits + 4 * (g ^ (2 * half_wave)));
+        narrow_half4(operand, g,
+            scale * int8_t(word), scale * int8_t(word >> 8),
+            scale * int8_t(word >> 16), scale * int8_t(word >> 24));
+    }
+    return operand;
+}
+#endif
+
+template <int Waves>
+__global__ void prefill_q8_0_pair_wmma_kernel(float * out0, float * out1,
+                                               const float * x, const uint8_t * w0,
+                                               const uint8_t * w1, int64_t width,
+                                               int64_t rank, int64_t rows) {
+#if defined(__gfx1151__)
+    const int lane = threadIdx.x % 32;
+    const int half_wave = lane / 16;
+    const int64_t row = (int64_t(blockIdx.y) * Waves + threadIdx.x / 32) * 16;
+    const int64_t channel = int64_t(blockIdx.x) * 16 + lane % 16;
+    const int64_t input_row = row + lane % 16;
+    const int64_t weight_stride = width / 32 * 34;
+    w0 += channel * weight_stride;
+    w1 += channel * weight_stride;
+    NarrowAccumulator result0{}, result1{};
+    for (int64_t k = 0; k < width; k += 32) {
+        const float scale0 = load_f16_device(w0);
+        const float scale1 = load_f16_device(w1);
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            NarrowOperand activation{};
+            if (input_row < rows) {
+                const auto * tile = reinterpret_cast<const float4 *>(x + input_row * width + k + part * 16);
+                #pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    const float4 value = tile[g ^ (2 * half_wave)];
+                    narrow_half4(activation, g, value.x, value.y, value.z, value.w);
+                }
+            }
+            const auto beta = narrow_q8_operand(w0 + 2 + part * 16, scale0, half_wave);
+            const auto alpha = narrow_q8_operand(w1 + 2 + part * 16, scale1, half_wave);
+            result0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(activation, beta, result0);
+            result1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(activation, alpha, result1);
+        }
+        w0 += 34;
+        w1 += 34;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int64_t token = row + 2 * i + half_wave;
+        if (token < rows) {
+            out0[token * rank + channel] = result0[i];
+            out1[token * rank + channel] = result1[i];
+        }
+    }
+#else
+    (void)out0;
+    (void)out1;
+    (void)x;
+    (void)w0;
+    (void)w1;
+    (void)width;
+    (void)rank;
+    (void)rows;
+#endif
+}
+
+void launch_prefill_q8_0_pair(float * out0, float * out1, const float * x,
+                              const void * w0, const void * w1, uint64_t n_in,
+                              uint64_t n_out, uint64_t rows, hipStream_t stream) {
+    constexpr int waves = 1;
+    const dim3 grid(n_out / 16, (rows + 16 * waves - 1) / (16 * waves));
+    prefill_q8_0_pair_wmma_kernel<waves><<<grid, waves * 32, 0, stream>>>(
+        out0, out1, x, static_cast<const uint8_t *>(w0), static_cast<const uint8_t *>(w1),
+        n_in, n_out, rows);
+}
+
 void launch_gemm_wmma_f32out(float * out, const float * x, const void * w,
                              uint64_t n_in, uint64_t n_out, uint64_t batch,
                              uint32_t dtype, hipStream_t stream) {

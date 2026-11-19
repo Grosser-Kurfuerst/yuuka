@@ -1,6 +1,6 @@
 # Stage 2 — Pair the narrow Q8_0 recurrent projections
 
-Execution order 6. Start from the accepted Stage 1 routes and freeze chunk size in each A/B. Each of the 24 recurrent layers reads one normalized tile for QKV, gate, beta and alpha. Beta and alpha each have 32 outputs for 2560 inputs on the reference model. The original 48 launches consumed 6.17 ms at pp128 and 8.79 ms at pp512. The two candidates below change different arithmetic. [Roadmap attribution](roadmap.md)
+Execution order 6. Start from the accepted Stage 1 routes and freeze chunk size in each A/B. Each of the 24 recurrent layers reads one normalized tile for QKV, gate, beta and alpha. Beta and alpha each have 32 outputs for 2560 inputs on the reference model. The original 48 launches consumed 6.17 ms at pp128 and 8.79 ms at pp512. The candidates below evaluate distinct arithmetic contracts. [Roadmap attribution](roadmap.md)
 
 ## 2a — One paired launch over FP32 input
 
@@ -16,6 +16,25 @@ Open this trial only if 2a misses the product gate. Give it an independent force
 For each 32-value block, pack the signed weight and activation digits in the same byte order. Compute eight four-byte dot products using the gfx1151 form `__builtin_amdgcn_sudot4(true, w4, true, x4, 0, false)` and sum them in int32. Both `true` arguments select signed bytes. Apply `weightScale * activationScale` once to the block dot and accumulate in FP32. The existing matvec shows the operand packing and builtin call. [Signed dot implementation](../../../kernels/hip/gemv/gemv_i8.hip)
 
 Q8_0 has no minimum correction. Verify both outputs against a CPU product of the **same quantized bytes**. Even a correct integer product can move the exponential decay and sigmoid inputs. Save control/candidate snapshots after each chunk with a nonzero carried state and parse each layer's convolution history and recurrent matrix separately. Compare every value, report max absolute error and the responsible layer/chunk. Proposed additional state guard for this trial: finite values, ≤ 0.05 max absolute difference per state tensor against the original route, alongside the existing native recurrence gates. [Recurrence state checks](../phase1/acceptance/04b-gdn.md)
+
+## 2c — Preserve the original WMMA arithmetic
+
+The FP32 pair passed the CPU tensor and throughput gates but exceeded the
+same-chunk model-logit bound. The approved equivalent candidate retains the
+current FP16 operand conversions and ordered K16 WMMA operations with FP32
+accumulation. Share the activation fragment between the two projections.
+Decode their Q8_0 blocks in registers and write the outputs to independent
+row-major FP32 spans. Preserve the GFX11 upper half-wave K order.
+
+The CPU tensor oracle applies FP16 rounding to both operands before the
+dot and gates at `1e-5` on a dyadic fixture whose partial sums fit in
+FP32 in any order. Also run the broader random fixture and require both
+native output arrays to match legacy WMMA bitwise on both fixtures.
+Require the same bitwise agreement for full model logits through eight
+decode steps and recurrent snapshots. Include both input prompts and the
+two-call 512+512 test. The paired upstream 5% gate still applies at all four
+lengths. Retain the verified original path for unmeasured or losing row
+bands. [Trial record](acceptance/06-narrow-q8-projections.md)
 
 ## Promotion decision
 

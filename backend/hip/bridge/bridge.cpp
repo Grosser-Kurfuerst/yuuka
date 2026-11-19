@@ -34,6 +34,7 @@ struct yuuka_event {
 
 struct yuuka_plan {
     std::vector<yuuka_op> ops;
+    bool gfx1151;
 };
 
 struct yuuka_graph {
@@ -479,6 +480,37 @@ yuuka_status validate_gemv_pair_plan_op(const yuuka_op & op) {
         !buffer_range_ok(op.buf[3], op.off[3], output_bytes_a) ||
         (epilogue == 0 && !buffer_range_ok(op.buf[4], op.off[4], output_bytes_b))) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv pair buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_prefill_q8_0_pair(const yuuka_op & op) {
+    const uint64_t width = op.n[0], rank = op.n[1], rows = op.n[2];
+    if (width == 0 || rank == 0 || rows == 0 ||
+        width > INT32_MAX || rank > INT32_MAX || rows > INT32_MAX) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prefill Q8_0 pair dimensions");
+    }
+    if (op.u[0] != YUUKA_DTYPE_Q8_0 || op.u[1] != YUUKA_DTYPE_Q8_0 ||
+        width % 128 != 0 || rank % 16 != 0) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "prefill Q8_0 pair needs Q8_0 weights, width divisible by 128 and rank divisible by 16");
+    }
+    const uint64_t weight_bytes = (width / 32) * 34 * rank;
+    const uint64_t out_bytes = rows * rank * sizeof(float);
+    const uint64_t bytes[] = {weight_bytes, weight_bytes, rows * width * sizeof(float),
+                              out_bytes, out_bytes};
+    constexpr uint64_t align[] = {2, 2, 16, 4, 4};
+    for (int i = 0; i < 5; ++i) {
+        if (op.off[i] % align[i] != 0 || !buffer_range_ok(op.buf[i], op.off[i], bytes[i])) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prefill Q8_0 pair buffer %d range or alignment", i);
+        }
+    }
+    for (int dst = 3; dst < 5; ++dst) {
+        for (int src = 0; src < dst; ++src) {
+            if (op.buf[src] == op.buf[dst] && op.off[src] < op.off[dst] + bytes[dst] &&
+                op.off[dst] < op.off[src] + bytes[src]) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "prefill Q8_0 pair output overlaps buffer %d", src);
+            }
+        }
     }
     return YUUKA_OK;
 }
@@ -2249,6 +2281,12 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                                               op.n[1], op.n[2], op.u[0],
                                               int(op.u[2]), stream);
             break;
+        case YUUKA_OP_PREFILL_Q8_0_PAIR:
+            yuuka::launch_prefill_q8_0_pair(
+                op_ptr<float>(op, 3), op_ptr<float>(op, 4), op_ptr<const float>(op, 2),
+                op_ptr<const void>(op, 0), op_ptr<const void>(op, 1),
+                op.n[0], op.n[1], op.n[2], stream);
+            break;
         case YUUKA_OP_RECURRENT_TOKEN:
             yuuka::launch_recurrent_token_f32(
                 op_ptr<float>(op, 0),
@@ -3519,7 +3557,10 @@ YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out) 
         if (dev == nullptr || out == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "device or plan handle is null");
         }
-        *out = new yuuka_plan();
+        const char * arch = dev->prop.gcnArchName;
+        const bool gfx1151 = std::strncmp(arch, "gfx1151", 7) == 0 &&
+                             (arch[7] == '\0' || arch[7] == ':');
+        *out = new yuuka_plan{{}, gfx1151};
         return YUUKA_OK;
     });
 }
@@ -3533,7 +3574,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_SILU_MUL_QUANT_Q8_1) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_PREFILL_Q8_0_PAIR) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3603,6 +3644,12 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_GEMV_PAIR:
                 status = validate_gemv_pair_plan_op(*op);
+                break;
+            case YUUKA_OP_PREFILL_Q8_0_PAIR:
+                if (!plan->gfx1151) {
+                    return fail(YUUKA_ERR_UNSUPPORTED, "prefill Q8_0 pair requires gfx1151");
+                }
+                status = validate_prefill_q8_0_pair(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

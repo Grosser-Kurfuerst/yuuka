@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 9
+#define YUUKA_HIP_ABI_VERSION 10
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -144,7 +144,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_CONV_L2NORM = 40,
     YUUKA_OP_GEMV_RESIDUAL = 41,
     YUUKA_OP_GEMV_PAIR = 42,
-    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43
+    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43,
+    YUUKA_OP_PREFILL_Q8_0_PAIR = 44
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -368,6 +369,11 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   SILU_MUL_QUANT_Q8_1: buf0 FP32 gate, buf1 FP32 up, buf2 int8 dst,
  *                        buf3 float2 block scales; n={width,rows}; offsets
  *                        must be aligned to 16, 16, 4 and 8 bytes
+ *   PREFILL_Q8_0_PAIR:   buf0/1 Q8_0 weights, buf2 shared FP32 inputs,
+ *                        buf3/4 FP32 outputs; n={n_in,n_out,rows};
+ *                        u[0/1]=Q8_0; gfx1151 only, n_in multiple of 128
+ *                        and n_out multiple of 16. WMMA rounds the
+ *                        inputs and dequantized weights to FP16.
  *   GEMM with path MMQ:  buf0 packed weights, buf1 Q8_1 int8 activations,
  *                        buf2 FP32 out, buf3 float2 block scales;
  *                        n={n_in,n_out,rows}; u[0]=Q4_K/Q5_K/Q6_K;

@@ -554,6 +554,18 @@ uses the plain quantizer's scale, rounding and sum rules and skips
 materializing the activated FP32 tensor. The compact final FFN uses
 its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/phase1/acceptance/05-ffn-fusion.md)
 
+#### gfx1151 narrow Q8_0 pair
+
+On gfx1151 the recurrent prefill plan pairs the Q8_0 beta and alpha
+projections at input width 2560, output width 32 and chunk rows
+128–2048. The pair reads one normalized FP32 tile and writes independent
+FP32 outputs. Packed Q8_0 weights and input are rounded to FP16 in
+registers. A wave reuses the activation fragment across both WMMA
+products and preserves the legacy FP32 accumulation order.
+
+`PREFILL_Q8_0_PAIR` is opcode 44 in ABI 10. The old projection
+routes cover other shapes, dtypes and devices. [Narrow pair validation and timing](prefill-optimization/phase2/acceptance/06-narrow-q8-projections.md)
+
 #### gfx1151 direct MMQ specialization
 
 The native launcher selects direct MMQ for the measured shapes in the

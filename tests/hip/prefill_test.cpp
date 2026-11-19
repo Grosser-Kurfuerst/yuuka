@@ -668,6 +668,121 @@ bool test_gemm_mmq_row_tail(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
+// Use the binary16 spacing and the default nearest-even rounding mode as
+// the independent CPU oracle for the finite operand range of the fixture.
+float round_pair_fp16(float value) {
+    int exponent = 0;
+    std::frexp(value, &exponent);
+    const int precision = std::min(24, 11 - exponent);
+    return std::ldexp(std::nearbyint(std::ldexp(value, precision)), -precision);
+}
+
+bool test_prefill_q8_pair(yuuka_device * device, yuuka_stream * stream,
+                          yuuka_event * event, int64_t rows, bool exact_sum,
+                          std::mt19937 & rng) {
+    constexpr int64_t width = 2560, rank = 32, stride = width / 32 * 34;
+    const size_t valid = rows * rank;
+    std::uniform_real_distribution<float> input(-0.5f, 0.5f);
+    std::uniform_int_distribution<int> exact_input(-7, 7);
+    std::vector<float> x(width * rows);
+    for (float & value : x) {
+        // After FP16 rounding this fixture is on a 1/64 grid. A value just
+        // above the grid point also makes the operand conversion observable.
+        value = exact_sum ? std::nextafter(std::ldexp(float(exact_input(rng)), -6), 1.0f)
+                          : input(rng);
+    }
+    std::vector<float> rounded_x(x.size());
+    std::transform(x.begin(), x.end(), rounded_x.begin(), round_pair_fp16);
+    std::vector<uint8_t> weights[2];
+    Buffer packed[2], output[2], activation;
+    const std::vector<float> sentinel(valid + rank, kGemmSentinel);
+    bool ok = alloc(device, activation, x.size() * sizeof(float)) && upload_vec(activation, x);
+    for (int p = 0; p < 2; ++p) {
+        weights[p] = pack_weights(YUUKA_DTYPE_Q8_0, rng, width, rank);
+        for (size_t offset = 0; offset < weights[p].size(); offset += 34) {
+            uint8_t * block = weights[p].data() + offset;
+            const int scale_index = offset / 34 % 5;
+            const float scale = exact_sum ? std::ldexp(float(scale_index), -10)
+                                          : scale_index * 0.00075f;
+            put_half(block, scale);
+            block[2] = 0x80;
+            block[33] = 0x7f;
+        }
+        ok = ok && alloc(device, packed[p], weights[p].size()) &&
+             alloc(device, output[p], sentinel.size() * sizeof(float)) &&
+             upload_vec(packed[p], weights[p]) && upload_vec(output[p], sentinel);
+    }
+    yuuka_plan * plan = nullptr;
+    if (ok) {
+        yuuka_op op{};
+        op.code = YUUKA_OP_PREFILL_Q8_0_PAIR;
+        op.buf[0] = packed[0].buf;
+        op.buf[1] = packed[1].buf;
+        op.buf[2] = activation.buf;
+        op.buf[3] = output[0].buf;
+        op.buf[4] = output[1].buf;
+        op.n[0] = width;
+        op.n[1] = rank;
+        op.n[2] = rows;
+        op.u[0] = op.u[1] = YUUKA_DTYPE_Q8_0;
+        ok = check(yuuka_plan_create(device, &plan), "create Q8_0 pair plan") &&
+             check(yuuka_plan_add(plan, &op), "add Q8_0 pair") &&
+             execute(plan, stream, event, 0);
+    }
+    for (int p = 0; p < 2 && ok; ++p) {
+        std::vector<float> got(sentinel.size());
+        ok = download_vec(output[p], got) &&
+             std::equal(got.begin() + valid, got.end(), sentinel.begin() + valid);
+        std::vector<float> baseline(sentinel.size());
+        ok = ok && check(yuuka_gemm_wmma(stream, output[p].buf, activation.buf,
+                                        packed[p].buf, width, rank, rows, YUUKA_DTYPE_Q8_0, event),
+                         "original Q8_0 projection") &&
+             check(yuuka_event_wait(event), "original Q8_0 projection wait") &&
+             download_vec(output[p], baseline);
+        if (!ok || std::memcmp(got.data(), baseline.data(), valid * sizeof(float)) != 0) {
+            std::fprintf(stderr, "Q8_0 pair differs from original WMMA output %d\n", p);
+            ok = false;
+            break;
+        }
+        std::vector<float> rounded_w(width * rank);
+        for (int64_t c = 0; c < rank; ++c) {
+            const uint8_t * packed_row = weights[p].data() + c * stride;
+            for (int64_t k = 0; k < width; k += 32) {
+                const uint8_t * block = packed_row + k / 32 * 34;
+                const float d = half_to_float(uint16_t(block[0] | (block[1] << 8)));
+                for (int l = 0; l < 32; ++l) {
+                    rounded_w[c * width + k + l] = round_pair_fp16(d * int8_t(block[2 + l]));
+                }
+            }
+        }
+        double max_diff = 0;
+        for (int64_t i = 0; i < rows && ok; ++i) {
+            for (int64_t c = 0; c < rank; ++c) {
+                double expected = 0;
+                for (int64_t k = 0; k < width; ++k) {
+                    expected += double(rounded_w[c * width + k]) * rounded_x[i * width + k];
+                }
+                const double diff = std::fabs(got[i * rank + c] - expected);
+                // The dyadic fixture bounds the integer numerator of every
+                // partial sum below 2^24. The random fixture checks exact
+                // legacy WMMA parity above and reports its CPU differential.
+                ok = ok && std::isfinite(diff) && (!exact_sum || diff <= 1e-5);
+                max_diff = std::max(max_diff, diff);
+            }
+        }
+        std::printf("Q8_0 pair, %lld rows, output %d, %s: %s (CPU max abs %.3g)\n",
+                    static_cast<long long>(rows), p, exact_sum ? "exact-sum" : "random",
+                    ok ? "ok" : "FAILED", max_diff);
+    }
+    yuuka_plan_destroy(plan);
+    for (int p = 0; p < 2; ++p) {
+        release(output[p]);
+        release(packed[p]);
+    }
+    release(activation);
+    return ok;
+}
+
 bool test_silu_mul_quant_q8_1(yuuka_device * device, yuuka_stream * stream,
                              yuuka_event * event, std::mt19937 & rng) {
     constexpr uint64_t width = 256, rows = 17, channels = 65, offset = 16;
@@ -2110,6 +2225,15 @@ int main() {
     }
     ok = test_lm_head(device, stream, event, rng) && ok;
     ok = test_silu_mul_quant_q8_1(device, stream, event, rng) && ok;
+    yuuka_device_info info{};
+    ok = check(yuuka_device_info_get(device, &info), "device info for Q8_0 pair") && ok;
+    if (std::strncmp(info.gcn_arch, "gfx1151", 7) == 0) {
+        auto pair_rng = rng;
+        for (int64_t rows : {128, 131, 512}) {
+            ok = test_prefill_q8_pair(device, stream, event, rows, false, pair_rng) && ok;
+            ok = test_prefill_q8_pair(device, stream, event, rows, true, pair_rng) && ok;
+        }
+    }
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
