@@ -306,6 +306,23 @@ target is missed. Numerics: identical tokens over eight greedy steps with
 0.2656 maximum logit difference against the FP32 route, and 5.7e-4 relative
 against the quantized host reference in `tests/hip/gemv_test.cpp`.
 
+Re-evaluated on the remapped one-row mapping (roadmap step 5), 2026-11-19, same
+device and model:
+
+| Route | Matvec in step | Profiled step | Step over 32 decode steps |
+| --- | ---: | ---: | ---: |
+| FP32 remapped, selected | 15.44 ms, 176.6 GB/s | 17.31 ms | 16.56 ms |
+| int8 Q8_1, pre-quantized, remapped | 15.55 ms, 175.3 GB/s | 18.55 ms | 17.23 ms |
+
+In-step the int8 route is faster on `ffn_down` Q4_K (173.2 against 158.4 GB/s)
+and level on `attn_qkv` (179.0) and `ffn_down` Q6_K (186.5 against 189.7), but it
+loses the gate/up pair fusion: the paired Q4_K projection drops from 193.6 GB/s
+as one launch to 184.4 GB/s as two, and the 217 activation quantizations add
+operations of their own. The route is therefore 0.67 ms per step slower end to
+end and stays opt-in (`Options.Int8Matvec` with `PrequantizedInt8`), which is the
+negative result the roadmap asked to record. `TestGPUInt8MatvecMatchesFp32` now
+pins both the fused and the pre-quantized variants to the same tokens.
+
 ## Speculative decoding
 
 Exact greedy prompt-lookup speculation, 512-token prompt, 128 generated tokens,

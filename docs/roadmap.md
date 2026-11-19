@@ -7,13 +7,15 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Steps 1-4 have landed. Decode attention is split over the key range,
+**Status.** Steps 1-5 have landed. Decode attention is split over the key range,
 so the rate is flat in context, and the decode matvec is remapped to one wave per
 output row: `pp128/tg128` 60.16 t/s (ratio 0.97), `pp512/tg128` 59.74, and
-`pp2048/tg32` 58.16, so both target context points (60 and 55 t/s) are met.
-The per-shape bandwidth target is not: the wide shapes reach 179-230 GB/s but the
+`pp2048/tg32` 58.16, so both target context points (60 and 55 t/s) are met. The
+per-shape bandwidth target is not: the wide shapes reach 179-230 GB/s but the
 1024- and 4096-input projections stay at 93-158, and the step is 17.3 ms against
-the 15.5 ms row. Steps 5-6 are open and step 7 closes the record. This file is a plan, not a record: when a step lands, its
+the 15.5 ms row. Step 5 re-evaluated the int8 route on the new mapping and it is
+still slower end to end, so the FP32 route stays selected. Step 6 is open and
+step 7 closes the record. This file is a plan, not a record: when a step lands, its
 measured result goes into [benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
@@ -254,6 +256,7 @@ Steps 1–3 close the context-dependent gap; steps 4–5 close the flat gap; ste
 | | *Landed (step 2).* Split-key attention: 0.033 ms per layer at a 512-token context in `TestGPUProfileDecode`, `pp2048/tg32` 42.90 t/s, greedy tokens identical, logits within the recorded CPU difference. | | |
 | | *Landed (step 3).* F32/F16/Q8_0 and the captured graph take the same kernel: 0.0335/0.0353/0.0318 ms per layer at 512 tokens, replayed tokens identical, and 0.096/0.071/0.061 ms at 2048. The 0.06 ms row at 2048 holds for Q8_0; see the step note for the F32/F16 byte floor. | | |
 | | *Landed (step 4).* One wave per output row, sixteen K values per lane, no barrier inside K: matvec 130.3 -> 176.6 GB/s effective, step 23.4 -> 17.3 ms, `pp128/tg128` 38.8 -> 60.16 t/s, `pp2048/tg32` 17.4 -> 58.16. Per-shape 190 GB/s and the 15.5 ms step are not met; see the step note. | | |
+| | *Landed (step 5).* The Q8_1 int8 route on the remapped mapping measures 175.3 GB/s in step against 176.6 and 0.67 ms slower per step, so the gate fails and the FP32 route stays selected. The negative result and the per-shape cells are recorded. | | |
 | 2 | [Parallel decode attention over the key range](#step-2-parallelize-decode-attention-over-the-key-range) | 512-token context: ≤ 0.05 ms per layer, top-1 token and logits within the documented tolerance, `pp2048` ≥ 30 t/s | 4–8 files |
 | 3 | [Cover every KV format and the graph path](#step-3-cover-every-kv-format-and-the-graph-path) | All three pool formats and the captured graph produce the same tokens, ≤ 0.06 ms per layer from 0 to 2048 tokens | 3–6 files |
 | 4 | [Remap the decode matvec](#step-4-remap-the-decode-matvec) | ≥ 190 GB/s for every `N` ≥ 1024, step ≤ 15.5 ms, `pp128` ≥ 50 t/s | 4–8 files |
@@ -440,6 +443,23 @@ Acceptance: in-step bandwidth ≥ 190 GB/s for every shape with `N` ≥ 1024 in 
 `244 GB/s × 0.85`; decode step ≤ 15.5 ms; `pp128/tg128` ≥ 50 t/s.
 
 ### Step 5: activation-quantized integer matvec on the new mapping
+
+Landed as `gemv_row_i8_kernel` in `kernels/hip/gemv/gemv_row.hip`, reached
+through `Options.Int8Matvec` with `PrequantizedInt8` so the activation row is
+quantized once per group by the existing `AddQuantizeQ8_1At` operations. It
+keeps the one-row mapping and dots four weight digits against the Q8_1 words
+with `v_dot4`, applying the sub-block scale and minimum once per four values.
+
+Result: the gate fails. In step the route measures 175.3 GB/s against 176.6 for
+the FP32 route and 15.55 ms of matvec against 15.44; end to end it is 17.23 ms
+per step against 16.56 ms over 32 decode steps, with identical tokens and a
+0.41 maximum logit difference over eight steps. The int8 form wins on
+`ffn_down` Q4_K (173.2 against 158.4 GB/s) and is level elsewhere, but the plan
+loses the gate/up pair fusion, and the pair as two launches measures 184.4
+against 193.6 GB/s as one. The FP32 kernel of step 4 stays selected and the
+int8 route stays opt-in for measurement.
+
+The original design note follows.
 
 With the mapping of step 4 in place, re-evaluate the int8 route that
 [benchmarks.md](benchmarks.md#int8-decode-matvec) currently keeps opt-in.

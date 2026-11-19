@@ -219,15 +219,16 @@ slower than the templated decode, because the switch dominates a loop that runs
 (`q` and `k`) is also slower than two launches, because the grid follows the wider
 matrix.
 
-**Int8 variant, implemented and not selected.** `gemv_i8_kernel` keeps the same
-mapping but dots the four packed digits of a lane against the Q8_1 activation
-word with one `v_dot4`, applying the block scale and the Q4_K/Q5_K minimum once
-per sub-block instead of once per weight. It is reachable through
-`Options.Int8Matvec` and is measured slower end to end than the FP32 streaming
-kernel: 20.07 ms of matvec against 21.39 ms, plus 1.09 ms for the separate
-activation quantization, in a step where the fused variant costs 21.9 ms because
-every block re-quantizes the row. The decode step is not instruction bound at
-127 GB/s of a 244 GB/s read ceiling, so halving the arithmetic moves 6%. The
+**Int8 variant, implemented and not selected.** `gemv_i8_kernel` and the
+remapped `gemv_row_i8_kernel` keep the mapping but dot the four packed digits of
+a lane against the Q8_1 activation words with `v_dot4`, applying the block scale
+and the Q4_K/Q5_K minimum once per sub-block instead of once per weight. The
+route is reachable through `Options.Int8Matvec` (fused) and
+`Options.Int8Matvec` with `PrequantizedInt8` (one quantization operation per
+activation group, which takes the remapped one-row kernel). On the remapped
+mapping it measures 175.3 GB/s in step against 176.6 for the FP32 route and is
+0.67 ms slower per decode step, because it loses the gate/up pair fusion and
+pays for the activation quantizations. The FP32 route stays selected; the
 numbers are in [benchmarks.md](benchmarks.md#int8-decode-matvec).
 
 Numerics. The per-row kernel sums a strided set of K values per thread and

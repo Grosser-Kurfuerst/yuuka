@@ -248,6 +248,13 @@ void launch_gemv_row_pair_f32out(float * out0, float * out1, const float * x,
                                  const void * w0, const void * w1, uint64_t n_in,
                                  uint64_t n_out0, uint64_t n_out1, uint32_t dtype,
                                  int swiglu, hipStream_t stream);
+/* The same remapped mapping over a Q8_1 activation row: qs holds one int8 digit
+ * per activation value and ds one float2 block scale per 32 values. Only the
+ * dtypes whose per-value form is an integer plus an affine block scale are
+ * covered. */
+void launch_gemv_row_i8_f32out(float * out, const void * qs, const void * ds,
+                               const void * w, uint64_t n_in, uint64_t n_out,
+                               uint32_t dtype, hipStream_t stream);
 
 /* Chunked prefill operators. Every row-pointer argument is a contiguous
  * [rows, width] buffer in row-major order. position is the token position of

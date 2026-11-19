@@ -159,6 +159,85 @@ __global__ void gemv_row_pair_kernel(float * out0, float * out1, const float * x
     }
 }
 
+// dot4 is the signed int8 dot product of the four digits packed in each operand;
+// the supplied activation digits and the Q6_K/Q8_0 weight digits are signed, so
+// both operands are read as signed. It mirrors gemv_i8.hip.
+__device__ __forceinline__ int dot4_row(int32_t a, int32_t b) {
+    return __builtin_amdgcn_sudot4(true, a, true, b, 0, false);
+}
+
+// gemv_row_i8_kernel is the remapped mapping over a Q8_1 activation row: the
+// same grid, lane span, and wave-per-row shape as gemv_row_kernel, with each
+// four-value weight span dotted against its four activation digits by one
+// v_dot4. The per-sub-block scale and the Q4_K/Q5_K minimum are applied to a
+// 4-value span, and the activation scale is one float per 32-value block, so
+// the lane's sixteen values share it.
+template <uint32_t DType, int kRows>
+__global__ void gemv_row_i8_kernel(float * out, const int8_t * qs, const float2 * ds,
+                                   const uint8_t * w, int64_t n_in, int64_t n_out,
+                                   int64_t row_bytes) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int64_t first = static_cast<int64_t>(blockIdx.x) * kRowsPerBlock + warp;
+    const int64_t steps = n_in / kStepValues;
+    constexpr bool kHasBias = DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K;
+
+    float acc[kRows];
+    #pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (int64_t step = 0; step < steps; ++step) {
+        const int64_t k = step * kStepValues + lane * kSpanValues;
+        int32_t a4[kSpanValues / 4];
+        #pragma unroll
+        for (int i = 0; i < kSpanValues / 4; ++i) {
+            __builtin_memcpy(&a4[i], qs + k + 4 * i, 4);
+        }
+        const float a_scale = ds[k / 32].x;
+        #pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int64_t row = first + r * kRowWarps;
+            if (row >= n_out) {
+                continue;
+            }
+            const uint8_t * base = w + row * row_bytes;
+            #pragma unroll
+            for (int i = 0; i < kSpanValues / 4; ++i) {
+                int32_t q = 0;
+                float scale = 0.0f;
+                float bias = 0.0f;
+                decode_span4_i8<DType>(base, k + 4 * i, q, scale, bias);
+                acc[r] = fmaf(a_scale * scale, static_cast<float>(dot4_row(q, a4[i])),
+                              acc[r]);
+                if (kHasBias && bias != 0.0f) {
+                    acc[r] = fmaf(a_scale * bias,
+                                  static_cast<float>(dot4_row(a4[i], 0x01010101)),
+                                  acc[r]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        const int64_t row = first + r * kRowWarps;
+        const float total = warp_reduce_sum(acc[r]);
+        if (lane == 0 && row < n_out) {
+            out[row] = total;
+        }
+    }
+}
+
+template <uint32_t DType>
+void launch_gemv_row_i8_dtype(float * out, const int8_t * qs, const float2 * ds,
+                              const uint8_t * w, int64_t n_in, int64_t n_out,
+                              int64_t row_bytes, hipStream_t stream) {
+    const unsigned blocks = static_cast<unsigned>(
+        (n_out + kRowsPerBlock - 1) / kRowsPerBlock);
+    gemv_row_i8_kernel<DType, kRowsPerWave><<<blocks, kRowThreads, 0, stream>>>(
+        out, qs, ds, w, n_in, n_out, row_bytes);
+}
+
 template <uint32_t DType>
 void launch_gemv_row_dtype(float * out, const float * x, const uint8_t * w,
                            const float * res, int64_t n_in, int64_t n_out,
@@ -314,6 +393,35 @@ void launch_gemv_row_pair_f32out(float * out0, float * out1, const float * x,
                           out0, out1, x, w0b, w1b, in, o0, o1, rb, stream)
                     : launch_gemv_row_pair_dtype<YUUKA_DTYPE_Q6_K, false>(
                           out0, out1, x, w0b, w1b, in, o0, o1, rb, stream);
+            break;
+    }
+}
+
+void launch_gemv_row_i8_f32out(float * out, const void * qs, const void * ds,
+                                const void * w, uint64_t n_in, uint64_t n_out,
+                                uint32_t dtype, hipStream_t stream) {
+    const auto * weights = static_cast<const uint8_t *>(w);
+    const auto * quantized = static_cast<const int8_t *>(qs);
+    const auto * scales = static_cast<const float2 *>(ds);
+    const auto in = static_cast<int64_t>(n_in);
+    const auto on = static_cast<int64_t>(n_out);
+    const auto rb = static_cast<int64_t>(yuuka_packed_row_bytes(dtype, n_in));
+    switch (dtype) {
+        case YUUKA_DTYPE_Q8_0:
+            launch_gemv_row_i8_dtype<YUUKA_DTYPE_Q8_0>(out, quantized, scales, weights,
+                                                       in, on, rb, stream);
+            break;
+        case YUUKA_DTYPE_Q4_K:
+            launch_gemv_row_i8_dtype<YUUKA_DTYPE_Q4_K>(out, quantized, scales, weights,
+                                                       in, on, rb, stream);
+            break;
+        case YUUKA_DTYPE_Q5_K:
+            launch_gemv_row_i8_dtype<YUUKA_DTYPE_Q5_K>(out, quantized, scales, weights,
+                                                       in, on, rb, stream);
+            break;
+        default:
+            launch_gemv_row_i8_dtype<YUUKA_DTYPE_Q6_K>(out, quantized, scales, weights,
+                                                       in, on, rb, stream);
             break;
     }
 }

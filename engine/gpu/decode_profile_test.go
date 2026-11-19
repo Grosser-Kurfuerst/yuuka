@@ -134,7 +134,12 @@ func TestGPUProfileDecode(t *testing.T) {
 	samples := decodeSamples(shadow, times, names)
 	report := newDecodeReport(samples)
 	printDecodeReport(t, rt, report)
-	checkDecodeGates(t, report)
+	// The operation count and the matvec share are recorded for the default
+	// route; the int8 and unfused variants add quantization operations and drop
+	// fusions by design, so they are reported without that gate.
+	if route == "fp32 streaming" {
+		checkDecodeGates(t, report)
+	}
 	checkDecodeAttentionGate(t, report, context)
 }
 
