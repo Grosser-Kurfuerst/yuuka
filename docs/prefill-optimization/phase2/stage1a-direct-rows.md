@@ -46,12 +46,19 @@ Two options compute the same set of 64-token tiles:
 Both execute three 64-token tiles for 129 rows instead of the four that the
 current padding implies. B is selected because:
 
-- Full-tile cells (`128`, `512`, `2048`, `1024`, `4096`) keep the exact same
-  workgroup-to-tile mapping and dispatch order, so there is no L2 locality
-  risk for already-accepted shapes.
+- The row counts that already run Direct MMQ (`128`, `512`, `2048`) keep the
+  exact same workgroup-to-tile mapping and dispatch order, so there is no L2
+  locality risk for already-accepted shapes. Full-tile row counts that run
+  generic MMQ today (`1024`, `4096`) switch to Direct for the first time and
+  are verified against control like any other newly enabled row count.
 - The host grid geometry that
   [prefill_counters.py](../../../scripts/prefill_counters.py) validates stays
-  unchanged, so the counter reduction needs no update.
+  unchanged, so its launch-geometry check still passes. The reducer derives
+  executed MMAs from the launched grid, so for partial-tile cells such as
+  129 rows it also counts the workgroups that exit early, and the per-MMA
+  VALU and LDS figures of those cells read low. Full-tile cells are
+  unaffected. This does not affect acceptance, which uses wall-clock and
+  kernel times.
 - The early return is uniform across the workgroup and precedes the first
   `__syncthreads`, so it cannot deadlock a barrier.
 
@@ -148,10 +155,19 @@ row, so masking cannot change valid rows.
      result (row independence), and every row at or beyond `R` to still hold
      the sentinel (no out-of-range stores).
 
-### 3.3 [prefill_sweep.cpp](../../../bench/hip/prefill_sweep.cpp) (~10 lines)
+### 3.3 [prefill_sweep.cpp](../../../bench/hip/prefill_sweep.cpp) (~15 lines)
 
-Add boundary row counts `{129, 192, 511, 1024}` for Q4_K and Q5_K at the
-model's Direct shapes only. The existing all-dtype row list stays as is so the
+The current sweep covers only `2560 -> 9216`, `9216 -> 2560`, and
+`2560 -> 8192`. Add a dedicated loop over every Direct shape in the model at
+boundary row counts `{129, 192, 511, 1024, 4096}`:
+
+| Weights | Shapes (K -> N) |
+| --- | --- |
+| Q4_K | 2560 -> 1024, 2560 -> 4096, 2560 -> 8192, 2560 -> 9216, 4096 -> 2560, 9216 -> 2560 |
+| Q5_K | 2560 -> 8192, 4096 -> 2560 |
+
+`4096` covers the largest prefill chunk, which the new `rows >= 128` rule
+also routes to Direct MMQ. The existing all-dtype row list stays as is so the
 sweep runtime does not grow for F16 and Q8_0.
 
 ### 3.4 Documentation (~60 lines)
@@ -164,7 +180,7 @@ sweep runtime does not grow for F16 and Q8_0.
   from the [module index](../README.md).
 - Record the final numbers in the roadmap Step 1a entry.
 
-**Total scope:** 4 file groups, about 165 lines. No new opcode, no Go changes.
+**Total scope:** 4 file groups, about 170 lines. No new opcode, no Go changes.
 
 ## 4. Steps and acceptance
 
@@ -172,8 +188,8 @@ sweep runtime does not grow for F16 and Q8_0.
 | --- | --- | --- |
 | 1. Kernel | Section 3.1 | Release build passes. `scripts/kernel_resources.sh` reports no VGPR spills or private scratch for the Direct variants, dynamic LDS stays 30 KiB, and VGPRs do not rise enough to reduce residency below two workgroups per CU. |
 | 2. Native tests | Section 3.2 | CTest passes 9/9. New cells stay within the existing MMQ tolerance against the CPU product. The row-tail test is bitwise identical on valid rows and leaves every sentinel intact. |
-| 3. Kernel A/B | Section 3.3; control (`HEAD` before the change) and candidate built side by side on the container; `rocprofv3` confirms that 129- and 511-row calls dispatch `gemm_mmq_kernel<…, true, false>` | Every Q4_K and Q5_K model shape at boundary row counts is faster than control. `128`, `512`, and `2048` rows stay within `±1%`. `OccupancyPercent` stays near the 47% baseline. |
-| 4. Model numerics | [prefill-compare](../../../bench/prefill-compare/main.go) exports logits from control and candidate at the same chunk size | At 129, 140, 256, 511, 513 (`chunk=2048`), and 1024 (`chunk=1024`) tokens, candidate logits are expected to be bitwise identical to control. The real-model HIP Go suite passes. |
+| 3. Kernel A/B | Section 3.3; control (`HEAD` before the change) and candidate built side by side on the container; `rocprofv3` confirms that 129-, 511-, 1024-, and 4096-row calls dispatch `gemm_mmq_kernel<…, true, false>` | Every Q4_K and Q5_K model shape at every boundary row count (`129`, `192`, `511`, `1024`, `4096`) is faster than control. `128`, `512`, and `2048` rows stay within `±1%`. `OccupancyPercent` stays near the 47% baseline. |
+| 4. Model numerics | [prefill-compare](../../../bench/prefill-compare/main.go) exports logits from control and candidate at the same chunk size | At 129, 140, 256, 511, 513 (`chunk=2048`), 1024 (`chunk=1024`), and 8192 (`chunk=4096`) tokens, candidate logits are expected to be bitwise identical to control. The real-model HIP Go suite passes. |
 | 5. End-to-end and TTFT | Unprofiled timing in control, candidate, candidate, control order; `yuuka-server` SSE first-content latency for chat prompts of about 140 and 300 tokens | See gates below. |
 | 6. Docs and commit | Section 3.4 with measured data | Zero broken relative links, `git diff --check` passes, one atomic Conventional Commits change. |
 
@@ -186,6 +202,8 @@ Step 5 gates:
   control.
 - **Chunk 1024:** no more than 3% slower than `chunk=512` at 1024, 2048, and
   8192 tokens.
+- **Chunk 4096:** 8192 tokens at `chunk=4096` is no slower than control at
+  the same chunk size.
 - **Server:** at least 10 ms lower SSE first-content latency for the
   ~140-token chat prompt.
 - **Control case:** `512 + 18` tails are outside this stage; record them
