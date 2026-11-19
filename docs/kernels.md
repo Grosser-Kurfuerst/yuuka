@@ -536,7 +536,7 @@ The combined prefill and decode ABI 9 assigns it opcode 43 and assigns
 opcodes 38–42 to the fused decode operations. The fused quantizer
 uses the plain quantizer's scale, rounding and sum rules and skips
 materializing the activated FP32 tensor. The compact final FFN uses
-its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/acceptance/05-ffn-fusion.md)
+its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/phase1/acceptance/05-ffn-fusion.md)
 
 #### gfx1151 direct MMQ specialization
 
@@ -567,8 +567,8 @@ plane for each of the same subblocks. Each activation block uses
 staging thread writes the FP32 scale and scaled sum once. The kernel
 completes both integer WMMA instructions and
 FP32 scale/min correction of each fragment before consuming the next
-fragment. [FFN cell](prefill-optimization/acceptance/02-q4-ffn.md) ·
-[Additional projections](prefill-optimization/acceptance/04a-mmq-shapes.md)
+fragment. [FFN cell](prefill-optimization/phase1/acceptance/02-q4-ffn.md) ·
+[Additional projections](prefill-optimization/phase1/acceptance/04a-mmq-shapes.md)
 
 ### 6.4 Dispatch
 
@@ -631,7 +631,7 @@ projection and attention routes. RoPE and paged attention use the
 last prompt position via the ABI 7 token displacement. An intermediate
 chunk ends after the final K/V write. Speculative verification computes
 every requested row through attention and FFN.
-[Validation and timings](prefill-optimization/acceptance/06-final-query.md)
+[Validation and timings](prefill-optimization/phase1/acceptance/06-final-query.md)
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
 projection in the prefill and decode tails. It also serves decode matvecs
@@ -906,7 +906,7 @@ for the later ranges. Each range keeps its own online FP32 maximum, sum
 and value accumulator. A wave merges the records for each row and head,
 then applies the output gate. ABI 8 binds the optional FP32 records and
 prefix maxima in slot 6. The plan reuses this scratch across layers on
-the same stream. [Split-key acceptance](prefill-optimization/acceptance/07-long-attention.md)
+the same stream. [Split-key acceptance](prefill-optimization/phase1/acceptance/07-long-attention.md)
 
 The earlier group-of-four tiled kernel (`attention_prefill_paged_gqa_f32_kernel`)
 is removed: the MMA kernel serves the same group at every shape the tiled kernel
@@ -999,7 +999,7 @@ traffic without reducing occupancy:
   per-head normalization domain. State sizes other than 128 use the fused
   one-column-per-thread kernel, which reads and writes the state for every row.
   Both paths keep the row-major state layout shared with the decode kernel.
-  [Prepared recurrence measurements](prefill-optimization/acceptance/04b-gdn.md)
+  [Prepared recurrence measurements](prefill-optimization/phase1/acceptance/04b-gdn.md)
 
 ## 9. Gated delta-net
 

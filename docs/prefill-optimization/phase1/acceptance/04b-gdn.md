@@ -2,14 +2,14 @@
 
 ## Implementation
 
-The [prefill plan](../../../engine/gpu/plan.go) binds the existing FFN gate
+The [prefill plan](../../../../engine/gpu/plan.go) binds the existing FFN gate
 scratch for gfx1151 recurrence with 128 state rows, at least 128 tokens and
-sufficient capacity. The [HIP descriptor](../../../backend/hip/bridge/yuuka_hip.h)
-and [native validator](../../../backend/hip/bridge/bridge.cpp) use slot 13
+sufficient capacity. The [HIP descriptor](../../../../backend/hip/bridge/yuuka_hip.h)
+and [native validator](../../../../backend/hip/bridge/bridge.cpp) use slot 13
 for the prepared span and reject short, misaligned, overlapping and
 conflicting bindings. Go and the native library require ABI 5.
 
-[The prepared path](../../../kernels/hip/prefill/prefill.hip) computes the
+[The prepared path](../../../../kernels/hip/prefill/prefill.hip) computes the
 FP32 Q/K scales once per token and key group and the decay and beta once per
 token and value head. The four-lane core then runs the existing register
 recurrence and reduction order with no block barriers in its token loop.

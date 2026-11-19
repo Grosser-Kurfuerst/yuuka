@@ -92,7 +92,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 
 ### Module indexes
 
-- [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
+- [Qwen prefill optimization](prefill-optimization/README.md) — Phase 1 upstream benchmark optimization and Phase 2 real-world prefill priority roadmap on gfx1151.
 
 ## Implementation status
 

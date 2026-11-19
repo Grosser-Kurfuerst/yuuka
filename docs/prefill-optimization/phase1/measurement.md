@@ -4,7 +4,7 @@
 
 The 2026-11-18 comparison used yuuka `bfd36c0` and upstream
 [llama.cpp v1.0.0](https://github.com/ggml-org/llama.cpp/tree/b1b770d90d94cad9e9ea5b993bdbc383a522fb28).
-The older tables in the [benchmark report](../benchmarks.md) use a
+The older tables in the [benchmark report](../../benchmarks.md) use a
 strix-llama.cpp fork. Reproduce the upstream tag when evaluating this plan.
 
 Both engines loaded `Qwen3.5-4B-Q4_K_M.gguf`, SHA-256
@@ -62,7 +62,7 @@ respectively.
 
 1. Build both revisions in Release mode. Record the model hash, resolved
    commits, versions, GPU, kernel, power mode and temperatures alongside the
-   raw output. Use the build instructions in the [benchmark report](../benchmarks.md#reproduction).
+   raw output. Use the build instructions in the [benchmark report](../../benchmarks.md#reproduction).
 2. On the GPU host set `MODEL` to the verified GGUF, `YUUKA` to the HIP CLI
    built with `-tags hip`, and `LLAMA_BENCH` to the ROCm executable built
    from the upstream tag. Run the following from the repository root with
@@ -92,7 +92,7 @@ respectively.
    Exclude warmup and model setup, retain casts and merge kernels, and report
    the positions and row counts. The Go whole-prompt traces above used a
    diagnostic launcher with a libc exit hook to flush the profiler. Use the
-   normal CLI for throughput. [Existing profile test](../../engine/gpu/prefill_profile_test.go#L25)
+   normal CLI for throughput. [Existing profile test](../../../engine/gpu/prefill_profile_test.go#L25)
 5. Before declaring a win, add a benchmark-only comparison driver that feeds
    the same saved token IDs and positions to the two independent runtimes,
    requests logits only on the last prompt row, and synchronizes through
@@ -105,10 +105,10 @@ respectively.
    reference executable only into its own benchmark process.
 
 For each stage run its targeted tests and the real-model greedy/long-context
-checks. For integration use the [project test commands](../testing.md#94-current-test-commands),
+checks. For integration use the [project test commands](../../testing.md#94-current-test-commands),
 including Go build, vet, tests, race tests, native CTest and the HIP-tagged
 suite. Check for model or device skips. Record accepted dispatch changes in
-[kernels.md](../kernels.md) and measured results in [benchmarks.md](../benchmarks.md).
+[kernels.md](../../kernels.md) and measured results in [benchmarks.md](../../benchmarks.md).
 Use a fresh paired upstream median for the final 1.05× gate at each length.
 
 For a first implementation slice, the following commands exercise the

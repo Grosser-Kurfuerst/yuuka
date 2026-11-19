@@ -21,7 +21,7 @@ preparation from the cost of mapping the state update to lanes.
    version of the four-lane core, then run `gdn_norm_gate_rows_f32_kernel`
    as today. The existing core normalizes the same Q/K once per head and
    column workgroup and executes two block barriers per token.
-   [Launcher](../../kernels/hip/prefill/prefill.hip#L825) · [Current core](../../kernels/hip/prefill/prefill.hip#L392)
+   [Launcher](../../../kernels/hip/prefill/prefill.hip#L825) · [Current core](../../../kernels/hip/prefill/prefill.hip#L392)
 2. Launch 128 threads per `(token r, key group g)`. Give thread `d` the
    Q and K components at `g*128+d` and `groups*128+g*128+d` in convolution
    row `r`. For each norm use the current Wave32 sum of squares and sum
@@ -33,7 +33,7 @@ preparation from the cost of mapping the state update to lanes.
    `decay = expf(softplus*a[h])` and `b = 1/(1+expf(-beta[r,h]))`.
    The existing triangular preparer stores **log** decay and uses a
    different Q reduction order. The per-token core consumes the actual
-   decay factor. [Triangular preparer](../../kernels/hip/prefill/gdn_chunk.hip#L83)
+   decay factor. [Triangular preparer](../../../kernels/hip/prefill/gdn_chunk.hip#L83)
 3. Lay out one FP32 span as consecutive arrays
    `Q[rows,groups,128]`, `K[rows,groups,128]`, `decay[rows,heads]`,
    `b[rows,heads]`. In `addPrefillRecurrent` bind an optional prepared
@@ -49,7 +49,7 @@ preparation from the cost of mapping the state update to lanes.
    Carry it through `RecurrentChunkArgs` and the native launcher. For
    other geometries or insufficient spare capacity select the current
    route at planning time. Reject a malformed bound span during validation.
-   [Allocation](../../engine/gpu/model.go#L379) · [Plan binding](../../engine/gpu/plan.go#L616) · [Go descriptor](../../backend/hip/hip.go#L1541) · [Native validation](../../backend/hip/bridge/bridge.cpp#L614)
+   [Allocation](../../../engine/gpu/model.go#L379) · [Plan binding](../../../engine/gpu/plan.go#L616) · [Go descriptor](../../../backend/hip/hip.go#L1541) · [Native validation](../../../backend/hip/bridge/bridge.cpp#L614)
 4. Keep the baseline four-lane dot and update order. Read the prepared
    Q/K for `g = h % groups` and both scalar gates directly in each token
    iteration. Remove the shared Q/K arrays, scalar handoff and both
@@ -87,15 +87,15 @@ matrix state in their current session-owned buffers.
 
 ## Verify and decide
 
-- Extend [test_recurrent_chunk](../../tests/hip/prefill_test.cpp#L1424) to compare
+- Extend [test_recurrent_chunk](../../../tests/hip/prefill_test.cpp#L1424) to compare
   convolution history, raw recurrence outputs, final matrix state and gated
   outputs of both variants with the CPU reference. Include a nonzero
   initial state, heads sharing a key group and a sequence split into two
   chunks. Check repeatability and the current operator tolerances.
 - Run real-model chunked prefill, greedy continuation and the separate
   decode-path check. Inspect layer state at the chunk boundary if the first
-  token agrees and subsequent tokens diverge. [CPU recurrence](../../model/qwen35/recurrent.go)
-  · [CPU/GPU comparison tests](../../engine/gpu/runtime_test.go)
+  token agrees and subsequent tokens diverge. [CPU recurrence](../../../model/qwen35/recurrent.go)
+  · [CPU/GPU comparison tests](../../../engine/gpu/runtime_test.go)
 - Time four-lane baseline, four-lane with prepared inputs, and eight-lane
   with the same inputs. Include convolution, preparation, core, output gate
   and total. An intermediate milestone is **42 ms** at pp512. Revisit

@@ -13,7 +13,7 @@ describe the initial independent-range experiment.
 ## Split the key range for long prefixes
 
 1. **Keep the short-prefix kernel as the control.** Start from
-   [attention_prefill_paged_wmma_kernel](../../kernels/hip/prefill/attention_wmma.hip#L107).
+   [attention_prefill_paged_wmma_kernel](../../../kernels/hip/prefill/attention_wmma.hip#L107).
    The target is F16 paged KV, head width 256, with four query heads sharing
    one KV head. One workgroup handles 16 query rows and stages 16 keys per
    loop. At this width its dynamic LDS footprint is 50 KiB. Increasing the
@@ -28,7 +28,7 @@ describe the initial independent-range experiment.
    K/V starting at `16*i` with the original tail bound. Score each key
    only up to that query row's absolute position. All threads participate
    in block barriers even for a row whose keys are entirely masked.
-   [Key loop and online softmax](../../kernels/hip/prefill/attention_wmma.hip#L164) · [Current grid](../../kernels/hip/prefill/attention_wmma.hip#L325)
+   [Key loop and online softmax](../../../kernels/hip/prefill/attention_wmma.hip#L164) · [Current grid](../../../kernels/hip/prefill/attention_wmma.hip#L325)
 
    Use the existing scaled base-2 scores, FP16 probability tile and FP32
    accumulators. In a tile with no valid key for a row, write zero
@@ -63,7 +63,7 @@ describe the initial independent-range experiment.
    its aligned byte range for four splits using checked products at plan
    creation. Reuse it across layers on the model stream and release it
    with the other prefill allocations. Cover an exact-fit span and a span
-   one byte short. [Allocation](../../engine/gpu/model.go#L349) · [Plan binding](../../engine/gpu/plan.go#L546) · [Go paged descriptor](../../backend/hip/hip.go#L1458) · [Native validation](../../backend/hip/bridge/bridge.cpp#L956)
+   one byte short. [Allocation](../../../engine/gpu/model.go#L349) · [Plan binding](../../../engine/gpu/plan.go#L546) · [Go paged descriptor](../../../backend/hip/hip.go#L1458) · [Native validation](../../../backend/hip/bridge/bridge.cpp#L956)
 
    Inside `launch_attention_prefill_paged_f32`, after the WMMA geometry
    check, choose the split count using the **execution-time** query position
@@ -73,7 +73,7 @@ describe the initial independent-range experiment.
    direct kernel on ties within observed run-to-run spread and for unmeasured
    shapes, including the compact one-query tail. Feed the winning table
    back into this launcher. The same cached 512-row plan executes at
-   positions 0 and 7680. [Native dispatch](../../kernels/hip/prefill/prefill.hip#L791)
+   positions 0 and 7680. [Native dispatch](../../../kernels/hip/prefill/prefill.hip#L791)
 
 ## Verify the attention change
 
@@ -82,20 +82,20 @@ identical paged KV. Cover a partial last page, noncontiguous physical pages,
 query rows on both sides of a split boundary, and an entirely masked split
 for an early query. Check the existing native attention tolerances, gated
 output, deterministic reruns, real-model logits and greedy continuation.
-Extend [test_attention_prefill_mma](../../tests/hip/prefill_test.cpp#L1299)
+Extend [test_attention_prefill_mma](../../../tests/hip/prefill_test.cpp#L1299)
 with an F16 pool. Round K/V once before feeding the same values to both
 the reference and the candidate. With 17 new queries at position zero,
 run four forced splits to exercise empty intervals and the one-row tail.
 At a nonzero start, test a row whose final tile is partially masked.
-Also run the [paged tests](../../tests/hip/paged_test.cpp) and the
-[model attention comparison](../../engine/gpu/attention_compare_test.go).
+Also run the [paged tests](../../../tests/hip/paged_test.cpp) and the
+[model attention comparison](../../../engine/gpu/attention_compare_test.go).
 
 Measure at positions 0, 2048 and 7680 with 512 new tokens. Use the full
 prompt trace and a fresh unprofiled pp8192 comparison to confirm the win.
 The first target is **at most 100 ms** for the last 512 rows under baseline
 geometry. Record merge time and peak scratch. Include the new kernel in
 the resource report when measuring spills and dynamic LDS. The current
-[resource script](../../scripts/kernel_resources.sh) needs the attention
+[resource script](../../../scripts/kernel_resources.sh) needs the attention
 WMMA source added to its compilation list for this measurement.
 
 ## Select a chunk size for single-request generation
@@ -110,12 +110,12 @@ WMMA source added to its compilation list for this measurement.
    boundary (for example 2048 and 2049). Check pp128/512, TTFT, peak
    transient bytes and the cost of a short final chunk. The model
    currently clamps to capacity and a maximum of 4096. Log the effective
-   size in the result. [Runtime configuration](../../engine/gpu/model.go)
+   size in the result. [Runtime configuration](../../../engine/gpu/model.go)
 3. If an automatic choice is justified, apply a measured length-based rule
    once before the single-request prefill plan and scratch are built. Keep
    an explicit `--chunk-size` override authoritative. The existing CLI
    defaults to 512, so distinguish an omitted option from an explicit 512
-   when wiring the rule into [run and bench](../../cmd/yuuka/main.go).
+   when wiring the rule into [run and bench](../../../cmd/yuuka/main.go).
    Reallocating shared scratch or invalidating session plans per chunk
    would defeat the policy. Evaluate scheduler latency separately before
    applying a single-request result to serving.

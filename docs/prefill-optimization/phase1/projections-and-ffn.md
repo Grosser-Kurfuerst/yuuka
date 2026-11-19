@@ -15,12 +15,12 @@ and Q5_K for 10.9 ms. The Q6_K paths, including upstream's conversions,
 differ by 0.1 ms at this length. Prioritize Q4_K, then Q5_K.
 
 1. **Establish the native A/B.** Extend the existing
-   [prefill sweep](../../bench/hip/prefill_sweep.cpp#L98) to run the existing and
+   [prefill sweep](../../../bench/hip/prefill_sweep.cpp#L98) to run the existing and
    candidate MMQ on identical packed weights and Q8_1 input. Use
    `M=512, K=2560, N=9216` first. Report both MMQ-only time and the path
    including activation quantization. The 1.406 ms baseline is MMQ-only.
 2. **Build one four-wave variant.** In
-   [mmq_gemm.hip](../../kernels/hip/gemm/mmq_gemm.hip#L343), keep
+   [mmq_gemm.hip](../../../kernels/hip/gemm/mmq_gemm.hip#L343), keep
    `launch_gemm_mmq_f32out` as the entry point. Specialize
    `launch_mmq_tile` and `gemm_mmq_kernel` on the wave count. Use the
    following mapping for the first Q4_K experiment. Both launches produce
@@ -43,7 +43,7 @@ differ by 0.1 ms at this length. Prioritize Q4_K, then Q5_K.
    both edge masks. Instantiate the HIP function attribute and launch size
    for each specialization. Keep the standalone Q8_1 quantizer at its own
    eight waves per block. Its warp index also uses the current `kWarps`.
-   [Staging](../../kernels/hip/gemm/mmq_gemm.hip#L229) · [Quantizer](../../kernels/hip/gemm/mmq_gemm.hip#L299) · [Launcher](../../kernels/hip/gemm/mmq_gemm.hip#L486)
+   [Staging](../../../kernels/hip/gemm/mmq_gemm.hip#L229) · [Quantizer](../../../kernels/hip/gemm/mmq_gemm.hip#L299) · [Launcher](../../../kernels/hip/gemm/mmq_gemm.hip#L486)
 3. **Measure the inner loop.** At the target shape, yuuka/upstream issued
    22.19/17.50 VALU and 4.75/2.05 LDS instructions per 4096 useful MACs.
    Yuuka's measured LDS bank conflicts were already 0%. The kernel already
@@ -58,15 +58,15 @@ differ by 0.1 ms at this length. Prioritize Q4_K, then Q5_K.
    path. Test the scale layout on the faster geometry from the first A/B.
    Normalize counters by
    the work of the actual tile. Update the geometry and dispatch pairing in
-   [the counter reducer](../../scripts/prefill_counters.py) when extending it
+   [the counter reducer](../../../scripts/prefill_counters.py) when extending it
    to a new tile or sweep order. The old reducer assumes eight waves and
    seven submissions per cell. Earlier double-buffer and register-prefetch
-   experiments are recorded in [decisions and rejected routes](../benchmarks.md#decisions-and-rejected-routes).
+   experiments are recorded in [decisions and rejected routes](../../benchmarks.md#decisions-and-rejected-routes).
 4. **Promote by shape.** The first target is at most **1.05 ms** and a
    reproducible improvement in unprofiled pp512. Select the winning native
    variant inside the MMQ launcher if the Go-level route is still MMQ.
-   Update [Go dispatch](../../backend/hip/dispatch.go#L60) and its
-   [tests](../../backend/hip/dispatch_test.go) only when changing route
+   Update [Go dispatch](../../../backend/hip/dispatch.go#L60) and its
+   [tests](../../../backend/hip/dispatch_test.go) only when changing route
    selection. At the 1.05 ms target, 64 equal-shaped calls would save about
    23 ms of traced projection time (`64*(1.406-1.05)`). Recount calls after
    final-layer cropping. The original pp512 projection gap alone was 62.7 ms.
@@ -84,11 +84,11 @@ differ by 0.1 ms at this length. Prioritize Q4_K, then Q5_K.
    the high bit and scale/min at subblocks 3/4 and the next 256-value
    block in the product test. Compare loads, instructions and time on
    model shapes. Enable only cells with a measured benefit.
-   [Packed span decode](../../kernels/hip/gemm/mmq_gemm.hip#L158)
+   [Packed span decode](../../../kernels/hip/gemm/mmq_gemm.hip#L158)
 
 ## Fuse where the intermediate has a single consumer
 
-In [addPrefillFFN](../../engine/gpu/plan.go#L653), the MMQ branch quantizes the
+In [addPrefillFFN](../../../engine/gpu/plan.go#L653), the MMQ branch quantizes the
 normalized input once, submits two `AddGemmMmqAt` operations, applies
 `AddSiluMul`, then calls `prefillMatmul` for down. The existing
 `AddGemmSwigluAt` fusion serves the FP16 WMMA route. Two FP32 gate/up
@@ -99,7 +99,7 @@ actual DRAM traffic.
 1. **Fuse SwiGLU with the down-input quantizer.** Start where down selects
    MMQ. Read corresponding gate/up values, compute `SiLU(gate) * up`, and
    quantize a complete 32-channel block using the rounding in
-   [quantize_q8_1_kernel](../../kernels/hip/gemm/mmq_gemm.hip#L299). Write the
+   [quantize_q8_1_kernel](../../../kernels/hip/gemm/mmq_gemm.hip#L299). Write the
    packed digits and `(scale, scale * sum(digits))` into the existing
    `xQ8` and `xDS` scratch. Feed these buffers directly to down through
    `AddGemmMmqAt`, bypassing the second input quantization. Both gate and
@@ -120,10 +120,10 @@ actual DRAM traffic.
    write and one read of the 18 MiB activated tensor at 512 rows, or
    **36 MiB of logical traffic per eligible layer**. The two GEMMs still
    materialize gate and up. Count the launches and compare full FFN time.
-   [Current SwiGLU arithmetic](../../kernels/hip/ops/norm.hip#L101) · [Down projection](../../engine/gpu/plan.go#L705)
+   [Current SwiGLU arithmetic](../../../kernels/hip/ops/norm.hip#L101) · [Down projection](../../../engine/gpu/plan.go#L705)
 
 2. **Carry the fused operation through the plan.** Append a new opcode to
-   the [C ABI](../../backend/hip/bridge/yuuka_hip.h). Give it
+   the [C ABI](../../../backend/hip/bridge/yuuka_hip.h). Give it
    `buf[0..3] = {gate, up, digits, scale_sum}` and
    `n[0..1] = {ffn_width, rows}`. Require positive rows, width divisible
    by 128, and checked spans at the supplied byte offsets of respectively
@@ -131,10 +131,10 @@ actual DRAM traffic.
    `8*rows*(width/32)` bytes. Require alignment for the vector loads and
    stores used by the kernel.
    Add native buffer-span validation and dispatch in the
-   [bridge](../../backend/hip/bridge/bridge.cpp), the launcher declaration
-   in [yuuka_kernels.h](../../kernels/hip/yuuka_kernels.h), and one
-   checked plan builder in [hip.go](../../backend/hip/hip.go). Update the
-   [profile labels](../../engine/gpu/prefill_profile_test.go) so its time is
+   [bridge](../../../backend/hip/bridge/bridge.cpp), the launcher declaration
+   in [yuuka_kernels.h](../../../kernels/hip/yuuka_kernels.h), and one
+   checked plan builder in [hip.go](../../../backend/hip/hip.go). Update the
+   [profile labels](../../../engine/gpu/prefill_profile_test.go) so its time is
    included in the complete FFN comparison.
 3. **Evaluate paired gate/up as a separate change.** For two Q4_K weights
    of identical shape, have each workgroup own the same output tile in
@@ -151,8 +151,8 @@ actual DRAM traffic.
 
 ## Acceptance
 
-- Extend [test_gemm_mmq](../../tests/hip/prefill_test.cpp#L534) for the
-  geometry A/B. Add a case beside [test_gemm_swiglu](../../tests/hip/prefill_test.cpp#L586)
+- Extend [test_gemm_mmq](../../../tests/hip/prefill_test.cpp#L534) for the
+  geometry A/B. Add a case beside [test_gemm_swiglu](../../../tests/hip/prefill_test.cpp#L586)
   comparing `SILU_MUL → QUANT_Q8_1 → MMQ(down)` with the fused route
   from identical gate/up buffers. Check the existing
   per-GEMM tolerance, zero and signed activation blocks, Q8_1 rounding,
@@ -160,7 +160,7 @@ actual DRAM traffic.
   quantizer fed the same gate/up values should reproduce the reference
   digits. Use model-level gates after any change in projection reduction order.
 - Cover buffer offsets, short buffers and invalid widths for added plan
-  operations in [plan validation](../../tests/hip/plan_validation_test.cpp).
+  operations in [plan validation](../../../tests/hip/plan_validation_test.cpp).
   Run the native sweep, real-model pp128/512/2048/8192, and greedy
   generation. Record MMQ time, complete FFN time, scratch, compiler spills
   and unprofiled throughput for each accepted change.

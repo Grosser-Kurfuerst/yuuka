@@ -89,10 +89,10 @@ and costs less than computing a separate maximum for each range. The
 same greedy outputs at chunk 512 and 2048. The 1024-key seed reached
 0.37293, above the existing 0.3 gate.
 
-The [native dispatcher](../../../kernels/hip/prefill/prefill.hip)
+The [native dispatcher](../../../../kernels/hip/prefill/prefill.hip)
 chooses four splits for 512, 1024 and 2048 query rows at execution
 positions 6144 and later when the full query range ends by token
-8191. The [model](../../../engine/gpu/model.go) reserves a reusable
+8191. The [model](../../../../engine/gpu/model.go) reserves a reusable
 split buffer on gfx1151 for that geometry and F16 KV. The records
 and the one maximum per row and head share this allocation. At chunk
 512 it is 32.28125 MiB. The one-query tail and the 4096-row chunk
@@ -158,7 +158,7 @@ session state and the KV pool.
 A gfx1151 Release build and all nine CTest tests passed on AI. The
 shipping prefix-seed variant passed the empty and partially masked
 native tests, the exact-fit and short scratch checks and repeatability.
-The [long-model differential](../../../engine/gpu/attention_compare_test.go)
+The [long-model differential](../../../../engine/gpu/attention_compare_test.go)
 compared the 8K prompt and three greedy steps with direct WMMA, with
 the same top-1 tokens and a maximum difference of 0.25627.
 

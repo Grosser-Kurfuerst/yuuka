@@ -2,7 +2,7 @@
 
 ## Implementation
 
-The [prefill plan](../../../engine/gpu/plan.go) runs final-layer K/V
+The [prefill plan](../../../../engine/gpu/plan.go) runs final-layer K/V
 projection, key normalization and RoPE, and the paged K/V write for
 every prompt row. Subsequent operators enter the output tail. An
 ordinary final chunk moves the last residual to row zero, projects its
@@ -10,9 +10,9 @@ normalized Q and gate, applies attention against the entire prefix,
 and runs the output projection and FFN for one row. The speculative
 all-logits plan keeps full-row execution.
 
-The [ABI 7 descriptor](../../../backend/hip/bridge/yuuka_hip.h) carries
+The [ABI 7 descriptor](../../../../backend/hip/bridge/yuuka_hip.h) carries
 token displacement in `ROPE_BATCH.u[0]` and
-`ATTENTION_PREFILL_PAGED.n[5]`. The [executor](../../../backend/hip/bridge/bridge.cpp)
+`ATTENTION_PREFILL_PAGED.n[5]`. The [executor](../../../../backend/hip/bridge/bridge.cpp)
 checks the adjusted absolute positions before narrowing, and checks the
 adjusted attention range against the KV capacity. It uses the parent
 chunk's attention preference when computing the compact query. This
@@ -27,7 +27,7 @@ maximum absolute error 0.0000000447 and capacity 16. Increasing the
 dispatch position by one failed. The Go RoPE test matched rotation at
 position 5 and exercised signed position overflow rejection.
 
-The [real-model test](../../../engine/gpu/prefill_real_test.go) compared
+The [real-model test](../../../../engine/gpu/prefill_real_test.go) compared
 the final logits, three greedy decode steps and full last-layer K/V
 buffers against the full-row plan with F16 KV. It covered one token,
 128 tokens, a full chunk, one- and three-token tails, two full chunks,

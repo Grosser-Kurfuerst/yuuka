@@ -2,16 +2,16 @@
 
 ## Implementation
 
-The [MMQ kernel](../../../kernels/hip/gemm/mmq_gemm.hip) reuses the gfx1151
+The [MMQ kernel](../../../../kernels/hip/gemm/mmq_gemm.hip) reuses the gfx1151
 direct WMMA tile for additional full-tile Q4_K and Q5_K projections. A
 staging thread reads a pair of low and high nibbles together and applies
 separate FP32 scales and minima. For Q5_K it also reads the packed
 high bits once for that pair and extracts the bit plane for each
-subblock. The [dispatch table](../../kernels.md#gfx1151-direct-mmq-specialization)
+subblock. The [dispatch table](../../../kernels.md#gfx1151-direct-mmq-specialization)
 lists the measured cells. The earlier FFN specialization uses its
 compile-time dimensions.
 
-The [native tests](../../../tests/hip/prefill_test.cpp) add full CPU
+The [native tests](../../../../tests/hip/prefill_test.cpp) add full CPU
 product checks for one new Q4_K and one new Q5_K cell. They include
 subblocks on both sides of the 128-value staging boundary and across
 multiple 256-value quantization blocks.

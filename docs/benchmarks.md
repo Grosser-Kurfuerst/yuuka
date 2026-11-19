@@ -125,23 +125,23 @@ current ones by 0.5-1.6% at the longer prompts, which is the run-to-run noise of
 an unpinned clock on this device, so the same-session A/B above is the number to
 compare the LM head stage against.
 
-The [Q4_K FFN specialization acceptance](prefill-optimization/acceptance/02-q4-ffn.md)
+The [Q4_K FFN specialization acceptance](prefill-optimization/phase1/acceptance/02-q4-ffn.md)
 records the 2026-11-19 gfx1151 prefill comparison using F16 KV,
 including isolated MMQ, complete FFN and prompt-length medians.
-The [final FFN acceptance](prefill-optimization/acceptance/03-final-ffn.md)
+The [final FFN acceptance](prefill-optimization/phase1/acceptance/03-final-ffn.md)
 records the next F16 KV comparison, with one FFN row in the ordinary
 prefill output tail.
-The [MMQ shape expansion](prefill-optimization/acceptance/04a-mmq-shapes.md)
+The [MMQ shape expansion](prefill-optimization/phase1/acceptance/04a-mmq-shapes.md)
 records projection shape medians and the short- and long-prompt A/B.
-The [prepared GDN comparison](prefill-optimization/acceptance/04b-gdn.md)
+The [prepared GDN comparison](prefill-optimization/phase1/acceptance/04b-gdn.md)
 records the recurrence timings and the model-state comparison by lane mapping.
-The [FFN fusion comparison](prefill-optimization/acceptance/05-ffn-fusion.md)
+The [FFN fusion comparison](prefill-optimization/phase1/acceptance/05-ffn-fusion.md)
 records the isolated quantizer check, complete FFN time and prompt rates.
-The [final query crop comparison](prefill-optimization/acceptance/06-final-query.md)
+The [final query crop comparison](prefill-optimization/phase1/acceptance/06-final-query.md)
 records K/V equivalence, output work per chunk and the resulting prompt rates.
-The [long attention comparison](prefill-optimization/acceptance/07-long-attention.md)
+The [long attention comparison](prefill-optimization/phase1/acceptance/07-long-attention.md)
 records split-key numerics, merge costs, scratch and the 8K chunk sweep.
-The [official v1.0.0 matched-input comparison](prefill-optimization/acceptance/08-upstream-comparison.md)
+The [official v1.0.0 matched-input comparison](prefill-optimization/phase1/acceptance/08-upstream-comparison.md)
 records host logit latency and the per-length gate. At measured chunk settings
 the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
 2048 and 8192 tokens respectively.

@@ -2,9 +2,9 @@
 
 ## Implementation
 
-The [prefill plan](../../../engine/gpu/plan.go) uses the fused quantizer
+The [prefill plan](../../../../engine/gpu/plan.go) uses the fused quantizer
 where gate, up and down all select MMQ. After both gate and up GEMMs
-complete, the [kernel](../../../kernels/hip/gemm/mmq_gemm.hip) reads their
+complete, the [kernel](../../../../kernels/hip/gemm/mmq_gemm.hip) reads their
 FP32 projections and writes the down-input digits and scales into the
 same Q8_1 buffers. There is no activated FP32 write and read. At
 `M=512, FFN=9216` the change removes one launch and 36 MiB of logical
@@ -12,11 +12,11 @@ traffic per eligible full-row FFN. The persistent and transient buffer
 capacities are unchanged. ABI 6 adds the opcode and checks allocation
 spans, alignment and output overlap.
 
-The [native comparison](../../../tests/hip/prefill_test.cpp) covered a
+The [native comparison](../../../../tests/hip/prefill_test.cpp) covered a
 zero block, signed and exact halfway values, 17 rows, 65 down-output
 channels and nonzero offsets. Fused Q8_1 digits, scale/sum pairs and
 the following Q4_K down output matched the separate activation and
-quantizer exactly across two runs. The [plan tests](../../../tests/hip/plan_validation_test.cpp)
+quantizer exactly across two runs. The [plan tests](../../../../tests/hip/plan_validation_test.cpp)
 covered all four short or unaligned buffer spans, overlapping output
 and unsupported width. All nine CTest tests passed.
 

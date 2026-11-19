@@ -8,11 +8,11 @@ residual into row zero and evaluates one row of the FFN and output head.
 The FFN chooses its projection routes using the parent chunk's rows. The
 all-logits plan and plans ending in a recurrent layer process every row.
 
-- [Plan construction](../../../engine/gpu/plan.go) — Tail placement, row compaction and projection dispatch.
-- [Session](../../../engine/gpu/session.go) — Cached last-row and all-logits modes.
-- [HIP plan builder](../../../backend/hip/hip.go) — Checked byte-offset copies using the existing native operation.
-- [Tests](../../../engine/gpu/prefill_real_test.go) — Full-row oracle, F16 KV, five chunk layouts, and greedy continuation.
-- [Copy test](../../../backend/hip/hip_test.go) — In-place disjoint copy, sentinel row, overlap and bounds validation.
+- [Plan construction](../../../../engine/gpu/plan.go) — Tail placement, row compaction and projection dispatch.
+- [Session](../../../../engine/gpu/session.go) — Cached last-row and all-logits modes.
+- [HIP plan builder](../../../../backend/hip/hip.go) — Checked byte-offset copies using the existing native operation.
+- [Tests](../../../../engine/gpu/prefill_real_test.go) — Full-row oracle, F16 KV, five chunk layouts, and greedy continuation.
+- [Copy test](../../../../backend/hip/hip_test.go) — In-place disjoint copy, sentinel row, overlap and bounds validation.
 
 ## Arithmetic A/B
 

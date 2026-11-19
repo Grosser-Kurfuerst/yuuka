@@ -23,8 +23,8 @@ Attention selection.
 
 ## Reproduce the matched test
 
-Build the [Yuuka driver](../../../bench/prefill-compare/main.go) from the
-project root and build the [reference driver](../../../bench/prefill-compare/llama/driver.cpp)
+Build the [Yuuka driver](../../../../bench/prefill-compare/main.go) from the
+project root and build the [reference driver](../../../../bench/prefill-compare/llama/driver.cpp)
 against the verified official checkout. Set `YUUKA_BUILD` and `LLAMA`
 to the corresponding Release build directory and source checkout,
 `MODEL` to the GGUF, and `out` to a directory for logs.
