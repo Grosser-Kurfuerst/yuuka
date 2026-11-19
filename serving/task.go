@@ -164,21 +164,26 @@ func (t *generationTask) PrefillOnce(ctx context.Context, budget int) (scheduler
 		return stats, false, nil
 	}
 	t.promptDone = true
-	if t.capturePrefix {
-		if snapshot, snapshotErr := t.seq.Snapshot(); snapshotErr == nil {
-			t.promptState = snapshot
-			t.snapshotOK = true
-		}
-		t.promptLogits = serializeLogits(logits)
-	}
 	sampleElapsed, err := t.sampleAndEmit(logits)
 	t.sampling += sampleElapsed
 	stats.SamplingTime = sampleElapsed
+	if t.capturePrefix {
+		// Preserve the prompt boundary before the next decode changes the state.
+		t.capturePromptPrefix(logits)
+	}
 	if err != nil {
 		t.failure = err
 		return stats, true, err
 	}
 	return stats, true, t.failure
+}
+
+func (t *generationTask) capturePromptPrefix(logits []float32) {
+	if snapshot, err := t.seq.Snapshot(); err == nil {
+		t.promptState = snapshot
+		t.snapshotOK = true
+	}
+	t.promptLogits = serializeLogits(logits)
 }
 
 // DecodeOnce feeds the pending token and samples the next one.

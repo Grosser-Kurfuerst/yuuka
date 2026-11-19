@@ -78,3 +78,84 @@ repeatable end-to-end gain.
   It completed with zero hits and 15 misses.
 - One independent read-only review returned `NO_BLOCKING_ISSUES`.
   The reviewer independently reduced the SSE samples and capture timings.
+
+## Stage 5b emit before capture
+
+The control was Stage 5a at `6e267d7`. The candidate samples and calls
+the synchronous sink first, then captures the prompt state and serializes
+the final logits before returning control to the scheduler. The next
+decode can only start after that return. A terminal first sample or
+sink error still attempts capture. Cache insertion remains the manager's
+decision. [Generation task](../../../../serving/task.go)
+
+The task tests check ordering, terminal paths including a disconnected
+sink, and the exact prompt logits after the sequence's working logits
+buffer is overwritten. [Task tests](../../../../serving/task_test.go)
+
+Both timing arms enabled prefix caching. Every benchmark process had
+zero hits and 14 misses across warmups and timed requests. The server
+also reported misses for every timed request. Starting temperatures
+for the internal comparison were 41–60 °C.
+
+| Internal prompt | Control TTFT (ms) | Candidate TTFT (ms) | Control total (ms) | Candidate total (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 140 | 95.536 | 91.092 | 122.913 | 121.143 |
+| 530 | 281.708 | 279.001 | 314.699 | 315.548 |
+| 2050 | 988.117 | 995.811 | 1042.528 | 1053.781 |
+
+| Rendered SSE prompt | Control first content (ms) | Candidate first content (ms) | Latency saved (ms) |
+| ---: | ---: | ---: | ---: |
+| 138 | 102.433 | 93.003 | 9.430 |
+| 528 | 285.483 | 279.017 | 6.465 |
+| 2048 | 913.707 | 915.726 | −2.019 |
+
+The longest prompt's raw p50 increased in both process-level comparisons.
+Internal prefill p50 increased by 11.41 ms and total latency
+by 11.25 ms. In the HTTP run, the server's prefill p50 rose from 902.251
+to 910.369 ms. Subtracting each request's actual prefill time from its
+first-content latency gives medians of 8.797 ms and 5.536 ms for the two
+builds at 2048 tokens. This includes queueing, HTTP overhead and sampling
+and excludes the measured prefill interval.
+
+A temporary diagnostic benchmark alternated the two capture orders in
+one process in groups of four and recorded each request's timings.
+It used the same 2050-token flags with four warmups and 40 measured
+requests, 20 per order and zero cache hits. The table reports medians
+from the individual samples. It separates cross-process prefill
+variation from the placement of capture. Total latency differed by
+0.865 ms, or 0.08%.
+
+| Capture order | TTFT (ms) | Prefill (ms) | TTFT minus prefill (ms) | Total (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Capture before emission | 991.564 | 984.803 | 5.910 | 1045.995 |
+| Capture after emission | 987.129 | 984.076 | 3.043 | 1045.130 |
+
+The owner approved using the observed capture cost and measured benefit
+for both steps in place of the original 7 ms requirement. The short
+and medium SSE gains and the same-process long-prompt comparison met
+that acceptance basis.
+
+### Real-model server reuse
+
+The real-model test ran an otherwise identical server with temporary
+diagnostic output for token IDs. A 512-token chat prompt was cold on
+the first call and had 512 cached tokens on repeat. Appending an
+assistant message produced a 527-token prompt sharing those 512 tokens.
+The cold, full-hit and partial-hit calls each returned token IDs
+`[5844, 1199, 505]` and the same text as the corresponding
+cache-disabled request.
+
+### Stage 5b verification
+
+- `go build ./...`, `go vet ./...`, `go vet -tags hip ./...`,
+  `go test ./...`, and `go test -race ./...` passed on AI.
+- `go test -tags hip -v ./serving/...` passed on AI, including
+  `TestGPUPrefixCacheMatchesFreshRun`. The full
+  `YUUKA_TEST_MODEL="$MODEL" YUUKA_TEST_KV=f16 go test -p 1 -tags hip -v ./...`
+  suite passed. One MoE and two SentencePiece tests skipped because
+  their separate fixtures were absent.
+- Locally, `go test -race ./serving/...`, formatting, relative links
+  and `git diff --check` passed. The AI-tested Go sources matched the
+  local sources by SHA-256.
+- Two independent read-only review rounds returned `NO_BLOCKING_ISSUES`.
+  The follow-up independently reduced the 40 long-prompt samples.

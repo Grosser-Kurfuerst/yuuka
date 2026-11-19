@@ -270,8 +270,10 @@ request.
 - **Payload:** block references covering the prompt, the recurrent
   convolution/matrix state snapshot at the prompt boundary, and the logits for
   the last prompt token. The logits let a full-prompt hit sample immediately.
-  Requests with prefix caching enabled capture both after the final prefill
-  chunk. Requests with caching disabled skip the snapshot and serialization.
+  Requests with prefix caching enabled capture both after attempting to emit
+  the first sampled token and before the first decode step. A stop token, a
+  one-token limit or a sink error still captures the prompt boundary.
+  Requests with caching disabled skip the snapshot and serialization.
 - **Partial final block:** when the prompt is not block-aligned, the cache owns
   the original partial block and the request receives a private copy, so later
   decode writes cannot corrupt the cached KV.
