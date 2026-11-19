@@ -307,6 +307,12 @@ def main(argv=None):
             dtype, n_in, n_out = key
             mine = yuuka[key]
             theirs = reference[key]
+            # The yuuka table's bytes already cover every matrix of the signature
+            # (a paired row counts both), so the reference bandwidth is those
+            # bytes over the reference's time for the same step, whatever number
+            # of dispatches it partitions them into: the reference runs one
+            # dispatch per matrix, yuuka one per pair, which is the ratio of two
+            # the check permits.
             ratio_ops = theirs["ops"] / mine["ops"] if mine["ops"] else 0.0
             if abs(ratio_ops - 1.0) > 1e-6 and abs(ratio_ops - 2.0) > 1e-6:
                 raise Fail(f"{dtype} {n_in}->{n_out}: the reference runs"
@@ -314,10 +320,7 @@ def main(argv=None):
                            f" {mine['ops']:.0f}; the two engines do not partition this"
                            " projection the same way, so the bandwidths are not"
                            " comparable")
-            # The fused gate/up dispatch covers two matrices; scale the matrix
-            # bytes by the operation ratio, which the check above bounds to 1 or 2.
-            reference_bytes = mine["bytes"] * ratio_ops
-            ref_gbps = reference_bytes / theirs["ns_per_step"]
+            ref_gbps = mine["bytes"] / theirs["ns_per_step"]
             rows.append([
                 ",".join(sorted(set(mine["names"]))), dtype,
                 f"{n_in}->{n_out}" + (" x2" if mine["paired"] else ""),
