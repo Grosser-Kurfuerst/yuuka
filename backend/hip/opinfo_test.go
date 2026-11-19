@@ -12,8 +12,8 @@ import (
 // a name and a recorded first-slot role. A new code without an entry would make
 // the attribution tables silent about it, so this fails instead.
 func TestOpNameAndRolesCoverABI(t *testing.T) {
-	if MaxOpCode < 42 {
-		t.Fatalf("shadow covers op codes up to %d, want at least 42", MaxOpCode)
+	if MaxOpCode < 43 {
+		t.Fatalf("shadow covers op codes up to %d, want at least 43", MaxOpCode)
 	}
 	names := make(map[string]uint32, MaxOpCode)
 	for code := uint32(1); code <= MaxOpCode; code++ {
@@ -30,19 +30,19 @@ func TestOpNameAndRolesCoverABI(t *testing.T) {
 			t.Errorf("op code %d (%s) has no recorded first-slot role", code, name)
 		}
 	}
-	// The decode attribution in docs/benchmarks.md names these codes; pin the
-	// spelling the documents use.
+	// Pin the names used in the prefill and decode attribution.
 	for code, want := range map[uint32]string{
-		OpGemv:           "gemv",
-		OpGDN:            "gdn",
-		OpRecurrentToken: "recurrent_token",
-		OpConvL2Norm:     "conv_l2norm",
-		OpRMSNorm:        "rmsnorm",
-		OpSiluMul:        "silu_mul",
-		OpQuantQ8_1:      "quant_q8_1",
-		OpLMHead:         "lm_head",
-		OpGemvResidual:   "gemv_residual",
-		OpGemvPair:       "gemv_pair",
+		OpGemv:             "gemv",
+		OpGDN:              "gdn",
+		OpRecurrentToken:   "recurrent_token",
+		OpConvL2Norm:       "conv_l2norm",
+		OpRMSNorm:          "rmsnorm",
+		OpSiluMul:          "silu_mul",
+		OpQuantQ8_1:        "quant_q8_1",
+		OpLMHead:           "lm_head",
+		OpGemvResidual:     "gemv_residual",
+		OpGemvPair:         "gemv_pair",
+		OpSiluMulQuantQ8_1: "silu_mul_quant_q8_1",
 	} {
 		if got := OpName(code); got != want {
 			t.Errorf("OpName(%d) = %q, want %q", code, got, want)

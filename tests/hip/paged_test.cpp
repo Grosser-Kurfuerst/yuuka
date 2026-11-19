@@ -155,7 +155,8 @@ int expect_graph_rejected(context & ctx, yuuka_plan * plan, yuuka_buffer * dynam
 // so the reference attention sweep over the same host arrays is a direct
 // comparison.
 int test_gqa_attention_group4(context & ctx, int head_dim, int position, int rows,
-                              int block_size, int capacity, bool blas = false) {
+                              int block_size, int capacity, bool blas = false,
+                              int displacement = 0) {
     const int heads = 4, kv_heads = 1, kv_dim = kv_heads * head_dim;
     const int blocks = capacity / block_size;
     std::vector<int32_t> table(static_cast<size_t>(blocks));
@@ -226,10 +227,17 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
         op.n[2] = head_dim;
         op.n[3] = kv_dim;
         op.n[4] = rows;
+        op.n[5] = displacement;
         op.u[0] = block_size;
         op.u[1] = capacity;
         op.u[2] = blas ? YUUKA_DTYPE_F16 : YUUKA_DTYPE_F32;
         op.f[0] = 1.0f / std::sqrt(float(head_dim));
+        if (displacement > 0) {
+            yuuka_op invalid = op;
+            invalid.n[5] = capacity;
+            CHECK(yuuka_plan_add(plan, &invalid) == YUUKA_ERR_INVALID_ARGUMENT);
+            CHECK(position + displacement + rows == capacity);
+        }
         CHECK_STATUS(yuuka_plan_add(plan, &op));
     }
     CHECK_STATUS(yuuka_plan_execute(plan, ctx.stream, 0, uint32_t(position), 1, ctx.event));
@@ -237,7 +245,7 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
     std::vector<float> got(size_t(rows) * heads * head_dim);
     CHECK(download(ctx, out, got.data(), got.size() * sizeof(float)));
     std::vector<float> want;
-    reference_attention_dims(q, host_k, host_v, position, rows, heads, kv_heads,
+    reference_attention_dims(q, host_k, host_v, position + displacement, rows, heads, kv_heads,
                              head_dim, want);
     const float diff = max_diff(got, want);
     if (diff >= 2e-4f) {
@@ -248,6 +256,10 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
         }
     }
     CHECK(diff < 2e-4f);
+    if (displacement > 0) {
+        CHECK(yuuka_plan_execute(plan, ctx.stream, 0, uint32_t(position + 1), 1, ctx.event) ==
+              YUUKA_ERR_INVALID_ARGUMENT);
+    }
     yuuka_plan_destroy(fill);
     yuuka_plan_destroy(plan);
     yuuka_buffer_free(k_src);
@@ -258,8 +270,8 @@ int test_gqa_attention_group4(context & ctx, int head_dim, int position, int row
     yuuka_buffer_free(q_buf);
     yuuka_buffer_free(out);
     if (scratch) yuuka_buffer_free(scratch);
-    std::printf("gqa attention group4 head_dim=%d position=%d blas=%d: ok (max diff %.3g)\n",
-                head_dim, position, blas ? 1 : 0, diff);
+    std::printf("gqa attention group4 head_dim=%d position=%d displacement=%d blas=%d: ok (max diff %.3g)\n",
+                head_dim, position, displacement, blas ? 1 : 0, diff);
     return 0;
 }
 
@@ -543,6 +555,10 @@ int main() {
         return 1;
     }
     if (test_gqa_attention_group4(ctx, 64, 2048, 16, 16, 2048 + 16, true) != 0) {
+        teardown(ctx);
+        return 1;
+    }
+    if (test_gqa_attention_group4(ctx, 4, 10, 1, 4, 16, false, 5) != 0) {
         teardown(ctx);
         return 1;
     }

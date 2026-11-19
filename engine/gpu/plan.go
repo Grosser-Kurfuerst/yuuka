@@ -5,6 +5,7 @@ package gpu
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
 	"github.com/yuuka-ai/yuuka/tensor"
@@ -13,7 +14,13 @@ import (
 // prefillMatmul appends the measured implementation for one prefill matmul.
 func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
 	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64) error {
-	switch hip.SelectPrefillPath(w.dtype, rows, nIn, nOut) {
+	return m.prefillMatmulPath(plan, w, x, xOff, out, outOff, nIn, nOut, rows,
+		hip.SelectPrefillPath(w.dtype, rows, nIn, nOut))
+}
+
+func (m *Model) prefillMatmulPath(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
+	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64, path hip.PrefillPath) error {
+	switch path {
 	case hip.PrefillBatchedGemv:
 		return plan.AddGemvBatchAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
 	case hip.PrefillBLAS:
@@ -535,8 +542,16 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	return m.decodeMatmulResidual(plan, down, m.act.ffnGate, m.act.x, m.act.x, ffn, hidden)
 }
 
+type prefillOutput uint8
+
+const (
+	prefillLastLogit prefillOutput = iota
+	prefillAllLogits
+	prefillLastLogitFullFFN // Full-row reference for correctness comparisons.
+)
+
 // buildPrefillPlan constructs the chunked prompt graph for one session.
-func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Plan, error) {
+func (m *Model) buildPrefillPlan(s *Session, rows int, outputMode prefillOutput) (*hip.Plan, error) {
 	plan, err := m.device.NewPlan()
 	if err != nil {
 		return nil, err
@@ -544,6 +559,8 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 	cfg := m.config
 	p := &m.prefill
 	rows64 := int64(rows)
+	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
+	crop := outputMode == prefillLastLogit && cfg.BlockCount > 0 && !cfg.IsRecurrent(cfg.BlockCount-1)
 	embedding, err := m.weight("token_embd.weight")
 	if err != nil {
 		return nil, err
@@ -566,20 +583,28 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 		if err != nil {
 			return nil, err
 		}
+		cropLayer := crop && i == cfg.BlockCount-1
 		if cfg.IsRecurrent(i) {
 			if err := m.addPrefillRecurrent(plan, s, i, attnNorm, rows64); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := m.addPrefillFullAttention(plan, s, i, attnNorm, rows64); err != nil {
+			if err := m.addPrefillFullAttention(plan, s, i, attnNorm, rows64, cropLayer); err != nil {
 				return nil, err
 			}
 		}
-		if err := m.addPrefillFFN(plan, prefix, postNorm, rows64); err != nil {
+		ffnRows := rows64
+		if cropLayer {
+			ffnRows, lastOff = 1, 0
+		}
+		// Preserve the parent chunk's projection arithmetic for the compact row.
+		if err := m.addPrefillFFN(plan, prefix, postNorm, ffnRows, rows64); err != nil {
 			return nil, err
 		}
 	}
-	plan.MarkTail()
+	if !crop {
+		plan.MarkTail()
+	}
 	outputNorm, err := m.weight("output_norm.weight")
 	if err != nil {
 		return nil, err
@@ -592,7 +617,7 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 	if err != nil {
 		return nil, err
 	}
-	if allLogits {
+	if outputMode == prefillAllLogits {
 		if rows > maxSpecDraft {
 			return nil, fmt.Errorf("gpu: speculative logits rows %d exceed %d", rows, maxSpecDraft)
 		}
@@ -620,7 +645,6 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 		}
 		return plan, nil
 	}
-	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
 	if err := plan.AddRMSNormAt(p.x, lastOff, outputNorm.buf, p.norm, 0,
 		int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
 		return nil, err
@@ -642,7 +666,7 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Pla
 	return plan, nil
 }
 
-func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight, rows int64) error {
+func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight, rows int64, cropQuery bool) error {
 	cfg := m.config
 	p := &m.prefill
 	prefix := fmt.Sprintf("blk.%d.", layerIndex)
@@ -679,23 +703,20 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillProjections(plan, p.norm, hidden, rows, []prefillProjection{
+	projections := [...]prefillProjection{
 		{w: q, out: p.q, nOut: qDim},
 		{w: k, out: p.k, nOut: kvDim},
 		{w: v, out: p.v, nOut: kvDim},
-	}); err != nil {
-		return err
 	}
-	if err := plan.AddRMSNormHeadsBatchAt(p.q, 0, qNorm.buf, p.q, 0,
-		rows, int64(cfg.HeadCount), headDim, 2*headDim, cfg.RMSNormEps); err != nil {
+	firstProjection := 0
+	if cropQuery {
+		firstProjection = 1
+	}
+	if err := m.prefillProjections(plan, p.norm, hidden, rows, projections[firstProjection:]); err != nil {
 		return err
 	}
 	if err := plan.AddRMSNormHeadsBatchAt(p.k, 0, kNorm.buf, p.k, 0,
 		rows, int64(cfg.KVHeadCount), headDim, headDim, cfg.RMSNormEps); err != nil {
-		return err
-	}
-	if err := plan.AddRoPEBatchAt(p.q, 0, int(rows), cfg.HeadCount, int(2*headDim),
-		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), int64(cfg.HeadCount*2*cfg.HeadDim)); err != nil {
 		return err
 	}
 	if err := plan.AddRoPEBatchAt(p.k, 0, int(rows), cfg.KVHeadCount, int(headDim),
@@ -706,36 +727,64 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		m.poolV[layerIndex], s.tableBuf, kvDim, rows, int64(s.capacity), m.blockSize, m.kvType); err != nil {
 		return err
 	}
+	queryRows := rows
+	var displacement uint32
+	if cropQuery {
+		// All K/V rows are ready for subsequent chunks and decode. The
+		// remaining operations only produce the requested final output.
+		plan.MarkTail()
+		queryRows = 1
+		displacement = uint32(rows - 1)
+		lastOff := uint64(rows-1) * uint64(hidden) * 4
+		if rows > 1 {
+			if err := plan.AddCopyAt(p.x, 0, p.x, lastOff, hidden); err != nil {
+				return err
+			}
+		}
+		qPath := hip.SelectPrefillPath(q.dtype, rows, hidden, qDim)
+		if err := m.prefillMatmulPath(plan, q, p.norm, lastOff, p.q, 0, hidden, qDim, queryRows, qPath); err != nil {
+			return err
+		}
+	}
+	if err := plan.AddRMSNormHeadsBatchAt(p.q, 0, qNorm.buf, p.q, 0,
+		queryRows, int64(cfg.HeadCount), headDim, 2*headDim, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := plan.AddRoPEBatchOffsetAt(p.q, 0, int(queryRows), cfg.HeadCount, int(2*headDim),
+		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), qDim, displacement); err != nil {
+		return err
+	}
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 	// The rocBLAS path only runs where the FP16 MMA kernel does not cover the
 	// shape, so F16 KV never selects the slower kernel by default.
 	useBlas := m.attentionBlasEnabled && !m.forceTiledAttention &&
 		!hip.PrefillAttentionMMA(cfg.HeadCount, cfg.KVHeadCount, int(headDim),
 			int(rows), s.position, m.kvType)
-	if m.forceTiledAttention {
-		if err := plan.AddAttentionPrefillPagedTiledFormatAt(p.q, 0, m.poolK[layerIndex],
-			m.poolV[layerIndex], p.attn, 0, s.tableBuf,
-			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
-			s.capacity, m.blockSize, scale, m.kvType); err != nil {
+	if useBlas {
+		if err := plan.AddAttentionPrefillPagedBlasOffsetFormatAt(p.q, 0, m.poolK[layerIndex],
+			m.poolV[layerIndex], p.attn, 0, s.tableBuf, p.attentionBlas,
+			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),
+			s.capacity, m.blockSize, scale, displacement); err != nil {
 			return err
 		}
-	} else if useBlas {
-		if err := plan.AddAttentionPrefillPagedBlasFormatAt(p.q, 0, m.poolK[layerIndex],
-			m.poolV[layerIndex], p.attn, 0, s.tableBuf, p.attentionBlas,
-			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
+	} else if p.attentionSplit != nil && queryRows >= 512 {
+		if err := plan.AddAttentionPrefillPagedSplitFormatAt(p.q, m.poolK[layerIndex],
+			m.poolV[layerIndex], p.attn, s.tableBuf, p.attentionSplit,
+			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),
 			s.capacity, m.blockSize, scale); err != nil {
 			return err
 		}
-	} else if err := plan.AddAttentionPrefillPagedFormatAt(p.q, 0, m.poolK[layerIndex],
+	} else if err := plan.AddAttentionPrefillPagedOffsetFormatAt(p.q, 0, m.poolK[layerIndex],
 		m.poolV[layerIndex], p.attn, 0, s.tableBuf,
-		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
-		s.capacity, m.blockSize, scale, m.kvType); err != nil {
+		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),
+		s.capacity, m.blockSize, scale, m.kvType, displacement, m.forceTiledAttention); err != nil {
 		return err
 	}
-	if err := m.prefillMatmul(plan, o, p.attn, 0, p.tmp, 0, oDim, hidden, rows); err != nil {
+	oPath := hip.SelectPrefillPath(o.dtype, rows, oDim, hidden)
+	if err := m.prefillMatmulPath(plan, o, p.attn, 0, p.tmp, 0, oDim, hidden, queryRows, oPath); err != nil {
 		return err
 	}
-	return plan.Add(p.x, p.tmp, rows*hidden)
+	return plan.Add(p.x, p.tmp, queryRows*hidden)
 }
 
 func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight, rows int64) error {
@@ -796,6 +845,14 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		return err
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
+	var prepared *hip.Buffer
+	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
+	preparedWidth := uint64(convDim - inner + 2*rank)
+	if arch == "gfx1151" && stateSize == 128 && rows >= 128 &&
+		preparedWidth <= p.ffnGate.Bytes()/4/uint64(rows) {
+		// The FFN writes this buffer after the recurrent op on the same stream.
+		prepared = p.ffnGate
+	}
 	if err := plan.AddRecurrentChunkAt(hip.RecurrentChunkArgs{
 		ConvState:   s.conv[layerIndex],
 		State:       s.recState[layerIndex],
@@ -809,21 +866,16 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		Norm:        norm.buf,
 		Conv:        p.conv,
 		Out:         p.gdnNorm,
-		// The chunkwise gated delta-net kernel is implemented and validated
-		// against this path (see kernels/hip/prefill/gdn_chunk.hip), but it is
-		// slower on gfx1151: its dense products run on the FMA pipe with the
-		// state in registers and are LDS-latency bound, so the per-token kernel
-		// stays selected. Supplying Scratch here selects the chunked path.
-		Scratch:   nil,
-		Rows:      rows,
-		Groups:    int64(cfg.SSMGroupCount),
-		Heads:     rank,
-		StateSize: stateSize,
-		ConvDim:   convDim,
-		Inner:     inner,
-		Kernel:    int64(cfg.SSMConvKernel),
-		Eps:       cfg.RMSNormEps,
-		QScale:    qScale,
+		Prepared:    prepared,
+		Rows:        rows,
+		Groups:      int64(cfg.SSMGroupCount),
+		Heads:       rank,
+		StateSize:   stateSize,
+		ConvDim:     convDim,
+		Inner:       inner,
+		Kernel:      int64(cfg.SSMConvKernel),
+		Eps:         cfg.RMSNormEps,
+		QScale:      qScale,
 	}); err != nil {
 		return err
 	}
@@ -833,7 +885,7 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 	return plan.Add(p.x, p.tmp, rows*hidden)
 }
 
-func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows int64) error {
+func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows, dispatchRows int64) error {
 	cfg := m.config
 	p := &m.prefill
 	gate, err := m.weight(prefix + "ffn_gate.weight")
@@ -857,8 +909,9 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 	// Fuse the gate/up pair when both matmuls select the custom WMMA path.
 	// The fused kernel shares one activation tile and applies SwiGLU in the
 	// epilogue, so neither intermediate is written.
-	gatePath := hip.SelectPrefillPath(gate.dtype, rows, hidden, ffn)
-	upPath := hip.SelectPrefillPath(up.dtype, rows, hidden, ffn)
+	gatePath := hip.SelectPrefillPath(gate.dtype, dispatchRows, hidden, ffn)
+	upPath := hip.SelectPrefillPath(up.dtype, dispatchRows, hidden, ffn)
+	downPath := hip.SelectPrefillPath(down.dtype, dispatchRows, ffn, hidden)
 	fused := gate.dtype == up.dtype && gatePath == hip.PrefillWMMA
 	if fused {
 		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, p.norm, 0,
@@ -877,11 +930,22 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 		if err := plan.AddGemmMmqAt(up.buf, 0, p.xQ8, p.xDS, p.ffnUp, 0, hidden, ffn, rows, up.dtype); err != nil {
 			return err
 		}
+		if downPath == hip.PrefillMMQ {
+			// Both projections have consumed the normalized input. Reuse its
+			// Q8_1 scratch for the down projection on the same stream.
+			if err := plan.AddSiluMulQuantQ8_1At(p.ffnGate, 0, p.ffnUp, 0, p.xQ8, 0, p.xDS, 0, ffn, rows); err != nil {
+				return err
+			}
+			if err := plan.AddGemmMmqAt(down.buf, 0, p.xQ8, p.xDS, p.tmp, 0, ffn, hidden, rows, down.dtype); err != nil {
+				return err
+			}
+			return plan.Add(p.x, p.tmp, rows*hidden)
+		}
 	} else {
-		if err := m.prefillMatmul(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows); err != nil {
+		if err := m.prefillMatmulPath(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows, gatePath); err != nil {
 			return err
 		}
-		if err := m.prefillMatmul(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows); err != nil {
+		if err := m.prefillMatmulPath(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows, upPath); err != nil {
 			return err
 		}
 	}
@@ -890,7 +954,7 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 			return err
 		}
 	}
-	if err := m.prefillMatmul(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows); err != nil {
+	if err := m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath); err != nil {
 		return err
 	}
 	return plan.Add(p.x, p.tmp, rows*hidden)

@@ -182,6 +182,48 @@ int main() {
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
                     "LM_HEAD weight size") && ok;
     }
+    {
+        yuuka_buffer * scratch = nullptr;
+        if (yuuka_buffer_alloc(device, 2048, &scratch) != YUUKA_OK) {
+            std::fprintf(stderr, "SwiGLU Q8_1 test scratch: %s\n", yuuka_last_error());
+            ok = false;
+        } else {
+            yuuka_op op = make_op(YUUKA_OP_SILU_MUL_QUANT_Q8_1, scratch);
+            op.n[0] = 128;
+            op.n[1] = 1;
+            op.off[0] = 16;
+            op.off[1] = 544;
+            op.off[2] = 1088;
+            op.off[3] = 1224;
+            for (int i = 0; i < 4; ++i) {
+                yuuka_op bad = op;
+                bad.buf[i] = tiny;
+                ok = expect(yuuka_plan_add(plan, &bad), YUUKA_ERR_INVALID_ARGUMENT,
+                            "SwiGLU Q8_1 short buffer") && ok;
+                bad = op;
+                ++bad.off[i];
+                ok = expect(yuuka_plan_add(plan, &bad), YUUKA_ERR_INVALID_ARGUMENT,
+                            "SwiGLU Q8_1 unaligned offset") && ok;
+            }
+            yuuka_op bad = op;
+            bad.off[2] = op.off[1];
+            ok = expect(yuuka_plan_add(plan, &bad), YUUKA_ERR_INVALID_ARGUMENT,
+                        "SwiGLU Q8_1 overlap") && ok;
+            bad = op;
+            bad.n[0] = 160;
+            ok = expect(yuuka_plan_add(plan, &bad), YUUKA_ERR_UNSUPPORTED,
+                        "SwiGLU Q8_1 width") && ok;
+            yuuka_plan * fused_plan = nullptr;
+            ok = expect(yuuka_plan_create(device, &fused_plan), YUUKA_OK,
+                        "SwiGLU Q8_1 plan") && ok;
+            if (fused_plan != nullptr) {
+                ok = expect(yuuka_plan_add(fused_plan, &op), YUUKA_OK,
+                            "SwiGLU Q8_1 valid offset spans") && ok;
+                yuuka_plan_destroy(fused_plan);
+            }
+            yuuka_buffer_free(scratch);
+        }
+    }
 
     // The same shapes with roomy buffers must still be accepted.
     {

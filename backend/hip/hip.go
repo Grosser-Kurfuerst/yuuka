@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 7
+const RequiredABI = 9
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -840,12 +840,26 @@ func (p *Plan) Add(x, delta *Buffer, n int64) error {
 }
 
 func (p *Plan) AddCopy(dst, src *Buffer, n int64) error {
+	return p.AddCopyAt(dst, 0, src, 0, n)
+}
+
+// AddCopyAt appends an FP32 copy at byte offsets. Ranges in the same buffer
+// must be disjoint or identical.
+func (p *Plan) AddCopyAt(dst *Buffer, dstOff uint64, src *Buffer, srcOff uint64, n int64) error {
 	if err := p.check(dst, src); err != nil {
 		return err
+	}
+	if n <= 0 || dstOff%4 != 0 || srcOff%4 != 0 {
+		return errors.New("hip: invalid FP32 copy count or offset")
+	}
+	if dst.ptr == src.ptr && dstOff != srcOff && uint64(n) > (max(dstOff, srcOff)-min(dstOff, srcOff))/4 {
+		return errors.New("hip: overlapping FP32 copy ranges")
 	}
 	op := C.yuuka_op{code: C.YUUKA_OP_COPY}
 	op.buf[0] = dst.ptr
 	op.buf[1] = src.ptr
+	op.off[0] = C.uint64_t(dstOff)
+	op.off[1] = C.uint64_t(srcOff)
 	op.n[0] = C.uint64_t(n)
 	return p.add(op)
 }
@@ -1036,6 +1050,25 @@ func (p *Plan) AddQuantizeQ8_1At(x *Buffer, xOff uint64, qs, ds *Buffer, nIn, ba
 	op.buf[2] = ds.ptr
 	op.n[0] = C.uint64_t(nIn)
 	op.n[1] = C.uint64_t(batch)
+	return p.add(op)
+}
+
+// AddSiluMulQuantQ8_1At writes the Q8_1 digits and scale/sum pairs for
+// SiLU(gate)*up. The four offsets are byte offsets into the respective buffers.
+func (p *Plan) AddSiluMulQuantQ8_1At(gate *Buffer, gateOff uint64, up *Buffer, upOff uint64,
+	qs *Buffer, qsOff uint64, ds *Buffer, dsOff uint64, width, rows int64) error {
+	if width <= 0 || rows <= 0 {
+		return errors.New("hip: SwiGLU Q8_1 dimensions must be positive")
+	}
+	if err := p.check(gate, up, qs, ds); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_SILU_MUL_QUANT_Q8_1}
+	op.buf[0], op.off[0] = gate.ptr, C.uint64_t(gateOff)
+	op.buf[1], op.off[1] = up.ptr, C.uint64_t(upOff)
+	op.buf[2], op.off[2] = qs.ptr, C.uint64_t(qsOff)
+	op.buf[3], op.off[3] = ds.ptr, C.uint64_t(dsOff)
+	op.n[0], op.n[1] = C.uint64_t(width), C.uint64_t(rows)
 	return p.add(op)
 }
 
@@ -1317,6 +1350,12 @@ func (p *Plan) AddRMSNormHeadsBatchAt(src *Buffer, srcOff uint64, weight *Buffer
 // AddRoPEBatchAt appends RoPE to a [rows, heads, stride] chunk starting at the
 // dynamic position supplied to Execute.
 func (p *Plan) AddRoPEBatchAt(data *Buffer, dataOff uint64, rows, heads, stride, headDim, rotDim int, base float32, rowStride int64) error {
+	return p.AddRoPEBatchOffsetAt(data, dataOff, rows, heads, stride, headDim, rotDim, base, rowStride, 0)
+}
+
+// AddRoPEBatchOffsetAt rotates the first row at the execution position plus
+// displacement tokens. The remaining rows use consecutive positions.
+func (p *Plan) AddRoPEBatchOffsetAt(data *Buffer, dataOff uint64, rows, heads, stride, headDim, rotDim int, base float32, rowStride int64, displacement uint32) error {
 	if rows <= 0 || heads <= 0 || rotDim <= 0 || rotDim%2 != 0 || rotDim > headDim || stride < headDim || rowStride < int64(heads*stride) {
 		return errors.New("hip: invalid batch RoPE dimensions")
 	}
@@ -1332,6 +1371,7 @@ func (p *Plan) AddRoPEBatchAt(data *Buffer, dataOff uint64, rows, heads, stride,
 	op.n[3] = C.uint64_t(rotDim)
 	op.n[4] = C.uint64_t(rows)
 	op.n[5] = C.uint64_t(rowStride)
+	op.u[0] = C.uint32_t(displacement)
 	op.f[0] = C.float(base)
 	return p.add(op)
 }
@@ -1633,8 +1673,15 @@ func (p *Plan) AddAttentionPrefillPagedAt(q *Buffer, qOff uint64, kPool, vPool, 
 
 // AddAttentionPrefillPagedBlasFormatAt selects the experimental FP16 KV
 // matrix-multiplication attention path. It uses the ordinary plan validator,
-// with buf[5] carrying the scratch and flags bit 0 requesting rocBLAS.
+// with buf[5] carrying the scratch and the BLAS flag requesting rocBLAS.
 func (p *Plan) AddAttentionPrefillPagedBlasFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, scratch *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	return p.AddAttentionPrefillPagedBlasOffsetFormatAt(q, qOff, kPool, vPool, out, outOff, table, scratch,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, 0)
+}
+
+// AddAttentionPrefillPagedBlasOffsetFormatAt selects the experimental FP16 KV
+// attention path starting at the execution position plus displacement tokens.
+func (p *Plan) AddAttentionPrefillPagedBlasOffsetFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, scratch *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, displacement uint32) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 ||
 		heads%kvHeads != 0 || kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity || headDim > 256 {
@@ -1656,6 +1703,7 @@ func (p *Plan) AddAttentionPrefillPagedBlasFormatAt(q *Buffer, qOff uint64, kPoo
 	op.off[0], op.off[3] = C.uint64_t(qOff), C.uint64_t(outOff)
 	op.n[0], op.n[1], op.n[2], op.n[3], op.n[4] =
 		C.uint64_t(kvHeads), C.uint64_t(heads), C.uint64_t(headDim), C.uint64_t(kvDim), C.uint64_t(rows)
+	op.n[5] = C.uint64_t(displacement)
 	op.u[0], op.u[1], op.u[2] = C.uint32_t(blockSize), C.uint32_t(capacity), C.uint32_t(tensor.F16)
 	op.f[0] = C.float(scale)
 	return p.add(op)
@@ -1680,16 +1728,35 @@ func (p *Plan) AddAttentionPrefillPagedDenseFormatAt(q *Buffer, qOff uint64, kPo
 // with the FP16 MMA kernel forced off, so a test can compare the two kernels on
 // the same plan input.
 func (p *Plan) AddAttentionPrefillPagedTiledFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {
-	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
-		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, false, true)
+	return p.AddAttentionPrefillPagedOffsetFormatAt(q, qOff, kPool, vPool, out, outOff, table,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, 0, true)
+}
+
+// AddAttentionPrefillPagedOffsetFormatAt appends gated attention starting at
+// execution position plus displacement. It preserves dispatch for the parent
+// chunk of displacement+rows and can force the scalar tiled implementation.
+func (p *Plan) AddAttentionPrefillPagedOffsetFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, tiled bool) error {
+	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table, nil,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, displacement, false, tiled)
+}
+
+// AddAttentionPrefillPagedSplitFormatAt appends gated F16 attention with
+// scratch for up to four FP32 key ranges. The native launcher selects the
+// split count using the position supplied to Execute.
+func (p *Plan) AddAttentionPrefillPagedSplitFormatAt(q, kPool, vPool, out, table, partial *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	if partial == nil {
+		return errors.New("hip: split attention scratch is nil")
+	}
+	return p.addAttentionPrefillPagedFlag(q, 0, kPool, vPool, out, 0, table, partial,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, tensor.F16, 0, false, false)
 }
 
 func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
-	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
-		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, dense, false)
+	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table, nil,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, 0, dense, false)
 }
 
-func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense, tiled bool) error {
+func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, partial *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, dense, tiled bool) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
 		kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity {
@@ -1710,6 +1777,12 @@ func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool
 	op.buf[2] = vPool.ptr
 	op.buf[3] = out.ptr
 	op.buf[4] = table.ptr
+	if partial != nil {
+		if err := p.check(partial); err != nil {
+			return err
+		}
+		op.buf[6] = partial.ptr
+	}
 	op.off[0] = C.uint64_t(qOff)
 	op.off[3] = C.uint64_t(outOff)
 	op.n[0] = C.uint64_t(kvHeads)
@@ -1717,6 +1790,7 @@ func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool
 	op.n[2] = C.uint64_t(headDim)
 	op.n[3] = C.uint64_t(kvDim)
 	op.n[4] = C.uint64_t(rows)
+	op.n[5] = C.uint64_t(displacement)
 	op.u[0] = C.uint32_t(blockSize)
 	op.u[1] = C.uint32_t(capacity)
 	op.u[2] = C.uint32_t(dtype)
@@ -1749,8 +1823,12 @@ type RecurrentChunkArgs struct {
 	Out         *Buffer
 	OutOff      uint64
 	// Scratch holds two chunk x chunk matrices per 32-token chunk and head for
-	// the chunked path. It may be nil, which selects the per-token kernel.
-	Scratch   *Buffer
+	// the chunkwise path. It is mutually exclusive with Prepared.
+	Scratch *Buffer
+	// Prepared holds FP32 Q, K, decay and beta during a 128-state recurrence.
+	// With no scratch buffers, preparation runs inside the per-token core.
+	Prepared *Buffer
+
 	Rows      int64
 	Groups    int64
 	Heads     int64
@@ -1787,6 +1865,11 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 				got, chunks*2*32*32*a.Heads)
 		}
 	}
+	if a.Prepared != nil {
+		if err := p.check(a.Prepared); err != nil {
+			return err
+		}
+	}
 	op := C.yuuka_op{code: C.YUUKA_OP_RECURRENT_CHUNK}
 	op.buf[0] = a.ConvState.ptr
 	op.buf[1] = a.State.ptr
@@ -1805,6 +1888,9 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 	op.off[10] = C.uint64_t(a.OutOff)
 	if a.Scratch != nil {
 		op.buf[12] = a.Scratch.ptr
+	}
+	if a.Prepared != nil {
+		op.buf[13] = a.Prepared.ptr
 	}
 	op.n[0] = C.uint64_t(a.Rows)
 	op.n[1] = C.uint64_t(a.Groups)

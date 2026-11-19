@@ -213,6 +213,34 @@ yuuka_status validate_quantize_plan_op(const yuuka_op & op) {
                                   op.off[1], op.buf[2], op.off[2]);
 }
 
+yuuka_status validate_silu_mul_quantize_plan_op(const yuuka_op & op) {
+    const uint64_t n = op.n[0];
+    const uint64_t rows = op.n[1];
+    const yuuka_status status = validate_q8_1_quantize(
+        n, rows, op.buf[0], op.off[0], op.buf[2], op.off[2], op.buf[3], op.off[3]);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    const uint64_t elements = n * rows;
+    const uint64_t bytes[] = {elements * 4, elements * 4, elements, elements / 4};
+    if (!buffer_range_ok(op.buf[1], op.off[1], bytes[1])) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "silu q8_1 up buffer is too small");
+    }
+    if (op.off[0] % 16 != 0 || op.off[1] % 16 != 0 ||
+        op.off[2] % 4 != 0 || op.off[3] % 8 != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "silu q8_1 buffer offset is unaligned");
+    }
+    for (int dst = 2; dst < 4; ++dst) {
+        for (int src = 0; src < dst; ++src) {
+            if (op.buf[src] == op.buf[dst] && op.off[src] < op.off[dst] + bytes[dst] &&
+                op.off[dst] < op.off[src] + bytes[src]) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "silu q8_1 output overlaps buffer %d", src);
+            }
+        }
+    }
+    return YUUKA_OK;
+}
+
 // validate_gemv_plan_op checks a GEMV or GEMV_BATCH operation before it enters
 // the plan. Unsupported dtypes and block-misaligned widths are capability
 // failures; invalid dimensions and undersized buffers are argument failures.
@@ -739,7 +767,8 @@ yuuka_status validate_rope_batch_plan_op(const yuuka_op & op) {
     const uint64_t rows = op.n[4];
     const uint64_t row_stride = op.n[5];
     if (heads == 0 || rows == 0 || rot_dim == 0 || rot_dim % 2 != 0 ||
-        rot_dim > head_dim || stride < head_dim || row_stride < heads * stride) {
+        rot_dim > head_dim || stride < head_dim || row_stride < heads * stride ||
+        rows > INT32_MAX || op.u[0] > INT32_MAX || rows - 1 > uint64_t(INT32_MAX) - op.u[0]) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch RoPE dimensions");
     }
     if (rot_dim / 2 > 1024) {
@@ -880,6 +909,25 @@ yuuka_status validate_recurrent_chunk_plan_op(const yuuka_op & op) {
             !buffer_range_ok(op.buf[i], op.off[i], bytes)) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT,
                         "recurrent chunk buffer %d is too small", i);
+        }
+    }
+    if (op.buf[13] != nullptr) {
+        if (op.buf[12] != nullptr || state != 128 || rows > UINT16_MAX ||
+            conv_dim > INT32_MAX || groups > INT32_MAX || heads > INT32_MAX) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prepared recurrent chunk geometry");
+        }
+        uint64_t bytes = 0;
+        const uint64_t width = conv_dim - inner + 2 * heads;
+        if (__builtin_mul_overflow(rows, width, &elems) ||
+            !checked_float_bytes(elems, &bytes) || (op.off[13] % sizeof(float)) != 0 ||
+            !buffer_range_ok(op.buf[13], op.off[13], bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prepared recurrent chunk scratch span");
+        }
+        for (int i = 0; i < 12; ++i) {
+            if (op.buf[i] == op.buf[13] && op.off[i] < op.off[13] + bytes &&
+                op.off[13] < op.off[i] + need[i] * sizeof(float)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "prepared recurrent chunk scratch overlaps buffer %d", i);
+            }
         }
     }
     return YUUKA_OK;
@@ -1161,7 +1209,8 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
     const uint64_t capacity = op.u[1];
     const uint32_t dtype = op.u[2];
     if (kv_heads == 0 || heads == 0 || head_dim == 0 || rows == 0 ||
-        heads % kv_heads != 0 || kv_dim != kv_heads * head_dim || capacity < rows) {
+        heads % kv_heads != 0 || kv_dim != kv_heads * head_dim || capacity < rows ||
+        capacity > INT32_MAX || op.n[5] > capacity - rows) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged prefill attention dimensions");
     }
     if (!kv_dtype_ok(dtype)) {
@@ -1194,6 +1243,27 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
         !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small");
     }
+    const uint32_t split_flag = op.flags & YUUKA_OP_FLAG_PREFILL_SPLIT_MASK;
+    if (op.buf[6] != nullptr) {
+        if (dtype != YUUKA_DTYPE_F16 || head_dim != 256 || heads / kv_heads != 4 ||
+            op.u[3] != 0 ||
+            (op.flags & (YUUKA_OP_FLAG_PREFILL_BLAS | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED)) != 0) {
+            return fail(YUUKA_ERR_UNSUPPORTED, "split attention requires gated F16 GQA with head width 256");
+        }
+        uint64_t bytes = 0;
+        if (__builtin_mul_overflow(heads, rows, &bytes) || bytes > INT32_MAX ||
+            __builtin_mul_overflow(bytes, (4 * (head_dim + 2) + 1) * sizeof(float), &bytes) ||
+            op.off[6] % sizeof(float) != 0 || !buffer_range_ok(op.buf[6], op.off[6], bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "split attention scratch is too small or unaligned");
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (op.buf[6] == op.buf[i]) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "split attention scratch aliases buffer %d", i);
+            }
+        }
+    } else if (split_flag != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "forced split attention requires scratch");
+    }
     if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0) {
         if (dtype != YUUKA_DTYPE_F16 || op.u[3] != 0 || (op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_BLAS)) != 0) {
             return fail(YUUKA_ERR_UNSUPPORTED, "BLAS attention requires gated F16 KV");
@@ -1213,7 +1283,8 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
             !buffer_range_ok(op.buf[5], 0, scratchBytes)) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "BLAS attention scratch too small");
         }
-    } else if ((op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED)) != 0u) {
+    } else if ((op.flags & ~(YUUKA_OP_FLAG_TAIL | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED |
+                             YUUKA_OP_FLAG_PREFILL_SPLIT_MASK)) != 0u) {
         return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged attention flags");
     }
     return YUUKA_OK;
@@ -2016,9 +2087,13 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             break;
         }
         case YUUKA_OP_ROPE_BATCH: {
+            const uint64_t first = uint64_t(position) + op.u[0];
+            if (first + op.n[4] - 1 > INT32_MAX) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch RoPE position exceeds int32");
+            }
             yuuka::launch_rope_batch_f32(
                 op_ptr<float>(op, 0), int(op.n[4]), int(op.n[0]), int(op.n[1]),
-                int(op.n[2]), int(op.n[3]), int(position), op.f[0], int(op.n[5]),
+                int(op.n[2]), int(op.n[3]), int(first), op.f[0], int(op.n[5]),
                 stream);
             break;
         }
@@ -2061,7 +2136,7 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                 op_ptr<const float>(op, 6), op_ptr<const float>(op, 7),
                 op_ptr<const float>(op, 8), op_ptr<const float>(op, 9),
                 op_ptr<float>(op, 11), op_ptr<float>(op, 10),
-                op_ptr<float>(op, 12),
+                op_ptr<float>(op, 12), op_ptr<float>(op, 13),
                 int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
                 int(op.n[4]), int(op.n[5]), int(op.u[0]), op.f[0], op.f[1],
                 stream);
@@ -2088,6 +2163,12 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             yuuka::launch_quantize_q8_1(op_ptr<void>(op, 1), op_ptr<void>(op, 2),
                                         op_ptr<const float>(op, 0), op.n[0], op.n[1],
                                         stream);
+            break;
+        }
+        case YUUKA_OP_SILU_MUL_QUANT_Q8_1: {
+            yuuka::launch_silu_mul_quantize_q8_1(
+                op_ptr<void>(op, 2), op_ptr<void>(op, 3), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), op.n[0], op.n[1], stream);
             break;
         }
         case YUUKA_OP_RMSNORM: {
@@ -2311,29 +2392,39 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         case YUUKA_OP_ATTENTION_PREFILL_PAGED: {
             const uint64_t rows = op.n[4];
             const uint64_t capacity = op.u[1];
-            if (uint64_t(position) + rows > capacity) {
+            const uint64_t first = uint64_t(position) + op.n[5];
+            if (first + rows > capacity) {
                 return fail(YUUKA_ERR_INVALID_ARGUMENT,
-                            "paged prefill attention at %u with %llu rows exceeds capacity %llu",
-                            position, static_cast<unsigned long long>(rows),
+                            "paged prefill attention at %llu with %llu rows exceeds capacity %llu",
+                            static_cast<unsigned long long>(first),
+                            static_cast<unsigned long long>(rows),
                             static_cast<unsigned long long>(capacity));
             }
-            if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0 && uint64_t(position) + rows >= 2048) {
+            if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0 && first + rows >= 2048) {
                 const int rc = yuuka::launch_attention_prefill_paged_blas_f16(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
                     op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
-                    int(op.n[1]), int(op.n[2]), int(rows), int(position),
+                    int(op.n[1]), int(op.n[2]), int(rows), int(first),
                     op.f[0], op_ptr<void>(op, 5), stream);
                 if (rc != 0) return fail(YUUKA_ERR_DEVICE, "BLAS attention failed: %d", rc);
             } else {
-                yuuka::launch_attention_prefill_paged_f32(
+                // The displacement omits leading query rows without changing
+                // the parent chunk's WMMA preference.
+                const bool prefer_wmma = (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) == 0 &&
+                    yuuka::attention_wmma_preferred(int(rows + op.n[5]), int(position));
+                const uint32_t split_flag = op.flags & YUUKA_OP_FLAG_PREFILL_SPLIT_MASK;
+                const int forced_splits = split_flag == 0 ? 0 : 1 << ((split_flag >> 3) - 1);
+                const hipError_t error = yuuka::launch_attention_prefill_paged_f32(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
                     op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
                     int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
-                    int(position), op.f[0], op.u[2], int(op.u[3]),
-                    (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) != 0,
-                    stream);
+                    int(first), op.f[0], op.u[2], int(op.u[3]), prefer_wmma,
+                    op_ptr<float>(op, 6), forced_splits, stream);
+                if (error != hipSuccess) {
+                    return fail(YUUKA_ERR_DEVICE, "split prefill attention: %s", hip_error(error));
+                }
             }
             break;
         }
@@ -3442,7 +3533,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMV_PAIR) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_SILU_MUL_QUANT_Q8_1) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3491,6 +3582,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_QUANT_Q8_1:
                 status = validate_quantize_plan_op(*op);
+                break;
+            case YUUKA_OP_SILU_MUL_QUANT_Q8_1:
+                status = validate_silu_mul_quantize_plan_op(*op);
                 break;
             case YUUKA_OP_LM_HEAD:
                 status = validate_lm_head_plan_op(*op);

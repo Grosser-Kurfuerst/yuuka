@@ -15,7 +15,8 @@ for source in \
     kernels/hip/gemm/wmma_gemm.hip \
     kernels/hip/gemm/mmq_gemm.hip \
     kernels/hip/gemm/lm_head.hip \
-    kernels/hip/prefill/prefill.hip; do
+    kernels/hip/prefill/prefill.hip \
+    kernels/hip/prefill/attention_wmma.hip; do
     echo "== ${source}"
     "${hipcc}" --offload-arch="${arch}" -O3 -std=c++17 \
         -I"${root}/backend/hip/bridge" -I"${root}/kernels/hip" \

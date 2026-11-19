@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 7
+#define YUUKA_HIP_ABI_VERSION 9
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -143,7 +143,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_RECURRENT_TOKEN = 39,
     YUUKA_OP_CONV_L2NORM = 40,
     YUUKA_OP_GEMV_RESIDUAL = 41,
-    YUUKA_OP_GEMV_PAIR = 42
+    YUUKA_OP_GEMV_PAIR = 42,
+    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -151,15 +152,19 @@ typedef enum yuuka_op_code {
 // Forces the tiled paged prefill attention kernel where the FP16 MMA kernel
 // would otherwise be selected. Validation and measurement only.
 #define YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED 0x4u
+// These values are mutually exclusive choices in the split-count field.
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_MASK 0x18u
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_1 0x08u
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_2 0x10u
+#define YUUKA_OP_FLAG_PREFILL_SPLIT_4 0x18u
 
 /* GEMM implementation selection carried in yuuka_op.u[1]. AUTO uses the
  * compiled default for the dtype. BLAS is the rocBLAS route and requires FP16
  * weights, an FP16 x, and an FP16 scratch buffer that receives the FP32-accumulated
  * product before it is cast to the FP32 result. WMMA is the custom rocWMMA
  * kernel, which accepts FP32 x and every supported weight dtype. MMQ is the
- * int8 route: Q4_K/Q5_K/Q6_K weights, Q8_1 activations produced by
- * YUUKA_OP_QUANT_Q8_1 in buf[1], their float2 block scales in buf[3], and FP32
- * output. */
+ * int8 route: Q4_K/Q5_K/Q6_K weights, Q8_1 activations in buf[1], their
+ * float2 block scales in buf[3], and FP32 output. */
 #define YUUKA_GEMM_PATH_AUTO 0u
 #define YUUKA_GEMM_PATH_BLAS 1u
 #define YUUKA_GEMM_PATH_WMMA 2u
@@ -321,7 +326,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * GEMV_PAIR), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
  * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
- * DEQUANT_F16, and QUANT_Q8_1. Unsupported
+ * DEQUANT_F16, QUANT_Q8_1, and SILU_MUL_QUANT_Q8_1. Unsupported
  * dtypes and widths that violate the quantization block layout fail with
  * YUUKA_ERR_UNSUPPORTED; invalid dimensions, batch sizes, and undersized
  * buffers fail with YUUKA_ERR_INVALID_ARGUMENT. A rejected operation is not
@@ -329,8 +334,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *
  * Dynamic positions: ROPE_BATCH, KV_WRITE_BATCH, ATTENTION_PREFILL, and the
  * legacy single-token operators consume the position passed to
- * yuuka_plan_execute. Prefill plans pass the chunk start. ATTENTION_PREFILL and
- * KV_WRITE_BATCH additionally reject position+rows beyond their capacity.
+ * yuuka_plan_execute. Prefill plans pass the chunk start. ROPE_BATCH and
+ * ATTENTION_PREFILL_PAGED add their descriptor's token displacement.
+ * Attention and KV write batches reject ranges beyond their capacity.
  *
  * Buffer layouts for the prefill family:
  *   RMSNORM_BATCH:       buf0 src, buf1 weight, buf2 dst; n={cols,rows,
@@ -338,7 +344,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   RMSNORM_HEADS_BATCH: buf0 src, buf1 weight, buf2 dst; n={size,heads,
  *                        stride,rows}; rows are contiguous [rows,heads,stride]
  *   ROPE_BATCH:          buf0 data; n={heads,stride,head_dim,rot_dim,rows,
- *                        row_stride}
+ *                        row_stride}; u[0]=token displacement
  *   KV_WRITE_BATCH:      buf0 k, buf1 v, buf2 k_cache, buf3 v_cache;
  *                        n={kv_dim,rows}; u[0]=capacity
  *   ATTENTION_PREFILL:   buf0 q, buf1 k_cache, buf2 v_cache, buf3 out;
@@ -347,6 +353,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   RECURRENT_CHUNK:     buf0 conv_state, buf1 matrix_state, buf2 qkv, buf3 z,
  *                        buf4 alpha, buf5 beta, buf6 conv weights, buf7 dt,
  *                        buf8 a, buf9 norm, buf10 out, buf11 conv scratch;
+ *                        optional buf12 triangular scratch or buf13 prepared
+ *                        FP32 Q[rows,groups,128], K[rows,groups,128],
+ *                        decay[rows,heads], beta[rows,heads] (state=128);
  *                        n={rows,groups,heads,state,conv_dim,inner};
  *                        u[0]=conv kernel; f[0]=eps; f[1]=q scale
  *   EMBEDDING_BATCH:     buf0 weight table, buf1 out, buf2 int32 tokens;
@@ -356,6 +365,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                        n[0]=n_in, n[1]=n_out, u[0]=dtype
  *   QUANT_Q8_1:          buf0 FP32 src, buf1 int8 dst, buf2 float2 block
  *                        scales; n={n, batch}; n must be a multiple of 128
+ *   SILU_MUL_QUANT_Q8_1: buf0 FP32 gate, buf1 FP32 up, buf2 int8 dst,
+ *                        buf3 float2 block scales; n={width,rows}; offsets
+ *                        must be aligned to 16, 16, 4 and 8 bytes
  *   GEMM with path MMQ:  buf0 packed weights, buf1 Q8_1 int8 activations,
  *                        buf2 FP32 out, buf3 float2 block scales;
  *                        n={n_in,n_out,rows}; u[0]=Q4_K/Q5_K/Q6_K;
@@ -421,7 +433,12 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 block table; flags bit 1 enables experimental
  *                           BLAS F16 KV path with buf5 FP16 scratch;
- *                           n={kv_heads,heads,head_dim,kv_dim,rows};
+ *                           optional buf6 holds split-key FP32 scratch
+ *                           with four [rows,heads,head_dim+2] records and
+ *                           one [rows,heads] prefix maximum array;
+ *                           n={kv_heads,heads,head_dim,kv_dim,rows,displacement};
+ *                           first query position is execute position plus
+ *                           displacement tokens;
  *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype;
  *                           u[3]=1 selects the dense query layout (no output
  *                           gate), u[3]=0 selects the gated Qwen3.5 layout

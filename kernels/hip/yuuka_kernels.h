@@ -95,6 +95,9 @@ void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,
  * 256, which every K-quant row layout already requires. */
 void launch_quantize_q8_1(void * qs, void * ds, const float * x, uint64_t n,
                           uint64_t batch, hipStream_t stream);
+void launch_silu_mul_quantize_q8_1(void * qs, void * ds, const float * gate,
+                                  const float * up, uint64_t n, uint64_t batch,
+                                  hipStream_t stream);
 void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
                             const void * w, uint64_t n_in, uint64_t n_out,
                             uint64_t batch, uint32_t dtype, hipStream_t stream);
@@ -281,13 +284,19 @@ void launch_attention_prefill_paged_wmma_f32(
     int head_dim, int kv_dim, int rows, int position, float scale,
     uint32_t dtype, int dense, hipStream_t stream);
 
-void launch_attention_prefill_paged_f32(float * out, const float * q,
+hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
                                         const void * k_pool, const void * v_pool,
                                         const int32_t * block_table, int block_size,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        int force_tiled, hipStream_t stream);
+                                        bool prefer_wmma, float * partial, int forced_splits,
+                                        hipStream_t stream);
+
+hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q,
+        const void * k_pool, const void * v_pool, const int32_t * block_table,
+        int block_size, int kv_heads, int heads, int kv_dim, int rows,
+        int position, float scale, float * partial, int splits, hipStream_t stream);
 // Experimental GEMM-based attention with gathered FP16 KV, batched QK/PV
 // matrix multiplication, causal softmax, and gated final FP32 output.
 int launch_attention_prefill_paged_blas_f16(
@@ -331,15 +340,15 @@ void launch_gdn_chunked_f32(float * rec, float * conv, float * alpha,
 
 // launch_recurrent_chunk_f32 runs the convolution, the gated delta-net
 // recurrence, and the gated RMSNorm of one recurrent layer chunk. alpha and
-// beta are overwritten with the activated gates. scratch holds the chunked
-// path's triangular intermediates and may be null, in which case state sizes
-// other than 128 take the per-token fallback.
+// beta are overwritten only on the triangular path selected by scratch.
+// A separate prepared span can hold normalized Q/K and activated gates for
+// the register path. State sizes other than 128 use the generic kernel.
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 const float * qkv, const float * z,
                                 float * alpha, float * beta,
                                 const float * conv_weights, const float * dt,
                                 const float * a, const float * norm, float * conv,
-                                float * out, float * scratch, int rows,
+                                float * out, float * scratch, float * prepared, int rows,
                                 int groups, int heads, int state_size,
                                 int conv_dim, int inner, int conv_kernel,
                                 float eps, float q_scale, hipStream_t stream);

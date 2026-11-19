@@ -125,6 +125,27 @@ current ones by 0.5-1.6% at the longer prompts, which is the run-to-run noise of
 an unpinned clock on this device, so the same-session A/B above is the number to
 compare the LM head stage against.
 
+The [Q4_K FFN specialization acceptance](prefill-optimization/acceptance/02-q4-ffn.md)
+records the 2026-11-19 gfx1151 prefill comparison using F16 KV,
+including isolated MMQ, complete FFN and prompt-length medians.
+The [final FFN acceptance](prefill-optimization/acceptance/03-final-ffn.md)
+records the next F16 KV comparison, with one FFN row in the ordinary
+prefill output tail.
+The [MMQ shape expansion](prefill-optimization/acceptance/04a-mmq-shapes.md)
+records projection shape medians and the short- and long-prompt A/B.
+The [prepared GDN comparison](prefill-optimization/acceptance/04b-gdn.md)
+records the recurrence timings and the model-state comparison by lane mapping.
+The [FFN fusion comparison](prefill-optimization/acceptance/05-ffn-fusion.md)
+records the isolated quantizer check, complete FFN time and prompt rates.
+The [final query crop comparison](prefill-optimization/acceptance/06-final-query.md)
+records K/V equivalence, output work per chunk and the resulting prompt rates.
+The [long attention comparison](prefill-optimization/acceptance/07-long-attention.md)
+records split-key numerics, merge costs, scratch and the 8K chunk sweep.
+The [official v1.0.0 matched-input comparison](prefill-optimization/acceptance/08-upstream-comparison.md)
+records host logit latency and the per-length gate. At measured chunk settings
+the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
+2048 and 8192 tokens respectively.
+
 ## Decode: output length
 
 `yuuka bench --backend hip --prompt-tokens 128 --decode-tokens 128|256`,
@@ -751,7 +772,7 @@ Each of these is a measured decision that still holds in the current code:
   1.6-3.3x faster per GEMM from 256 rows upward but numerically rejected on
   tall-K shapes and needed an FP16 copy of every weight matrix; the int8 MMQ
   route replaced it.
-- **The MMQ staging and K-step shape are settled.** The adopted change stages
+- **The generic MMQ path uses a 128-value K step.** It stages
   both operands in WMMA fragment order (0.0% bank conflicts from 35.9%),
   expands Q4_K/Q5_K digits with word-wide masks, and uses a 128-value K step so
   two blocks stay resident per CU: 13.8 -> 17.3-18.5 TFLOP/s on Q4_K
@@ -760,7 +781,9 @@ Each of these is a measured decision that still holds in the current code:
   a 60 KiB double-buffered 256-value stage (one block per CU, 14.6 TFLOP/s),
   register prefetch of the next step's weights (192 VGPRs, 161-195 spills,
   6.4 TFLOP/s), a 64-value K step (16.4 TFLOP/s), and rebuilding the rocWMMA
-  gfx11 operand duplication to remove its `ds_swizzle_b32` cost.
+  gfx11 operand duplication by storing duplicate operands in LDS. The
+  [gfx1151 specialization](kernels.md#gfx1151-direct-mmq-specialization) uses
+  LDS broadcast and vectorized activation staging on the measured Q4_K cell.
 - **The chunkwise gated delta-net form is implemented but not selected.** It
   matches the per-token recurrence to `1.6e-7` and removes the per-token barrier
   chain, but takes 3.10 ms per recurrent layer against 2.01 ms for the

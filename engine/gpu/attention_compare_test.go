@@ -113,3 +113,83 @@ func TestGPUAttentionPathsAgree(t *testing.T) {
 		}
 	}
 }
+
+func TestGPULongSplitAttentionMatchesDirect(t *testing.T) {
+	path := os.Getenv("YUUKA_TEST_MODEL")
+	if path == "" {
+		t.Skip("YUUKA_TEST_MODEL unset")
+	}
+	reader, err := gguf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	model, err := qwen35.Load(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := tokenizer.NewFromGGUF(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 1200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const length = 8192
+	if len(ids) < length {
+		t.Fatalf("prompt has %d tokens, want %d", len(ids), length)
+	}
+	rt, err := NewWithKVType(reader, model, length+16, tensor.F16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	if err := rt.SetPrefillChunk(2048); err != nil {
+		t.Fatal(err)
+	}
+	m := rt.model
+	scratch := m.prefill.attentionSplit
+	if scratch == nil {
+		t.Skip("model or device does not select the gfx1151 split route")
+	}
+	run := func(split bool) [][]float32 {
+		t.Helper()
+		if err := rt.session.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		m.prefill.attentionSplit = nil
+		if split {
+			m.prefill.attentionSplit = scratch
+		}
+		m.prefillGen++
+		logits, err := rt.session.Prefill(ids[:length], true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := [][]float32{append([]float32(nil), logits...)}
+		for range 3 {
+			logits, err = rt.session.Decode(int32(top1(logits)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, append([]float32(nil), logits...))
+		}
+		return result
+	}
+	want := run(false)
+	got := run(true)
+	// Use the existing cross-route long-attention tolerance for F16/Q8_1.
+	const tolerance = 0.3
+	for step := range want {
+		var maxDiff float64
+		for i, v := range got[step] {
+			maxDiff = math.Max(maxDiff, math.Abs(float64(v-want[step][i])))
+		}
+		if math.IsNaN(maxDiff) || maxDiff > tolerance || top1(got[step]) != top1(want[step]) {
+			t.Fatalf("step %d: max logit diff %.6g, top-1 %d vs %d",
+				step, maxDiff, top1(got[step]), top1(want[step]))
+		}
+		t.Logf("step %d: max logit diff %.6g, top-1 %d", step, maxDiff, top1(got[step]))
+	}
+}
