@@ -15,3 +15,4 @@
 - [Stage 4c Q8_0 unsplit WMMA](08c-q8-kv-wmma.md) — Packed reader, measured tiled-prefix cutoff, numerical checks, and paired throughput.
 - [Stage 4d Cross-format split-key](08d-cross-format-split.md) — Typed seed and partials, validation, and independently measured F32 and Q8_0 route windows.
 - [Stage 5c Contiguous GDN state](09-contiguous-gdn-state.md) — Snapshot compatibility, lifecycle timings, HIP call reduction, and the latency gate decision.
+- [Stage 6a Compact final-row GEMV](10a-compact-tail-gemv.md) — Five prepared projections, tail tile sweep, full-prefill timings, and the dispatch decision.
