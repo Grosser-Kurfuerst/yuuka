@@ -311,7 +311,7 @@ the measured F16 shape classes, not a fallback for unsupported quantization.
 
 ### 6.2 Custom WMMA GEMM
 
-Two rocWMMA tile variants share the packed-load helpers and are selected inside
+Two legacy rocWMMA tile variants share the packed-load helpers and are selected inside
 `launch_gemm_wmma_f32out` from the measured row and shape class:
 
 - `gemm_wmma_k32_kernel`: 32x64 output tile, eight waves, one 16x16 fragment
@@ -423,9 +423,25 @@ when both projections resolve to `PrefillWMMA`; otherwise the separate gate,
 up, and `SILU_MUL` operations remain. Q/K/V, beta/alpha, and RMSNorm fusions are
 not implemented.
 
-Larger tiles, an int8 tensor-core path, and the remaining projection fusions
-remain candidates; they are not implemented and
-are not claimed in the benchmark results.
+#### Direct short-chunk FP16 WMMA
+
+On single-target gfx1151 builds, eligible K-quant GEMMs with 17–127 rows
+use Direct FP16 WMMA. The single GEMM uses 128 output channels and the
+fused SwiGLU uses 64. Both stage 64 values of K and either 32 or 64 tokens
+per tile. Q4_K and Q5_K unpack one 32-value scale group at a time and
+Q6_K uses 16-value groups with two-byte aligned reads. The input tile
+uses vector loads and masks rows beyond the chunk.
+
+Swizzled LDS holds the FP16 operands in 16-byte spans. The upper half-wave
+consumes the second eight K values first, matching the rocWMMA operand
+order. The FP32 accumulators write the guarded output directly. The
+SwiGLU variant applies the gate and multiplication in the same epilogue.
+Both preserve the batch's activation precision and use at most 24 KiB of
+static LDS, with no FP16 weight scratch. The launch requires a multiple
+of 256 input values, a multiple of 128 output channels, and 16-byte
+aligned activations. Q4_K and Q5_K weights require 16-byte alignment.
+Q6_K weights require two-byte alignment. All other calls use the legacy
+tile selection. See the [Direct FP16 acceptance record](prefill-optimization/phase2/acceptance/04b-direct-fp16-wmma.md).
 
 ### 6.3 Int8 MMQ GEMM
 
@@ -586,6 +602,7 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 | `M < 4` | Batched GEMV |
 | Quantized, `M < 8`, and `K > N` | Batched GEMV |
 | K-quant, `N >= 64`, `M >= 128` | Int8 MMQ (Q8_1 activations, int32 WMMA) |
+| Aligned K-quant, `K % 256 == 0`, `N % 128 == 0`, `17 <= M <= 127`, gfx1151 build | Direct FP16 WMMA, with fused SwiGLU for eligible FFN pairs |
 | Quantized, other `M >= 4` | Custom rocWMMA |
 | F16, `4 <= M <= 64`, `K > N` | rocBLAS + cast |
 | F16, `M < 8`, `K <= N` | Batched GEMV |

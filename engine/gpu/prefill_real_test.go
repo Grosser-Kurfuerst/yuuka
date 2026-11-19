@@ -60,7 +60,7 @@ func TestGPUStreamingShortPrefillMatchesCPU(t *testing.T) {
 							t.Fatal(err)
 						}
 						state.Reset()
-						checkStreamingPrompt(t, rt, model, state, ids[:n])
+						checkPrefillCPU(t, rt, model, state, ids[:n], 2e-3)
 					})
 				}
 			}
@@ -68,7 +68,7 @@ func TestGPUStreamingShortPrefillMatchesCPU(t *testing.T) {
 	}
 }
 
-func checkStreamingPrompt(t *testing.T, rt *Runtime, model *qwen35.Model, state *qwen35.State, ids []int32) {
+func checkPrefillCPU(t *testing.T, rt *Runtime, model *qwen35.Model, state *qwen35.State, ids []int32, tolerance float64) {
 	t.Helper()
 	got, err := rt.Forward(ids)
 	if err != nil {
@@ -82,8 +82,8 @@ func checkStreamingPrompt(t *testing.T, rt *Runtime, model *qwen35.Model, state 
 	for i := range want {
 		diff = math.Max(diff, math.Abs(float64(got[i])-float64(want[i])))
 	}
-	if math.IsNaN(diff) || diff > 2e-3 {
-		t.Errorf("prefill max logit diff %.6g exceeds 0.002", diff)
+	if math.IsNaN(diff) || diff > tolerance {
+		t.Errorf("prefill max logit diff %.6g exceeds %g", diff, tolerance)
 	}
 	t.Logf("prefill max logit diff %.6g", diff)
 	for step := 0; step <= 8; step++ {
@@ -103,6 +103,41 @@ func checkStreamingPrompt(t *testing.T, rt *Runtime, model *qwen35.Model, state 
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestGPUShortFP16PrefillMatchesCPU(t *testing.T) {
+	reader, tok, model, _ := goldenPrompt(t)
+	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{17, 64} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			if len(ids) < n {
+				t.Fatalf("fixture has %d tokens, need %d", len(ids), n)
+			}
+			const capacity = 80
+			rt, err := NewWithKVType(reader, model, capacity, tensor.F16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rt.Close()
+			state, err := qwen35.NewStateWithFormat(model.Config, capacity, qwen35.KVF16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Table().Release()
+			checkPrefillCPU(t, rt, model, state, ids[:n], 0.05)
+		})
+	}
+}
+
+func TestGPUShortFP16PrefillMatchesControl(t *testing.T) {
+	control := os.Getenv("YUUKA_TEST_PREFILL_FP16_CONTROL")
+	if control == "" {
+		t.Skip("YUUKA_TEST_PREFILL_FP16_CONTROL is not set")
+	}
+	checkPrefillAgainstControl(t, control, []int{17, 18, 64, 96, 127, 530, 600}, 0.05)
 }
 
 // TestGPUStreamingTailsMatchControl compares against a separately built

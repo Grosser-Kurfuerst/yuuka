@@ -1,5 +1,6 @@
 #include "yuuka_hip.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -419,11 +420,26 @@ std::vector<uint8_t> pack_weights(yuuka_dtype dtype, std::mt19937 & rng, int64_t
     return packed;
 }
 
+// The short K-quant WMMA path rounds both operands to FP16 before
+// accumulation. The rounded oracle isolates the kernel from the expected
+// FP16 approximation, which the SwiGLU product can amplify.
+float dot_rounded_kquant(yuuka_dtype dtype, const uint8_t * row, const float * x,
+                          int64_t n_in) {
+    double sum = 0.0;
+    for (int64_t k = 0; k < n_in; ++k) {
+        const float w = static_cast<float>(static_cast<_Float16>(dequant_ref_value(dtype, row, k)));
+        const float a = static_cast<float>(static_cast<_Float16>(x[k]));
+        sum += double(a) * w;
+    }
+    return static_cast<float>(sum);
+}
+
 // compare_gemm checks a GEMM result against the CPU dot-product reference at
 // the documented tolerance.
 bool compare_gemm(const char * name, const std::vector<uint8_t> & packed,
                   const std::vector<float> & x, const std::vector<float> & got,
-                  yuuka_dtype dtype, int64_t n_in, int64_t n_out, int64_t rows) {
+                  yuuka_dtype dtype, int64_t n_in, int64_t n_out, int64_t rows,
+                  bool fp16_oracle = false) {
     const DotFn dot = dot_for(dtype);
     if (dot == nullptr) {
         return true;
@@ -431,14 +447,17 @@ bool compare_gemm(const char * name, const std::vector<uint8_t> & packed,
     const uint64_t rb = row_bytes(dtype, n_in);
     double max_abs = 0.0;
     bool ok = true;
+    const double tolerance = fp16_oracle ? 1e-3 : 2e-2;
     for (int64_t row = 0; row < rows && ok; ++row) {
         for (int64_t col = 0; col < n_out; ++col) {
             const uint8_t * wrow = packed.data() + col * rb;
-            const float expected = dot(wrow, x.data() + row * n_in, n_in);
+            const float * xrow = x.data() + row * n_in;
+            const float expected = fp16_oracle ? dot_rounded_kquant(dtype, wrow, xrow, n_in)
+                                               : dot(wrow, xrow, n_in);
             const float value = got[size_t(row * n_out + col)];
             const double diff = std::fabs(double(value) - double(expected));
             max_abs = std::max(max_abs, diff);
-            if (!std::isfinite(diff) || diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
+            if (!std::isfinite(diff) || diff > tolerance * (1.0 + std::fabs(double(expected)))) {
                 std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
                              name, static_cast<long long>(row),
                              static_cast<long long>(col), value, expected);
@@ -451,26 +470,44 @@ bool compare_gemm(const char * name, const std::vector<uint8_t> & packed,
     return ok;
 }
 
+constexpr float kGemmSentinel = -12345.0f;
+
+template <typename Launch>
+bool check_gemm_partial_output(Buffer & out, size_t valid,
+                               std::vector<float> & got, Launch launch) {
+    const std::vector<float> initial(got.size(), kGemmSentinel);
+    std::vector<float> repeated(got.size());
+    if (!upload_vec(out, initial) || !launch() || !download_vec(out, got) ||
+        !upload_vec(out, initial) || !launch() || !download_vec(out, repeated)) {
+        return false;
+    }
+    if (std::memcmp(got.data(), repeated.data(), got.size() * sizeof(float)) != 0 ||
+        !std::all_of(got.begin() + valid, got.end(), [](float v) { return v == kGemmSentinel; })) {
+        std::fprintf(stderr, "WMMA output changed between runs or wrote past the last row\n");
+        return false;
+    }
+    return true;
+}
+
 bool test_gemm(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
                yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
-               int64_t rows, std::mt19937 & rng) {
+               int64_t rows, std::mt19937 & rng, bool fp16_oracle = false) {
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     std::vector<float> x(size_t(n_in * rows));
     for (float & v : x) v = dist(rng);
     std::vector<uint8_t> packed = pack_weights(dtype, rng, n_in, n_out);
+    std::vector<float> got(size_t(n_out * (rows + 64)));
     Buffer wb, xb, ob;
     bool ok = alloc(device, wb, packed.size()) && alloc(device, xb, x.size() * 4) &&
-              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              alloc(device, ob, got.size() * sizeof(float)) &&
               upload(wb, packed.data(), packed.size()) && upload_vec(xb, x);
+    ok = ok && check_gemm_partial_output(ob, size_t(n_out * rows), got, [&]() {
+        return check(yuuka_gemm_wmma(stream, ob.buf, xb.buf, wb.buf, n_in, n_out, rows,
+                                    dtype, event), "gemm wmma") &&
+               check(yuuka_event_wait(event), "gemm wait");
+    });
     if (ok) {
-        ok = check(yuuka_gemm_wmma(stream, ob.buf, xb.buf, wb.buf, n_in, n_out, rows,
-                                   dtype, event), "gemm wmma") &&
-             check(yuuka_event_wait(event), "gemm wait");
-    }
-    std::vector<float> got(size_t(n_out * rows));
-    ok = ok && download_vec(ob, got);
-    if (ok) {
-        ok = compare_gemm(name, packed, x, got, dtype, n_in, n_out, rows);
+        ok = compare_gemm(name, packed, x, got, dtype, n_in, n_out, rows, fp16_oracle);
     }
     release(ob);
     release(xb);
@@ -724,16 +761,17 @@ bool test_silu_mul_quant_q8_1(yuuka_device * device, yuuka_stream * stream,
 bool test_gemm_swiglu(yuuka_device * device, yuuka_stream * stream,
                       yuuka_event * event, yuuka_dtype dtype, const char * name,
                       int64_t n_in, int64_t n_out, int64_t rows,
-                      std::mt19937 & rng) {
+                      std::mt19937 & rng, bool fp16_oracle = false) {
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     std::vector<float> x(size_t(n_in * rows));
     for (float & v : x) v = dist(rng);
     std::vector<uint8_t> gate = pack_weights(dtype, rng, n_in, n_out);
     std::vector<uint8_t> up = pack_weights(dtype, rng, n_in, n_out);
+    std::vector<float> got(size_t(n_out * (rows + 64)));
     Buffer gb, ub, xb, ob;
     bool ok = alloc(device, gb, gate.size()) && alloc(device, ub, up.size()) &&
               alloc(device, xb, x.size() * 4) &&
-              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              alloc(device, ob, got.size() * sizeof(float)) &&
               upload(gb, gate.data(), gate.size()) &&
               upload(ub, up.data(), up.size()) && upload_vec(xb, x);
     yuuka_plan * plan = nullptr;
@@ -751,23 +789,28 @@ bool test_gemm_swiglu(yuuka_device * device, yuuka_stream * stream,
         op.u[0] = dtype;
         ok = check(yuuka_plan_add(plan, &op), "add fused swiglu");
     }
-    if (ok) ok = check(yuuka_plan_execute(plan, stream, 0, 0, 1, event), "execute fused") &&
-                 check(yuuka_event_wait(event), "fused wait");
-    std::vector<float> got(size_t(n_out * rows));
-    ok = ok && download_vec(ob, got);
+    ok = ok && check_gemm_partial_output(ob, size_t(n_out * rows), got, [&]() {
+        return check(yuuka_plan_execute(plan, stream, 0, 0, 1, event), "execute fused") &&
+               check(yuuka_event_wait(event), "fused wait");
+    });
     const DotFn dot = dot_for(dtype);
     if (ok && dot != nullptr) {
         const uint64_t rb = row_bytes(dtype, n_in);
+        const auto product = [&](const uint8_t * wrow, const float * xrow) {
+            return fp16_oracle ? dot_rounded_kquant(dtype, wrow, xrow, n_in)
+                               : dot(wrow, xrow, n_in);
+        };
+        const double tolerance = fp16_oracle ? 1e-3 : 2e-2;
         double max_abs = 0.0;
         for (int64_t row = 0; row < rows && ok; ++row) {
             for (int64_t col = 0; col < n_out; ++col) {
-                const float g = dot(gate.data() + col * rb, x.data() + row * n_in, n_in);
-                const float u = dot(up.data() + col * rb, x.data() + row * n_in, n_in);
+                const float g = product(gate.data() + col * rb, x.data() + row * n_in);
+                const float u = product(up.data() + col * rb, x.data() + row * n_in);
                 const float expected = (g / (1.0f + std::exp(-g))) * u;
                 const float value = got[size_t(row * n_out + col)];
                 const double diff = std::fabs(double(value) - double(expected));
                 max_abs = std::max(max_abs, diff);
-                if (diff > 2e-2 * (1.0 + std::fabs(double(expected)))) {
+                if (!std::isfinite(diff) || diff > tolerance * (1.0 + std::fabs(double(expected)))) {
                     std::fprintf(stderr, "%s [%lld,%lld]: got %.6f expected %.6f\n",
                                  name, static_cast<long long>(row),
                                  static_cast<long long>(col), value, expected);
@@ -1983,6 +2026,17 @@ int main() {
         for (int64_t rows : {33, 70}) {
             ok = test_gemm_swiglu(device, stream, event, c.dtype, c.name, 256, 96,
                                   rows, rng) && ok;
+        }
+    }
+    for (yuuka_dtype dtype : {YUUKA_DTYPE_Q4_K, YUUKA_DTYPE_Q5_K, YUUKA_DTYPE_Q6_K}) {
+        for (int64_t rows : {17, 18, 32, 33, 64, 65, 96, 127}) {
+            for (int64_t width : {256, 512}) {
+                const int64_t channels = width / 2;
+                ok = test_gemm(device, stream, event, dtype, "short K-quant WMMA",
+                               width, channels, rows, rng, true) && ok;
+                ok = test_gemm_swiglu(device, stream, event, dtype, "short K-quant SwiGLU",
+                                      width, channels, rows, rng, true) && ok;
+            }
         }
     }
     const struct {

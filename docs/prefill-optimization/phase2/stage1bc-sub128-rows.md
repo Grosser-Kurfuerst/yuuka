@@ -5,7 +5,8 @@
 > streaming for eligible K-quant projections through 16 rows. See the
 > [accepted implementation](acceptance/04a-streaming-short-tails.md).
 > The short Q8_1 MMQ route described below is a rejected trial.
-> Step 1b-2 covers FP16 WMMA for 17–127 rows.
+> **Step 1b-2** uses Direct FP16 WMMA for 17–127 rows on gfx1151.
+> See the [accepted implementation](acceptance/04b-direct-fp16-wmma.md).
 
 Implementation plan for Steps 1b and 1c of the
 [Phase 2 roadmap](roadmap.md#stage-1-p1-eliminate-prompt-length-and-tail-chunk-cliffs-4-independent-steps).

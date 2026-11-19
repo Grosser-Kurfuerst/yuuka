@@ -211,6 +211,34 @@ bool run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
                                        n_out, rows, event), "rocblas");
         }, wait_event));
     }
+    if (ok && dtype == YUUKA_DTYPE_Q4_K && n_in == 2560 && n_out == 9216 &&
+        rows >= 17 && rows < 128) {
+        Buffer up;
+        yuuka_plan * fused = nullptr;
+        ok = alloc(device, up, weights.size()) &&
+             check(yuuka_memcpy_h2d(up.buf, weights.data(), weights.size()), "h2d up") &&
+             check(yuuka_plan_create(device, &fused), "SwiGLU plan create");
+        if (ok) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_GEMM_SWIGLU;
+            op.buf[0] = wb.buf;
+            op.buf[1] = up.buf;
+            op.buf[2] = xb.buf;
+            op.buf[3] = ob.buf;
+            op.n[0] = n_in;
+            op.n[1] = n_out;
+            op.n[2] = rows;
+            op.u[0] = dtype;
+            ok = check(yuuka_plan_add(fused, &op), "SwiGLU plan add");
+        }
+        if (ok) {
+            results.push_back(bench_rows(device, stream, event, fused, "swiglu", 5, [&]() {
+                ok = check(yuuka_plan_execute(fused, stream, 0, 0, 1, event), "SwiGLU execute");
+            }, wait_event));
+        }
+        if (fused != nullptr) yuuka_plan_destroy(fused);
+        release(up);
+    }
     // The K-quant route expands the packed matrix into FP16 on every call, so
     // the dequantization cost is part of the measured time.
     if (ok && kquant) {
@@ -244,9 +272,11 @@ bool run_shape(yuuka_device * device, yuuka_stream * stream, yuuka_event * event
                 std::printf("  %s=FAIL", r.name);
                 continue;
             }
+            // SwiGLU runs one gate GEMM and one up GEMM.
+            const double products = std::strcmp(r.name, "swiglu") == 0 ? 2.0 : 1.0;
             std::printf("  %s=%.3fms %.1fGB/s %.1fTF/s", r.name, r.ms,
-                        weight_gb / (r.ms / 1000.0),
-                        flops / (r.ms / 1000.0) / 1e12);
+                        products * weight_gb / (r.ms / 1000.0),
+                        products * flops / (r.ms / 1000.0) / 1e12);
         }
         std::printf("\n");
     }

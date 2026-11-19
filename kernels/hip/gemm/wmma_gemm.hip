@@ -46,7 +46,7 @@ __device__ __forceinline__ void write_q5k_word(uint32_t ql, uint32_t qh,
 
 // decode_span decodes Span consecutive weight values at absolute k offset. The
 // helper writes exactly out[0..valid-1] and the caller zeroes the rest of the
-// span. Span is 8 or 16 and stays inside one 32-value quantization segment, so
+// span. Span is 8, 16, or 32 within a 32-value quantization segment, so
 // each block header, scale, and min is hoisted once per span. Q4_K and Q5_K use
 // vector global loads: their row byte sizes are multiples of 16 and the span
 // offsets are 8 or 16-byte aligned by construction. Q4_0, Q5_0, and Q8_0 decode
@@ -103,12 +103,15 @@ __device__ __forceinline__ void decode_span(const uint8_t * row, int64_t k,
         const uint8_t * qs = blk + 16 + (sub / 2) * 32 + within;
         const bool high_nibble = (sub & 1) != 0;
         if (valid == Span) {
-            if constexpr (Span == 16) {
-                const uint4 packed = *reinterpret_cast<const uint4 *>(qs);
-                write_q4k_word(packed.x, high_nibble, scale, min, out);
-                write_q4k_word(packed.y, high_nibble, scale, min, out + 4);
-                write_q4k_word(packed.z, high_nibble, scale, min, out + 8);
-                write_q4k_word(packed.w, high_nibble, scale, min, out + 12);
+            if constexpr (Span >= 16) {
+                #pragma unroll
+                for (int offset = 0; offset < Span; offset += 16) {
+                    const uint4 packed = *reinterpret_cast<const uint4 *>(qs + offset);
+                    write_q4k_word(packed.x, high_nibble, scale, min, out + offset);
+                    write_q4k_word(packed.y, high_nibble, scale, min, out + offset + 4);
+                    write_q4k_word(packed.z, high_nibble, scale, min, out + offset + 8);
+                    write_q4k_word(packed.w, high_nibble, scale, min, out + offset + 12);
+                }
             } else {
                 const uint2 packed = *reinterpret_cast<const uint2 *>(qs);
                 write_q4k_word(packed.x, high_nibble, scale, min, out);
@@ -136,13 +139,16 @@ __device__ __forceinline__ void decode_span(const uint8_t * row, int64_t k,
         const uint8_t * qh = blk + 16 + within;
         const bool high_nibble = (sub & 1) != 0;
         if (valid == Span) {
-            if constexpr (Span == 16) {
-                const uint4 packed = *reinterpret_cast<const uint4 *>(ql);
-                const uint4 high = *reinterpret_cast<const uint4 *>(qh);
-                write_q5k_word(packed.x, high.x, high_nibble, sub, scale, min, out);
-                write_q5k_word(packed.y, high.y, high_nibble, sub, scale, min, out + 4);
-                write_q5k_word(packed.z, high.z, high_nibble, sub, scale, min, out + 8);
-                write_q5k_word(packed.w, high.w, high_nibble, sub, scale, min, out + 12);
+            if constexpr (Span >= 16) {
+                #pragma unroll
+                for (int offset = 0; offset < Span; offset += 16) {
+                    const uint4 packed = *reinterpret_cast<const uint4 *>(ql + offset);
+                    const uint4 high = *reinterpret_cast<const uint4 *>(qh + offset);
+                    write_q5k_word(packed.x, high.x, high_nibble, sub, scale, min, out + offset);
+                    write_q5k_word(packed.y, high.y, high_nibble, sub, scale, min, out + offset + 4);
+                    write_q5k_word(packed.z, high.z, high_nibble, sub, scale, min, out + offset + 8);
+                    write_q5k_word(packed.w, high.w, high_nibble, sub, scale, min, out + offset + 12);
+                }
             } else {
                 const uint2 packed = *reinterpret_cast<const uint2 *>(ql);
                 const uint2 high = *reinterpret_cast<const uint2 *>(qh);
@@ -162,57 +168,32 @@ __device__ __forceinline__ void decode_span(const uint8_t * row, int64_t k,
     }
 }
 
-// q6k_span4 decodes four consecutive Q6_K values starting at a multiple of 4
-// inside one 256-value block. The group shares one ql word, one qh word, and one
-// scale byte, so the four values cost two words instead of eight scalar byte
-// loads plus four block-header and scale loads. Q6_K block starts are only
-// 2-byte aligned (a block is 210 bytes), so the words are assembled from 16-bit
-// halves.
-__device__ __forceinline__ void q6k_span4(const uint8_t * blk, int j,
-                                          __half * out) {
+// Each span stays inside one Q6_K scale group. Block starts are only
+// two-byte aligned, so the packed words are assembled from 16-bit halves.
+template <int Span>
+__device__ __forceinline__ void decode_q6k_span(const uint8_t * blk, int j,
+                                                  __half * out) {
     const int8_t * sc = reinterpret_cast<const int8_t *>(blk + 192);
-    const int n = j / 128;
+    const int half_block = j / 128;
     const int l = j & 127;
-    const uint8_t * ql = blk + n * 64;
-    const uint8_t * qh = blk + 128 + n * 32;
-    const uint8_t * ql_src = ql;
-    const uint8_t * qh_src = qh;
-    int ql_shift = 0;
-    int qh_shift = 0;
-    int sidx = 0;
-    if (l < 32) {
-        ql_src = ql + l;
-        qh_src = qh + l;
-        sidx = l / 16;
-    } else if (l < 64) {
-        ql_src = ql + l;
-        qh_src = qh + (l - 32);
-        qh_shift = 2;
-        sidx = (l - 32) / 16 + 2;
-    } else if (l < 96) {
-        ql_src = ql + (l - 64);
-        ql_shift = 4;
-        qh_src = qh + (l - 64);
-        qh_shift = 4;
-        sidx = (l - 64) / 16 + 4;
-    } else {
-        ql_src = ql + (l - 64);
-        ql_shift = 4;
-        qh_src = qh + (l - 96);
-        qh_shift = 6;
-        sidx = (l - 96) / 16 + 6;
-    }
-    const uint32_t ql_word = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(ql_src)) |
-                             (static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(ql_src + 2)) << 16);
-    const uint32_t qh_word = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(qh_src)) |
-                             (static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(qh_src + 2)) << 16);
+    const uint8_t * ql = blk + half_block * 64 + (l & 63);
+    const uint8_t * qh = blk + 128 + half_block * 32 + (l & 31);
+    const int ql_shift = (l / 64) * 4;
+    const int qh_shift = (l / 32) * 2;
     const float d = load_f16_device(blk + 208) *
-                    static_cast<float>(sc[n * 8 + sidx]);
+                    static_cast<float>(sc[half_block * 8 + l / 16]);
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int q = static_cast<int>((ql_word >> (8 * i + ql_shift)) & 0xF) |
-                      (static_cast<int>((qh_word >> (8 * i + qh_shift)) & 3) << 4);
-        out[i] = __float2half(d * static_cast<float>(q - 32));
+    for (int offset = 0; offset < Span; offset += 4) {
+        const auto * low = reinterpret_cast<const uint16_t *>(ql + offset);
+        const auto * high = reinterpret_cast<const uint16_t *>(qh + offset);
+        const uint32_t ql_word = uint32_t(low[0]) | (uint32_t(low[1]) << 16);
+        const uint32_t qh_word = uint32_t(high[0]) | (uint32_t(high[1]) << 16);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int q = static_cast<int>((ql_word >> (8 * i + ql_shift)) & 0xF) |
+                          (static_cast<int>((qh_word >> (8 * i + qh_shift)) & 3) << 4);
+            out[offset + i] = __float2half(d * static_cast<float>(q - 32));
+        }
     }
 }
 
@@ -281,7 +262,7 @@ __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
                 in_range ? static_cast<int>(remaining < 4 ? remaining : 4) : 0;
             const uint8_t * row = w + gn * row_bytes;
             if (valid == 4) {
-                q6k_span4(row + (gk / 256) * 210, static_cast<int>(gk % 256), dst);
+                decode_q6k_span<4>(row + (gk / 256) * 210, static_cast<int>(gk % 256), dst);
                 continue;
             }
             for (int j = 0; j < valid; ++j) {
@@ -603,6 +584,207 @@ void launch_wmma_tile(float * out, const float * x, const uint8_t * w,
         <<<grid, kThreads, 0, stream>>>(out, x, w, n_in, n_out, rows, row_bytes);
 }
 
+#if defined(YUUKA_DIRECT_FP16_WMMA)
+constexpr int kDirectMinRows = 17;
+constexpr int kDirectMaxRows = 127;
+
+template <uint32_t DType>
+bool direct_fp16_shape(const float * x, const uint8_t * w, int64_t n_in,
+                       int64_t n_out, int64_t rows) {
+    constexpr size_t weight_alignment = DType == YUUKA_DTYPE_Q6_K ? 2 : 16;
+    return rows >= kDirectMinRows && rows <= kDirectMaxRows &&
+           n_in % 256 == 0 && n_out % 128 == 0 &&
+           reinterpret_cast<uintptr_t>(x) % alignof(float4) == 0 &&
+           reinterpret_cast<uintptr_t>(w) % weight_alignment == 0;
+}
+
+#if defined(__gfx1151__)
+using DirectOperand = _Float16 __attribute__((ext_vector_type(16)));
+using DirectAccum = float __attribute__((ext_vector_type(8)));
+using DirectWords = uint32_t __attribute__((ext_vector_type(8)));
+
+// Each 16-value fragment has two planes of eight values. Each plane
+// advances one 16-byte bank group per row. XOR the K span into the row
+// index to spread adjacent K stores across distinct bank groups.
+template <int TileRows>
+__device__ __forceinline__ int direct_half8_offset(int row, int k8) {
+    return k8 * TileRows + (row ^ k8);
+}
+
+template <int TileRows>
+__device__ __forceinline__ DirectOperand direct_operand(const uint4 * tile,
+                                                         int row, int k16, int half_wave) {
+    // Match rocWMMA's GFX11 half-wave ordering. The upper lanes start
+    // with the second eight K values before reading the lower half.
+    const uint4 first = tile[direct_half8_offset<TileRows>(row, 2 * k16 + half_wave)];
+    const uint4 second = tile[direct_half8_offset<TileRows>(row, 2 * k16 + (half_wave ^ 1))];
+    const DirectWords words{first.x, first.y, first.z, first.w,
+                            second.x, second.y, second.z, second.w};
+    return __builtin_bit_cast(DirectOperand, words);
+}
+
+template <int TileM, int StepK>
+__device__ __forceinline__ void stage_direct_fp16_inputs(
+    uint4 * tile, const float * x, int64_t m0, int64_t k0, int64_t rows, int64_t n_in) {
+    constexpr int kSpans = StepK / 8;
+    for (int idx = threadIdx.x; idx < TileM * kSpans; idx += kThreads) {
+        const int r = idx / kSpans;
+        const int k8 = idx % kSpans;
+        uint4 packed{};
+        if (m0 + r < rows) {
+            const auto * src = reinterpret_cast<const float4 *>(x + (m0 + r) * n_in + k0 + 8 * k8);
+            const float4 first = src[0];
+            const float4 second = src[1];
+            const __half2 pair0 = __floats2half2_rn(first.x, first.y);
+            const __half2 pair1 = __floats2half2_rn(first.z, first.w);
+            const __half2 pair2 = __floats2half2_rn(second.x, second.y);
+            const __half2 pair3 = __floats2half2_rn(second.z, second.w);
+            packed = make_uint4(__builtin_bit_cast(uint32_t, pair0),
+                                __builtin_bit_cast(uint32_t, pair1),
+                                __builtin_bit_cast(uint32_t, pair2),
+                                __builtin_bit_cast(uint32_t, pair3));
+        }
+        tile[direct_half8_offset<TileM>(r, k8)] = packed;
+    }
+}
+
+template <uint32_t DType, int TileN, int StepK, bool Fused>
+__device__ __forceinline__ void stage_direct_fp16_weights(
+    uint4 * gate_tile, uint4 * up_tile, const uint8_t * gate, const uint8_t * up,
+    int64_t n0, int64_t k0, uint64_t row_bytes) {
+    constexpr int kSpanSize = DType == YUUKA_DTYPE_Q6_K ? 16 : 32;
+    constexpr int kSpans = StepK / kSpanSize;
+    constexpr int kGateSpans = TileN * kSpans;
+    for (int idx = threadIdx.x; idx < (Fused ? 2 : 1) * kGateSpans; idx += kThreads) {
+        const bool second = Fused && idx >= kGateSpans;
+        const int span = idx % kGateSpans;
+        const int col = span / kSpans;
+        const int slot = span % kSpans;
+        const int64_t k = k0 + kSpanSize * slot;
+        uint4 * dst = second ? up_tile : gate_tile;
+        const uint8_t * row = (second ? up : gate) + (n0 + col) * row_bytes;
+        alignas(16) __half values[kSpanSize];
+        if constexpr (DType == YUUKA_DTYPE_Q6_K) {
+            decode_q6k_span<kSpanSize>(row + (k / 256) * 210, static_cast<int>(k % 256), values);
+        } else {
+            decode_span<DType, kSpanSize>(row, k, kSpanSize, values);
+        }
+        constexpr int kHalfVectors = kSpanSize / 8;
+        #pragma unroll
+        for (int block = 0; block < kHalfVectors; ++block) {
+            uint4 packed;
+            __builtin_memcpy(&packed, values + 8 * block, sizeof(packed));
+            dst[direct_half8_offset<TileN>(col, slot * kHalfVectors + block)] = packed;
+        }
+    }
+}
+#endif
+
+template <uint32_t DType, int TileM, int TileN, int StepK, bool Fused>
+__global__ void gemm_wmma_direct_kernel(
+    float * out, const float * x, const uint8_t * gate, const uint8_t * up,
+    int64_t n_in, int64_t n_out, int64_t rows, uint64_t row_bytes) {
+#if defined(__gfx1151__)
+    constexpr int kChannelWaves = TileN / 16;
+    constexpr int kTokenWaves = (kThreads / 32) / kChannelWaves;
+    constexpr int kTokenFrags = TileM / (16 * kTokenWaves);
+    constexpr int kWeightVectors = TileN * StepK / 8;
+    const int wave = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int m_wave = (wave / kChannelWaves) * 16 * kTokenFrags;
+    const int n_wave = (wave % kChannelWaves) * 16;
+    const int64_t m0 = static_cast<int64_t>(blockIdx.y) * TileM;
+    const int64_t n0 = static_cast<int64_t>(blockIdx.x) * TileN;
+
+    __shared__ uint4 weights[(Fused ? 2 : 1) * kWeightVectors];
+    __shared__ uint4 inputs[TileM * StepK / 8];
+    uint4 * up_tile = Fused ? weights + kWeightVectors : nullptr;
+    DirectAccum gate_acc[kTokenFrags]{};
+    DirectAccum up_acc[kTokenFrags]{};
+    for (int64_t k = 0; k < n_in; k += StepK) {
+        stage_direct_fp16_inputs<TileM, StepK>(inputs, x, m0, k, rows, n_in);
+        stage_direct_fp16_weights<DType, TileN, StepK, Fused>(
+            weights, up_tile, gate, up, n0, k, row_bytes);
+        __syncthreads();
+        #pragma unroll
+        for (int k16 = 0; k16 < StepK / 16; ++k16) {
+            const auto b_gate = direct_operand<TileN>(weights, n_wave + (lane & 15), k16, lane >> 4);
+            DirectOperand b_up{};
+            if constexpr (Fused) {
+                b_up = direct_operand<TileN>(up_tile, n_wave + (lane & 15), k16, lane >> 4);
+            }
+            #pragma unroll
+            for (int t = 0; t < kTokenFrags; ++t) {
+                const auto a = direct_operand<TileM>(inputs, m_wave + t * 16 + (lane & 15), k16, lane >> 4);
+                gate_acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b_gate, gate_acc[t]);
+                if constexpr (Fused) {
+                    up_acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b_up, up_acc[t]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const int64_t gn = n0 + n_wave + (lane & 15);
+    #pragma unroll
+    for (int t = 0; t < kTokenFrags; ++t) {
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int64_t gm = m0 + m_wave + t * 16 + 2 * e + (lane >> 4);
+            if (gm < rows) {
+                float value = gate_acc[t][e];
+                if constexpr (Fused) {
+                    value = (value / (1.0f + expf(-value))) * up_acc[t][e];
+                }
+                out[gm * n_out + gn] = value;
+            }
+        }
+    }
+#else
+    (void)out;
+    (void)x;
+    (void)gate;
+    (void)up;
+    (void)n_in;
+    (void)n_out;
+    (void)rows;
+    (void)row_bytes;
+#endif
+}
+
+template <uint32_t DType, int TileM, int TileN, int StepK, bool Fused>
+void launch_wmma_direct_tile(float * out, const float * x,
+                             const uint8_t * gate, const uint8_t * up,
+                             int64_t n_in, int64_t n_out, int64_t rows,
+                             uint64_t row_bytes, hipStream_t stream) {
+    const dim3 grid(static_cast<unsigned>(n_out / TileN),
+                    static_cast<unsigned>((rows + TileM - 1) / TileM));
+    gemm_wmma_direct_kernel<DType, TileM, TileN, StepK, Fused>
+        <<<grid, kThreads, 0, stream>>>(out, x, gate, up, n_in, n_out, rows, row_bytes);
+}
+
+template <uint32_t DType, bool Fused>
+bool launch_wmma_direct(float * out, const float * x, const uint8_t * gate,
+                        const uint8_t * up, int64_t n_in, int64_t n_out, int64_t rows,
+                        uint64_t row_bytes, hipStream_t stream) {
+    if (!direct_fp16_shape<DType>(x, gate, n_in, n_out, rows) ||
+        (Fused && !direct_fp16_shape<DType>(x, up, n_in, n_out, rows))) {
+        return false;
+    }
+    // A narrower fused tile keeps the two accumulator sets and both
+    // weight matrices resident while doubling the fused K step.
+    constexpr int kTileN = Fused ? 64 : 128;
+    if (rows <= 32) {
+        launch_wmma_direct_tile<DType, 32, kTileN, 64, Fused>(
+            out, x, gate, up, n_in, n_out, rows, row_bytes, stream);
+    } else {
+        launch_wmma_direct_tile<DType, 64, kTileN, 64, Fused>(
+            out, x, gate, up, n_in, n_out, rows, row_bytes, stream);
+    }
+    return true;
+}
+#endif
+
 // launch_wmma_selected chooses the measured tile. The 64x64 tile with a 32-wide
 // K step reuses a decoded B tile across two accumulator fragments, stages
 // 16 KiB so four CTAs stay resident, and is used for wide projections at 64 or
@@ -615,6 +797,15 @@ template <uint32_t DType>
 void launch_wmma_selected(float * out, const float * x, const uint8_t * w,
                           int64_t n_in, int64_t n_out, int64_t rows,
                           uint64_t row_bytes, hipStream_t stream) {
+#if defined(YUUKA_DIRECT_FP16_WMMA)
+    if constexpr (DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K ||
+                  DType == YUUKA_DTYPE_Q6_K) {
+        if (launch_wmma_direct<DType, false>(out, x, w, nullptr, n_in, n_out,
+                                             rows, row_bytes, stream)) {
+            return;
+        }
+    }
+#endif
     if (rows >= 64 && n_in <= n_out) {
         launch_wmma_tile<DType, 64, 2, 32>(out, x, w, n_in, n_out, rows,
                                            row_bytes, stream);
@@ -646,6 +837,15 @@ void launch_wmma_swiglu_selected(float * out, const float * x,
                                  const uint8_t * w_gate, const uint8_t * w_up,
                                  int64_t n_in, int64_t n_out, int64_t rows,
                                  uint64_t row_bytes, hipStream_t stream) {
+#if defined(YUUKA_DIRECT_FP16_WMMA)
+    if constexpr (DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K ||
+                  DType == YUUKA_DTYPE_Q6_K) {
+        if (launch_wmma_direct<DType, true>(out, x, w_gate, w_up, n_in, n_out,
+                                            rows, row_bytes, stream)) {
+            return;
+        }
+    }
+#endif
     if (rows >= 64 && n_in <= n_out) {
         launch_wmma_swiglu_tile<DType, 64, 2>(out, x, w_gate, w_up, n_in, n_out,
                                               rows, row_bytes, stream);
