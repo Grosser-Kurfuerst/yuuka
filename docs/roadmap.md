@@ -7,15 +7,16 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Steps 1-6 have landed. Decode attention is split over the key range,
-so the rate is flat in context, and the decode matvec is remapped to one wave per
-output row: `pp128/tg128` 60.70 t/s (ratio 0.98), `pp512/tg128` 60.41, and
-`pp2048/tg32` 58.60, so both target context points (60 and 55 t/s) are met. The
-per-shape bandwidth target is not: the wide shapes reach 179-230 GB/s but the
-1024- and 4096-input projections stay at 93-158, and the step is 17.1 ms against
-the 15.5 ms row. Step 5 re-evaluated the int8 route on the new mapping and it is
-still slower end to end, so the FP32 route stays selected. Step 6 cut 0.25 ms
-from the tail against its 0.5 ms row. Step 7 closes the record. This file is a plan, not a record: when a step lands, its
+**Status: closed.** All seven steps have landed and the record is re-recorded
+in [benchmarks.md](benchmarks.md) and [kernels.md](kernels.md). The objective is
+met: `pp128/tg128` 60.70 t/s (ratio 0.98 to llama.cpp), `pp512/tg128` 60.41, and
+`pp2048/tg32` 58.60, and the decode rate is flat in context. Two intermediate
+rows were not met and are recorded as measured: the 190 GB/s per-shape bandwidth
+(the wide shapes reach 179-230 GB/s and the 1024- and 4096-input projections
+stay at 92-158) and the 15.5 ms step (17.1 ms). Step 5's int8 re-evaluation
+failed its gate and the FP32 route stays selected; step 6 cut 0.25 ms of its
+0.5 ms tail row. What remains is the narrow-projection per-row cost, the
+launch-bound norm tail, and multi-request batching, which was out of scope. This file is a plan, not a record: when a step lands, its
 measured result goes into [benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
@@ -519,12 +520,16 @@ dispatch threshold without a measured table.
 
 ### Step 7: re-record the decode record
 
-Update [benchmarks.md](benchmarks.md): replace the decode attribution and the
-llama.cpp comparison rows, note the environment and repetition count, and
-record the rejected variants from this plan. Update
-[kernels.md](kernels.md) sections 4 and 7 with the new decode attention
-contract, and [architecture.md](architecture.md) if the plan gains an
-operation. Close the status line of this document.
+Landed. [benchmarks.md](benchmarks.md) now carries the re-recorded decode
+output-length table, the decode gap attribution with the per-operation and
+per-shape tables, the llama.cpp comparison row (0.98), the decode tail section,
+and the rejected variants of this plan in decisions. [kernels.md](kernels.md)
+sections 4, 5.3, 5.4, 6.5, and 7.2 carry the remapped matvec, the split-key
+attention contract, the KV-format reads, and the scores workspace. The plan
+gained no operation code: the beta/alpha merge reuses `GEMV_PAIR`, so
+[architecture.md](architecture.md) is unchanged. The status line above is
+closed. Reproduction is in [benchmarks.md](benchmarks.md#reproduction) and
+`scripts/decode_compare.sh`; the raw traces stay under `/tmp`.
 
 ## Rejected and deferred
 

@@ -445,17 +445,21 @@ operation, resolves each operation to the model buffer it reads, and prints the
 per-operation, per-tensor, and per-dtype tables plus one line per plan index
 sorted by time. It is opt-in through `YUUKA_TEST_MODEL`, and it gates the result
 against the recorded attribution of
-[benchmarks.md](benchmarks.md#decode-matvec): the plan must hold
-the recorded 379 operations, the profiled total must stay inside a wide band
-around the recorded 23.400 ms, and the matvec share must stay within five points
+[benchmarks.md](benchmarks.md#decode-gap-attribution): the plan must hold
+the recorded 355 operations, the profiled total must stay inside a wide band
+around the recorded 17.100 ms, and the matvec share must stay within five points
 of the recorded share. The bands are wide because device clocks are not pinned,
-and the recorded constants are re-recorded when a decode fusion lands, because
+and the recorded constants are re-recorded when a decode kernel lands, because
 each change moves the total by design: 97.6 ms in the first record, 89.4 ms
 after the streaming LM head, 31.6 ms after the matvec family moved to the
-streaming kernel, 24.3 ms after the fused gated delta-net, and 23.4 ms after the
-residual and gate/up fusions, in 579 operations until the delta-net fusion
-folded the five recurrent operators of a layer into two (507) and the matvec
-fusion folded the residual add and the gate/up pair into the projection (379).
+streaming kernel, 24.3 ms after the fused gated delta-net, 23.4 ms after the
+residual and gate/up fusions, 17.3 ms after the split-key attention and the
+remapped matvec, and 17.1 ms after the norm and narrow-pair rewrite, in 579
+operations until the delta-net fusion folded the five recurrent operators of a
+layer into two (507), the matvec fusion folded the residual add and the gate/up
+pair into the projection (379), and the beta/alpha pair merge removed 24 (355).
+The int8 and unfused variants are reported without the operation-count gate,
+because they add quantization operations and drop fusions by design.
 The operation count is exact because it is structural, so a plan change is
 always visible, and a change that moves the attribution outside the bands has
 to re-record the constants and the document rather than pass silently. The

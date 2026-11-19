@@ -115,7 +115,8 @@ hard-coded from another GPU.
 
 | Kernel family | Main scenario | Optimization focus |
 | --- | --- | --- |
-| `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
+| `gemv_row` / `gemv_row_pair` | Decode matvec (selected, one row, K % 512 == 0) | One wave per output row, sixteen K values per lane, two rows per wave, no shared staging and no barrier in K |
+| `lm_head_stream` | Decode matvec fallback, both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
 | `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
 | `lm_head_stream` epilogues | Decode matvec (selected) | Same streaming kernel with the residual add in the epilogue, or walking a second packed matrix to form the SwiGLU product (`GEMV_RESIDUAL`, `GEMV_PAIR`) |
 | `recurrent_token` | Gated delta-net per-token state (selected) | Head state in registers across four thread groups, decay and update fused in one pass, gated RMSNorm folded in |
@@ -684,8 +685,9 @@ every requested row through attention and FFN.
 [Validation and timings](prefill-optimization/acceptance/06-final-query.md)
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
-projection in the prefill and decode tails. It also serves decode matvecs
-when `SelectDecodeGemvPath` selects `DecodeGemvStreaming`:
+projection in the prefill and decode tails. A decode matvec with one row and a
+512-value K step takes the remapped one-row kernel of section 5.4 instead; the
+channel-parallel form below serves every other row count and K width:
 
 ```text
 out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16

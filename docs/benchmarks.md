@@ -156,41 +156,40 @@ the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
 
 ## Decode: output length
 
-`yuuka bench --backend hip --prompt-tokens 128 --decode-tokens 128|256`,
-F32 KV, median of three repetitions:
+`yuuka bench --backend hip --chunk-size 512 --prompt-tokens 128
+--decode-tokens 128|256`, F32 KV, greedy, warmup 2 and median of 3
+repetitions, 2026-11-19 on gfx1151 with `Qwen3.5-4B-Q4_K_M`:
 
 | Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 320 | 0.085 s | 0.085 s | 3.280 s | 38.70 |
-| 256 | 448 | 0.162 s | 0.162 s | 7.429 s | 34.32 |
+| 128 | 320 | 0.068 s | 0.068 s | 2.083 s | 60.96 |
+| 256 | 448 | 0.072 s | 0.072 s | 4.206 s | 60.62 |
 
-Decode is weight-bandwidth bound and flat in output length: the two rows differ by
-11%, which is the prefill of the longer prompt plus the drift of an unpinned
-clock, not a change of regime. Effective weight-read bandwidth is
-$2.726\\,\\mathrm{GB} \\times 38.7\\,\\mathrm{s^{-1}} \\approx 105.5\\,\\mathrm{GB/s}$
-against the 130 GB/s the profiled step measures for the family, so the family
-itself is still the limiter ([isolated kernels](#isolated-kernels)). The 3 ms per
-token between the two figures is the host side of the loop: the sampler reads
-248,320 logits and the row is copied device-to-host once per token.
+Decode is weight-bandwidth bound and flat in output length: the two rows differ
+by 0.6%. The 2,726 MB of packed weights move at 165 GB/s effective, and the
+profiled step puts the matvec family at 15.49 ms of 17.16 ms, 176 GB/s of the
+same bytes; the rest is the norm, delta-net, attention, RoPE, and KV tail
+([decode gap attribution](#decode-gap-attribution)). The decode rows measure the
+selected route, which is the FP32 remapped matvec (the int8 route is measured
+slower and stays opt-in; see [int8 decode matvec](#int8-decode-matvec)).
 
-The decode rows measure the selected route, which is the FP32 streaming matvec
-(the int8 route is measured slower and stays opt-in; see
-[int8 decode matvec](#int8-decode-matvec)).
-
-The table was re-measured four times: when the decode output projection moved to
-the streaming LM head kernel, when the rest of the decode matvec family followed
-it, when the gated delta-net moved to the fused per-token pair, and when the
-residual add and the gate/up pair were folded into the matvec. Same flags, same
-session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s, 3.341 s, then
-3.280 s. The profiled step went 97.4, 89.4, 31.6, 24.3, 23.4 ms with the matvec
-family at 87.6, 79.2, 21.6, 21.5, 21.1 ms, so the matvec share rose from 68% to
-90% as everything else left the critical path. Prefill is unaffected across all
-five: 0.085-0.088 s.
+The table was re-measured seven times, each time a decode kernel landed: the
+streaming LM head, the rest of the matvec family, the fused gated delta-net, the
+residual and gate/up epilogues, the split-key attention, the remapped matvec, and
+the norm/tail rewrite. Same flags, 128 decode tokens: 13.241 s, 12.079 s,
+4.245 s, 3.341 s, 3.280 s, 2.111 s, 2.083 s. The profiled step went 97.4, 89.4,
+31.6, 24.3, 23.4, 17.3, 17.1 ms with the matvec family at 87.6, 79.2, 21.6,
+21.5, 21.1, 15.4, 15.5 ms. Prefill is unaffected: 0.068-0.088 s across all
+seven.
 
 ### Decode fusion
 
 `TestGPUProfileDecode` with and without `YUUKA_TEST_DECODE_UNFUSED=1`, same
-session, same plan input, one decode step after a real forward pass:
+session, same plan input, one decode step after a real forward pass. This A/B is
+recorded at the plan shape of its session, before the split-key attention and the
+matvec remap; the test now reports the current counts (355 with fusions, 379
+without). The saved operations are structural, so the comparison still holds,
+while the absolute times are historical:
 
 | Plan | Operations | Matvec | Everything else | Step |
 | --- | ---: | ---: | ---: | ---: |
@@ -759,19 +758,17 @@ extra work; see [kernels.md](kernels.md#91-chunkwise-form).
 | pp512 | 2346.17 ± 80.87 | 1634.8 (F16 KV) | 0.70 |
 | pp2048 | 2409.70 ± 5.39 | 1641.5 (F16 KV) | 0.68 |
 | pp8192 | 2170.79 ± 4.19 | 1438.2 (F16 KV) | 0.66 |
-| tg128 (prompt 128) | 62.29 ± 0.19 | 38.70 (F32 KV) | 0.62 |
+| tg128 (prompt 128) | 62.29 ± 0.19 | 60.70 (F32 KV) | 0.98 |
 
 The remaining gaps, in order of size:
 
-1. Decode, 1.6x at a 128-token prompt and 2.0-3.3x from 512 tokens of context
-   up. Two causes, attributed per operation in
-   [decode gap attribution](#decode-gap-attribution) and planned in
-   [roadmap.md](roadmap.md): the matvec family reads the 2.726 GB of weights at
-   129.7 GB/s where llama.cpp reads the same bytes at 209 GB/s, and the
-   paged decode attention kernel is serial in position at 1.04 ms per layer and
-   512 tokens where llama.cpp spends 0.0105 ms. The delta-net, the norms, and
-   the submission gaps are 2.5 ms of the step together
-   ([gated delta-net](#gated-delta-net), [decode fusion](#decode-fusion)).
+1. Decode, 3-5% at every measured context (0.95-0.98 in
+   [decode gap attribution](#decode-gap-attribution)). The matvec family reads
+   the 2.726 GB of weights at 176 GB/s where llama.cpp reads them at 209, and
+   the tail (norm launches, delta-net, conv/L2) is 0.5-1 ms of the 17.2 ms step
+   ([decode tail](#decode-tail)). The roadmap closed the two structural causes:
+   decode attention is split over the key range and the matvec is one wave per
+   output row.
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
    runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see
@@ -786,140 +783,84 @@ The remaining gaps, in order of size:
 
 ### Decode gap attribution
 
-Measured 2026-11-19 at commit `7b7aa4c` against `../llama.cpp` build
-`b1b770d90` (12359, version 1.0.0), not against the `strix-llama.cpp` build of
-[environment and protocol](#environment-and-protocol), so these rows are not
-same-session comparable with the tables above; the yuuka token rates in them
-agree with [decode](#decode-output-length) within clock drift. Protocol:
-`yuuka bench --kv-type f32 --chunk-size 512`, `llama-bench -ngl 99 -b 512 -ub 512`
-(F16 KV), greedy, warmup then medians; yuuka per-operation numbers from
-`TestGPUProfileDecode`, llama.cpp numbers from `rocprofv3 --kernel-trace` around
-`llama-bench -p 0 -n 32 -r 2`, 65 decode steps reduced by kernel name and grid.
+Re-recorded 2026-11-19 against `../llama.cpp` build `b1b770d90` (12359,
+version 1.0.0), same session, same model: `yuuka bench --kv-type f32
+--chunk-size 512`, `llama-bench -ngl 99 -b 512 -ub 512` (F16 KV), greedy,
+warmup then medians; yuuka per-operation numbers from `TestGPUProfileDecode`
+(one warmup decode step first), llama.cpp numbers from `rocprofv3
+--kernel-trace` around `llama-bench -p 0 -n 32 -r 2`, 65 decode steps reduced by
+kernel name and grid.
 
-Token rate by context, both engines flat or not:
+Token rate by context, both engines flat:
 
 | Test | yuuka t/s | llama.cpp t/s | ratio |
 | --- | ---: | ---: | ---: |
-| tg32 after pp128 | 41.24 | 61.30 | 0.67 |
-| tg128 after pp128 | 38.63 | 61.99 | 0.62 |
-| tg512 after pp128 | 34.37 | 61.94 | 0.55 |
-| tg128 after pp512 | 31.37 | 61.84 | 0.51 |
-| tg32 after pp2048 | 18.44 | 61.49 | 0.30 |
+| tg32 after pp128 | 60.7 | 61.93 | 0.98 |
+| tg128 after pp128 | 60.70 | 62.08 | 0.98 |
+| tg512 after pp128 | 60.4 | 62.03 | 0.97 |
+| tg128 after pp512 | 60.41 | 61.88 | 0.98 |
+| tg32 after pp2048 | 58.60 | 61.60 | 0.95 |
 
-Per operation, one decode step: yuuka is 23.42 ms at a 64-token context and
-31.02 ms at 512 tokens (profiled, which adds a submission gap per operation;
-the unprofiled loop is 23.40 and 30.15 ms). The matvec family is 21.0 ms in
-both columns, because it does not depend on context. `attention_paged` is
-0.14 ms at a 7-token context, 1.34 ms at 64, and 8.31 ms at 512: 1.9 us per
-position per layer, from one dependent KV load, one 256-thread tree reduction,
-and two block barriers per position over a grid of 16 blocks.
+Per operation, one decode step: yuuka is 17.16 ms profiled (16.5 ms
+unprofiled), and the reference is 14.75 ms of kernels in a 16.13 ms loop. The
+matvec family is 15.49 ms of the yuuka step, 176 GB/s over the same 2,726 MB
+that the reference moves at 209 GB/s; it is no longer the whole step and no
+longer the whole gap. Decode attention is 0.17 ms for all eight layers at a
+32-token context and 0.27 ms at 512, against the reference's 0.067-0.084 ms.
 
-The reference step is 14.75 ms of kernels in a 16.13 ms loop: 13.02 ms of
-`mul_mat_vec_q` over the same 2,726 MB, 0.29 ms of `quantize_q8_1` (217
-launches), 0.37 ms of `rms_norm_f32`, 0.27 ms of `k_get_rows_float_vec`, 0.23 ms
-of `gated_delta_net_cuda`, and 0.067 ms of `flash_attn_tile` plus combine for
-all eight full-attention layers, flat at 0.084 ms at a 527-token context; the
-remaining 0.5 ms is elementwise, copy, concat and convolution launches.
-
-Per-shape weight bandwidth of the same projections inside a step. yuuka
-launches one block per 32 output channels, the reference one block per two
-output rows. `scripts/decode_compare.sh` regenerates this table from one yuuka
-profile and one reference trace. On the 2026-11-19 rerun every yuuka cell
-reproduced within 4% and every reference cell within 3%, except
-`attn_output`, which the trace attributes 207.7 GB/s instead of the recorded
-185; the recorded row is kept until step 7 re-records the comparison:
-
-| Projection | dtype | K -> N | yuuka blocks | yuuka GB/s | ref blocks | ref GB/s |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| `attn_k`, `attn_v` | Q4_K | 2560 -> 1024 | 32 | 49 | 512 | 174 |
-| `attn_output` | Q4_K | 4096 -> 2560 | 80 | 96 | 1,280 | 185 |
-| `ffn_down` | Q4_K | 9216 -> 2560 | 80 | 96 | 1,280 | 185 |
-| `ssm_out` | Q5_K | 4096 -> 2560 | 80 | 103 | 1,280 | 210 |
-| `ffn_down` | Q6_K | 9216 -> 2560 | 80 | 138 | 1,280 | 192 |
-| `attn_gate` | Q4_K | 2560 -> 4096 | 128 | 113 | 2,048 | 202 |
-| `attn_q` | Q4_K | 2560 -> 8192 | 256 | 123 | 4,096 | 212 |
-| `attn_qkv` | Q5_K | 2560 -> 8192 | 256 | 132 | 4,096 | 219 |
-| `ffn_gate`, `ffn_up` | Q4_K | 2560 -> 9216 x2 | 288 | 141 | 4,608 | 219 |
-| `lm_head` | Q6_K | 2560 -> 248320 | 7,760 | 186 | 124,160 | 235 |
-| `ssm_alpha`, `ssm_beta` | Q8_0 | 2560 -> 32 | 1 | 10 | 16 | 19 |
-
-The reference is flat in `N` and in `K`; yuuka's bandwidth follows the grid
-size and not the shape, from 49 GB/s at 32 blocks to 186 GB/s at 7,760. The
-`2560 -> 1024` Q4_K matrix reaches 65 GB/s even in the resident-matrix sweep,
-where its 1.47 MB fits the 32 MB MALL cache, so the small-`N` loss is not a
-memory-system effect. The kernel mapping behind it is described in
-[kernels.md](kernels.md#4-operator-family-map) and the fix in
-[roadmap.md](roadmap.md#root-causes).
-
-### Decode tail
-
-Landed in [roadmap.md](roadmap.md) step 6. Measured 2026-11-19 in the same
-sessions as the remap, `yuuka bench --kv-type f32 --chunk-size 512`, greedy,
-warmup 2 and 3 repetitions:
-
-| Test | before step 6 | after step 6 |
+| Group | ops | ms |
 | --- | ---: | ---: |
-| pp128/tg128 | 60.16 | 60.70 |
-| pp512/tg128 | 59.74 | 60.41 |
-| pp2048/tg32 | 58.16 | 58.60 |
+| `lm_head` (single-row projections) | 73 | 5.955 |
+| `gemv_pair` (gate/up and beta/alpha) | 56 | 4.832 |
+| `gemv_residual` (output projections) | 64 | 4.704 |
+| RMSNorm (row and head) | 81 | 0.692 |
+| gated delta-net (`recurrent_token`) | 24 | 0.465 |
+| conv + L2 norm (`conv_l2norm`) | 24 | 0.180 |
+| decode attention (`attention_paged`) | 8 | 0.170 |
+| RoPE, KV write, embedding | 25 | 0.166 |
+| **profiled total** | 355 | **17.16** |
 
-`TestGPUProfileDecode` falls from 17.31 to 17.10 ms and from 379 to 355
-operations. The two changes are the norm kernels and the merged narrow
-projection:
+Per-shape weight bandwidth of the same projections inside a step, yuuka from
+`TestGPUProfileDecode` and the reference from the trace joined by
+`(dtype, K, N)` with `scripts/decode_reference_shapes.py`:
 
-- `rmsnorm_f32_kernel` reduces with one wave shuffle tree per wave plus one
-  cross-wave add instead of the eight-barrier tree, and reads
-  `float4`/`float4`/`float4` when the width is a multiple of four.
-  `rmsnorm_heads_f32_kernel` runs one wave per head with no barrier at all. The
-  `rmsnorm` family drops from 1.08 to 0.59 ms per step and `rmsnorm_heads` from
-  0.14 to 0.10 ms.
-- The recurrent `beta` and `alpha` projections (Q8_0, 2560 -> 32 each) now share
-  one `GEMV_PAIR` launch over the same normalized row: 48 per-row launches at
-  8.8 us become 24 paired launches at 13.8 us, so the pair family absorbs them
-  and the plan loses 24 operations.
+| Projection | dtype | K -> N | yuuka GB/s | ref GB/s | ratio |
+| --- | --- | --- | ---: | ---: | ---: |
+| `ffn_gate`, `ffn_up` | Q4_K | 2560 -> 9216 x2 | 188.8 | 219.0 | 0.86 |
+| `lm_head` | Q6_K | 2560 -> 248320 | 230.2 | 233.5 | 0.99 |
+| `attn_qkv` | Q5_K | 2560 -> 8192 | 178.2 | 218.9 | 0.81 |
+| `ffn_down` | Q6_K | 9216 -> 2560 | 186.6 | 189.9 | 0.98 |
+| `ffn_down` | Q4_K | 9216 -> 2560 | 157.6 | 177.2 | 0.89 |
+| `ssm_out` | Q5_K | 4096 -> 2560 | 130.9 | 208.3 | 0.63 |
+| `attn_gate` | Q4_K | 2560 -> 4096 | 156.3 | 201.3 | 0.78 |
+| `attn_q` | Q4_K | 2560 -> 8192 | 160.8 | 212.1 | 0.76 |
+| `attn_output` | Q4_K | 4096 -> 2560 | 125.4 | 207.7 | 0.60 |
+| `ssm_alpha`, `ssm_beta` | Q8_0 | 2560 -> 32 x2 | 12.5 | 18.9 | 0.66 |
+| `attn_k`, `attn_v` | Q4_K | 2560 -> 1024 | 92.3 | 171.1 | 0.54 |
+| `attn_v` | Q6_K | 2560 -> 1024 | 134.4 | 186.1 | 0.72 |
 
-Both save about 0.15 ms per step end to end, short of the 0.5 ms target. The
-remaining tail is launch bound rather than arithmetic bound: 65 norm launches
-cost 9 us each against 5.7 us for the reference's `rms_norm_f32` on the same
-step, and the only remaining merge, q and k RoPE plus the two head norms, is
-worth under 0.1 ms because it removes eight of each.
+What remains, in order of size:
 
-### Remapped decode matvec
-
-Landed in [roadmap.md](roadmap.md) step 4. Measured 2026-11-19 on the same
-device and model, `yuuka bench --kv-type f32 --chunk-size 512`, greedy, warmup 2
-and 3 repetitions, against llama.cpp build `b1b770d90`:
-
-| Test | before step 4 | after step 4 | llama.cpp |
-| --- | ---: | ---: | ---: |
-| pp128/tg128 | 44.02 | 60.16 | 62.08 |
-| pp512/tg128 | 43.75 | 59.74 | 61.88 |
-| pp2048/tg32 | 42.90 | 58.16 | 61.60 |
-
-`TestGPUProfileDecode` moves from 18.79 ms to 17.31 ms and the matvec family
-from 16.07 ms at 169.6 GB/s to 15.44 ms at 176.6 GB/s in the same session; the
-profile now runs one unprofiled decode step first, so neither figure carries the
-first-touch fault of the decode-only `ssm_beta` row. In-step weight bandwidth,
-the channel-parallel streaming kernel against the remapped one:
-
-| Projection | dtype | K -> N | before GB/s | after GB/s |
-| --- | --- | --- | ---: | ---: |
-| `ffn_gate`, `ffn_up` | Q4_K | 2560 -> 9216 x2 | 141.3 | 193.6 |
-| `lm_head` | Q6_K | 2560 -> 248320 | 187.6 | 229.8 |
-| `attn_qkv` | Q5_K | 2560 -> 8192 | 131.3 | 178.8 |
-| `ffn_down` | Q6_K | 9216 -> 2560 | 133.3 | 189.7 |
-| `attn_q` | Q4_K | 2560 -> 8192 | 123.7 | 166.8 |
-| `attn_gate` | Q4_K | 2560 -> 4096 | 113.2 | 158.3 |
-| `ffn_down` | Q4_K | 9216 -> 2560 | 94.4 | 158.4 |
-| `ssm_out` | Q5_K | 4096 -> 2560 | 102.5 | 133.7 |
-| `attn_output` | Q4_K | 4096 -> 2560 | 97.1 | 125.5 |
-| `attn_k` | Q4_K | 2560 -> 1024 | 49.9 | 93.3 |
-| `attn_v` | Q6_K | 2560 -> 1024 | 74.1 | 136.1 |
-
-The wide shapes reach the reference's 209 GB/s band and `lm_head` passes it. The
-1024- and 4096-input projections carry a per-output-row cost of roughly 27 ns on
-top of their weight bytes, which is what leaves them at 93-158 GB/s and is what
-the 190 GB/s row in the roadmap still asks for.
+1. The narrow and short-K projections, 0.54-0.72 of the reference: the one-row
+   remap removed the grid and load-width defects on the wide shapes, but a
+   1024- or 4096-input row still pays a per-output-row cost of roughly 27 ns on
+   top of its weight bytes. Closing that needs the int8 route (measured slower
+   end to end, [int8 decode matvec](#int8-decode-matvec)) or a different
+   reduction, not another block-shape change.
+2. The tail, 1.67 ms, of which 0.69 ms is norm launches at 9 us each. The
+   reference pays 5.7 us for the same dispatch, so the remaining difference is
+   launch count, not arithmetic.
+3. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
+   runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
+   24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see
+   [isolated kernels](#isolated-kernels)); the gated delta-net chunk adds
+   further time yuuka does not measure separately here.
+4. Long-context prefill, 1.5x at 8192: the FP16 MMA attention kernel closed
+   most of this gap, so what remains is the quantized GEMM plus the delta-net
+   chunk, not attention. Q8_0 KV keeps the tiled kernel and stays at 0.40.
+5. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
+   into one weight pass; yuuka re-reads the weights per request because fused
+   mixed-shape decode batching is not implemented.
 
 ### Split-key decode attention
 
@@ -1005,6 +946,20 @@ Each of these is a measured decision that still holds in the current code:
   dequantize route) and HIP Graph replay (no gain at the serving contexts
   measured). Speculative decoding is opt-in: exact and 4x faster on repetitive
   prompts, no gain where draft acceptance is low.
+- **The decode matvec remap stops at sixteen K values per lane.** Thirty-two
+  values per lane measured 131 GB/s against 176 because the wider accumulator
+  and activation register set cuts occupancy; four rows per wave, four waves per
+  block with four rows per wave, and shared-memory staging of the activation
+  step measured 156, 156, and 163 GB/s. The activation is read once per wave
+  step and reused by the wave's two rows, which is what the 176 GB/s figure
+  reflects.
+- **The int8 route does not beat the FP32 remap.** On the remapped mapping the
+  Q8_1 form measures 175.3 GB/s in step against 176.6 and 0.67 ms slower per
+  step, because it loses the gate/up pair fusion; it stays opt-in.
+- **The decode attention tile is 32 positions below a 1024-position capacity
+  and 64 above.** 128 measured 77 us per layer at 512 tokens against 23, and 16
+  measured 33 against 30; more blocks win at short context and fewer partials
+  win at long context, hence the split.
 - **Known limits:** decode throughput is a single-request weight-bandwidth
   number until fused multi-request decode batching exists; NPU execution is a
   diagnostic probe only; MoE grouped kernels have no supported model runtime;
@@ -1031,6 +986,16 @@ scripts/kernel_resources.sh
 YUUKA_TEST_MODEL="$MODEL" scripts/decode_profile.sh   # decode matvec table
 YUUKA_TEST_MODEL="$MODEL" scripts/decode_compare.sh    # llama.cpp decode comparison
 YUUKA_TEST_MODEL="$MODEL" scripts/prefill_counters.sh # prefill counter table
+
+# One decode step per route and context. The profile test warms one step first.
+YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./engine/gpu \
+  -run TestGPUProfileDecode -count=1 -v
+YUUKA_TEST_DECODE_CONTEXT=512 YUUKA_TEST_MODEL="$MODEL" go test -tags hip \
+  ./engine/gpu -run TestGPUProfileDecode -count=1 -v
+YUUKA_TEST_DECODE_CONTEXT=2048 YUUKA_TEST_DECODE_KV=f16 YUUKA_TEST_MODEL="$MODEL" \
+  go test -tags hip ./engine/gpu -run TestGPUProfileDecode -count=1 -v
+YUUKA_TEST_DECODE_INT8=prequantized YUUKA_TEST_MODEL="$MODEL" go test -tags hip \
+  ./engine/gpu -run TestGPUProfileDecode -count=1 -v
 
 for p in 128 512 1024 2048 4096 8192; do
   /tmp/yuuka-hip bench --model "$MODEL" --backend hip --chunk-size 512 \
