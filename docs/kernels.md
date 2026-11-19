@@ -990,11 +990,12 @@ traffic without reducing occupancy:
   state size 128, where four lanes cooperate on one state column and each lane
   holds 32 of the 128 state rows in registers for the whole chunk. A layer
   exposes `heads * (state / 32)` workgroups. On gfx1151, for chunks of at
-  least 128 rows whose FFN gate buffer fits the preparation span, a separate
+  least two rows whose FFN gate buffer fits the preparation span, a separate
   launch writes the normalized Q/K per token and key group, and the decay
   and beta per token and head. The core reads these FP32 arrays with no
   per-token block barriers. The FFN and recurrence use the scratch in stream
-  order. The scratch slot is available from C ABI 5 and is mutually exclusive
+  order. The [short-chunk sweep](prefill-optimization/phase2/acceptance/03-sub128-gdn.md)
+  measures the crossover. The scratch slot is available from C ABI 5 and is mutually exclusive
   with the triangular scratch slot. Without either span, the register core
   recomputes Q/K per column workgroup using two block barriers per row.
   Both cores sum `S^T k` and `S^T q` across the four lanes with shuffles.

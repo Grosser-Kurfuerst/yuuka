@@ -208,3 +208,54 @@ errors. The profiler synchronizes the plan cache after resizing its
 buffers. The real-model run with row order `2,18,2,1,64,96,127,128`
 passed. On the CPU fixture, the append benchmark passed under the
 race detector at concurrency four, with nine hits and one miss.
+
+## Stage 1c prepared recurrence
+
+The isolated crossover selects two rows. At one row, inline took
+0.02473 ms versus 0.02577 ms prepared. Prepared was faster in
+every tested cell starting at two rows in all three sweeps. The
+[planner](../../../../engine/gpu/plan.go) now uses that threshold
+for gfx1151, state width 128, and a sufficiently large prepared
+span. The recurrence kernels and projection routes are the same
+as the control.
+
+In the real-model 127-row profile at position zero, the median
+sum of the 24 recurrent operations went from 12.596 to 4.668 ms.
+The candidate run sampled 4.641, 4.722 and 4.668 ms. This meets
+the 5.5 ms target. At 128 or more rows the plan still binds the
+same prepared route.
+
+The matched-input comparison used the
+[prefill comparison driver](../../../../bench/prefill-compare/main.go)
+with F16 KV and the Phase 1 token file. It dumped the final FP32
+logits and hashed `Session.Snapshot` after each prefill, outside
+the timed interval. The latter includes the convolution history
+and matrix state for all recurrent layers. The complete logit
+files and state digests matched for 1, 2, 17, 64, 127 and 128
+tokens and for `512+1` and `512+18` at chunk 512.
+
+Run each Release binary with `-model "$MODEL" -tokens "$TOKENS" -prompt "$N"
+-chunk 512 -warmup 0 -reps 1 -logits "$OUT"`. The diagnostic adds the
+following code before writing the logit file. Both output files and
+the diagnostic stderr lines were compared with `cmp`.
+
+```go
+state, err := session.Snapshot()
+if err != nil {
+    return err
+}
+fmt.Fprintf(os.Stderr, "state=(%d %x)\n", session.Position(), sha256.Sum256(state))
+```
+
+The end-to-end TTFT gates for short prompts, tails and cache increments
+are evaluated with the projection changes in Step 1b.
+
+`go build ./...`, `go vet ./...`, `go vet -tags hip ./...`,
+`go test -race ./...`, the real-model HIP suite
+(`YUUKA_TEST_MODEL="$MODEL" YUUKA_TEST_KV=f16 go test -p 1 -tags hip -v ./...`),
+and all ten CTest suites passed on AI. One MoE and two SentencePiece
+tests skipped because their separate fixtures were absent.
+
+Two read-only review rounds ended in `NO_BLOCKING_ISSUES`. The roadmap
+now assigns the joint end-to-end gates to Step 1b, consistent with the
+stage plan.

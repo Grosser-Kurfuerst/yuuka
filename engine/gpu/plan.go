@@ -11,6 +11,10 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
+// The gfx1151 sweep found prepared recurrence faster from two rows onward.
+// See docs/prefill-optimization/phase2/acceptance/03-sub128-gdn.md.
+const gdnPreparedMinRows = 2
+
 // prefillMatmul appends the measured implementation for one prefill matmul.
 func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
 	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64) error {
@@ -848,7 +852,7 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 	var prepared *hip.Buffer
 	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
 	preparedWidth := uint64(convDim - inner + 2*rank)
-	if arch == "gfx1151" && stateSize == 128 && rows >= 128 &&
+	if arch == "gfx1151" && stateSize == 128 && rows >= gdnPreparedMinRows &&
 		preparedWidth <= p.ffnGate.Bytes()/4/uint64(rows) {
 		// The FFN writes this buffer after the recurrent op on the same stream.
 		prepared = p.ffnGate

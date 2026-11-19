@@ -187,11 +187,11 @@ verified steps:
   - *Changes*: Sweep `gdn_prepare_splitreg` + `gdn_chunk_prepared` versus inline
     `gdn_chunk_splitreg` at `rows = 8, 16, 18, 32, 64, 96, 127` and lower the `rows >= 128`
     guard in [plan.go](../../../engine/gpu/plan.go) to the measured win point.
-  - *Acceptance*: Byte-identical logits and recurrent state vs the `128`-row prepared path
-    on two-chunk splits; `127`-row `recurrent_chunk` drops from `~11.9 ms` to `<= 5.5 ms`.
-    End-to-end **real TTFT gate**: measure `yuuka-server` SSE first-content-token latency
-    on `129`, `512+1`, `512+18`, `2048+2`, and **multi-turn prefix-cache hits appending
-    `2` and `18` new tokens**, confirming repeatable TTFT reductions across all cases.
+  - *Acceptance*: Byte-identical logits and recurrent state against the same
+    chunks with the old threshold. The sum of `127`-row recurrent operations
+    must fall to `<= 5.5 ms`. The end-to-end short prompt, tail and cache
+    increment gates apply after Step 1b, as specified in the sub-128 plan.
+    [Step 1c acceptance](acceptance/03-sub128-gdn.md)
 - **Step 1d — Re-sweep default CLI chunk policy on updated kernels**:
   - *Changes*: Re-sweep `chunk = 512, 1024, 2048` across `512..8192` (including `2049` and
     `4097` boundary lengths) *after* Steps 1a–1c land; only wire an automatic length-based
