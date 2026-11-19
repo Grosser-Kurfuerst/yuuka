@@ -859,7 +859,10 @@ context, 55/49/37 us at 1024, and 93/67/57 us at 2048 for F32/F16/Q8_0 KV.
 The 2048-token F32 figure moves 16 MB of KV per layer, which is 68 us at the
 235 GB/s read ceiling recorded in [roadmap.md](roadmap.md#open-questions), so
 what remains there is the pool bytes rather than the kernel; F16 and Q8_0 read
-half and a quarter of that.
+half and a quarter of that. The same profile with all three pools
+(`YUUKA_TEST_DECODE_KV`) measures 0.096/0.071/0.061 ms per layer at 2048 tokens
+and 0.0335/0.0353/0.0318 ms at 512 for F32/F16/Q8_0, and the graph replay
+reproduces each format's plain token stream (ratio 1.003-1.006).
 
 ## Decisions and rejected routes
 

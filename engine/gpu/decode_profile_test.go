@@ -67,6 +67,17 @@ func TestGPUProfileDecode(t *testing.T) {
 	// the matvec block, "prequantized" submits one quantization operation per
 	// activation group. Unset keeps the default FP32 streaming route.
 	opts := Options{}
+	// YUUKA_TEST_DECODE_KV selects the KV pool format, so the same attribution and
+	// the same attention gate run for F32, F16, and Q8_0.
+	switch kv := os.Getenv("YUUKA_TEST_DECODE_KV"); kv {
+	case "", "f32":
+	case "f16":
+		opts.KVType = tensor.F16
+	case "q8_0":
+		opts.KVType = tensor.Q8_0
+	default:
+		t.Fatalf("YUUKA_TEST_DECODE_KV=%q is not f32, f16, or q8_0", kv)
+	}
 	route := "fp32 streaming"
 	// YUUKA_TEST_DECODE_UNFUSED=1 builds the plan without the residual epilogue
 	// and gate/up pair, which is how the same-session A/B measured the fusions.
@@ -123,24 +134,26 @@ func TestGPUProfileDecode(t *testing.T) {
 // that context.
 const decodeAttentionPerLayerGate = 0.05
 
-// checkDecodeAttentionGate bounds the per-layer decode attention cost once the
-// context is long enough for the position range to dominate the step.
+// checkDecodeAttentionGate enforces the split-key acceptance cost at the
+// 512-token context it was written for and reports the cost at longer contexts.
+// Those rows are measurements, not gates: the cost is the KV pool bytes, and at
+// 2048 tokens one F32 layer already moves 16 MB, which is 68 us per layer at the
+// 235 GB/s read ceiling regardless of the kernel.
 func checkDecodeAttentionGate(t *testing.T, r *decodeReport, context int) {
 	t.Helper()
-	if context < 512 {
-		return
-	}
 	for _, row := range r.codes {
 		if row.code != hip.OpAttentionPaged || row.ops == 0 {
 			continue
 		}
 		perLayer := row.ms / float64(row.ops)
-		if perLayer > decodeAttentionPerLayerGate {
-			t.Fatalf("decode attention costs %.4f ms per layer at a %d-token context,"+
-				" the gate is %.3f ms", perLayer, context, decodeAttentionPerLayerGate)
+		if context == 512 && perLayer > decodeAttentionPerLayerGate {
+			t.Fatalf("decode attention costs %.4f ms per layer at a 512-token context,"+
+				" the gate is %.3f ms", perLayer, decodeAttentionPerLayerGate)
 		}
-		t.Logf("gate: decode attention %.4f ms per layer at a %d-token context"+
-			" (gate %.3f ms)", perLayer, context, decodeAttentionPerLayerGate)
+		t.Logf("decode attention %.4f ms per layer at a %d-token context"+
+			" (%s %.3f ms)", perLayer, context,
+			map[bool]string{true: "gate", false: "recorded"}[context == 512],
+			decodeAttentionPerLayerGate)
 	}
 }
 

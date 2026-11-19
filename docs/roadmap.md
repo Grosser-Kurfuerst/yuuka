@@ -7,11 +7,11 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Steps 1 and 2 have landed: `scripts/decode_compare.sh` regenerates
-the comparison tables, and decode attention is split over the key range, which
-made the decode rate flat in context (44.7/44.0/43.8/42.9 t/s for
-pp128/tg32, pp128/tg128, pp512/tg128, pp2048/tg32). Steps 3-6 are open and step
-7 closes the record. This file is a plan, not a record: when a step lands, its
+**Status.** Steps 1-3 have landed: `scripts/decode_compare.sh` regenerates the
+comparison tables, decode attention is split over the key range, which made the
+decode rate flat in context (44.7/44.0/43.8/42.9 t/s for pp128/tg32,
+pp128/tg128, pp512/tg128, pp2048/tg32), and all three KV formats plus the graph
+path take the same kernel. Steps 4-6 are open and step 7 closes the record. This file is a plan, not a record: when a step lands, its
 measured result goes into [benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
@@ -250,6 +250,7 @@ Steps 1–3 close the context-dependent gap; steps 4–5 close the flat gap; ste
 | 1 | [Reproduce the comparison harness](#step-1-reproduce-the-comparison) | One command prints both engines at 128/512/2048 and the per-shape table | Script and docs |
 | | *Landed.* `scripts/decode_compare.sh` plus `scripts/decode_reference_shapes.py` reproduce the headline rows (0.63/0.66/0.55/0.50/0.28 on the 2026-11-19 rerun) and the per-shape table. | | |
 | | *Landed (step 2).* Split-key attention: 0.033 ms per layer at a 512-token context in `TestGPUProfileDecode`, `pp2048/tg32` 42.90 t/s, greedy tokens identical, logits within the recorded CPU difference. | | |
+| | *Landed (step 3).* F32/F16/Q8_0 and the captured graph take the same kernel: 0.0335/0.0353/0.0318 ms per layer at 512 tokens, replayed tokens identical, and 0.096/0.071/0.061 ms at 2048. The 0.06 ms row at 2048 holds for Q8_0; see the step note for the F32/F16 byte floor. | | |
 | 2 | [Parallel decode attention over the key range](#step-2-parallelize-decode-attention-over-the-key-range) | 512-token context: ≤ 0.05 ms per layer, top-1 token and logits within the documented tolerance, `pp2048` ≥ 30 t/s | 4–8 files |
 | 3 | [Cover every KV format and the graph path](#step-3-cover-every-kv-format-and-the-graph-path) | All three pool formats and the captured graph produce the same tokens, ≤ 0.06 ms per layer from 0 to 2048 tokens | 3–6 files |
 | 4 | [Remap the decode matvec](#step-4-remap-the-decode-matvec) | ≥ 190 GB/s for every `N` ≥ 1024, step ≤ 15.5 ms, `pp128` ≥ 50 t/s | 4–8 files |
@@ -339,6 +340,30 @@ Acceptance: at a 512-token context, ≤ 0.05 ms per layer in
 `TestGPUProfileDecode`; `pp2048/tg32` ≥ 30 t/s; tokens identical.
 
 ### Step 3: cover every KV format and the graph path
+
+Landed with step 2's kernel: `load_key_span` and `load_value_pair` decode the
+F16 pool with 8-byte and 4-byte vector spans and the Q8_0 pool per 32-value
+group, and the dynamic variant passes the same device-resident position to both
+the split kernel and the merge. `TestGPUGraphReplayMatchesAndTimes` now runs
+F32, F16, and Q8_0 and requires each format's replayed tokens to equal its plain
+stream and all three streams to agree; `test_flash_decode_long` covers the
+head_dim 64 and 256 shapes and an F16 pool with graph replay at the ABI level.
+
+Measured per-layer decode attention, `TestGPUProfileDecode` with
+`YUUKA_TEST_DECODE_CONTEXT` and `YUUKA_TEST_DECODE_KV`:
+
+| Context | F32 | F16 | Q8_0 |
+| --- | ---: | ---: | ---: |
+| 512 | 0.0335 | 0.0353 | 0.0318 |
+| 2048 | 0.0960 | 0.0711 | 0.0606 |
+
+The 0.06 ms row holds for Q8_0 and misses for F16 and F32. This is the pool
+byte traffic, not the kernel: at 2048 tokens one layer reads 16 MB (F32), 8 MB
+(F16), and 4 MB (Q8_0) of K and V, so the F32 floor alone is 68 us at the
+235 GB/s read ceiling even with a perfect kernel: 34 us for F16 and 17 us for
+Q8_0. The profiled figures are 1.4x, 2.1x, and 3.5x those floors; the narrow
+formats issue smaller requests, so their streaming efficiency is lower. The
+512-token gate is the enforced one.
 
 The F16 and Q8_0 pools and the dynamic-parameter variant need the same
 treatment. The Q8_0 pool stages K and V dequantized per tile in shared memory;

@@ -5,6 +5,8 @@ package gpu
 import (
 	"testing"
 	"time"
+
+	"github.com/yuuka-ai/yuuka/tensor"
 )
 
 // TestGPUGraphReplayMatchesAndTimes measures the opt-in HIP Graph replay of the
@@ -40,18 +42,37 @@ func TestGPUGraphReplayMatchesAndTimes(t *testing.T) {
 		ms := float64(time.Since(started).Microseconds()) / 1000 / steps
 		return tokens, ms
 	}
-	plainTokens, plainMS := run(Options{})
-	graphTokens, graphMS := run(Options{EnableGraph: true, GraphMinSteps: 2})
-	if len(plainTokens) != len(graphTokens) {
-		t.Fatalf("plain path produced %d tokens, replayed path %d", len(plainTokens),
-			len(graphTokens))
-	}
-	for i := range plainTokens {
-		if plainTokens[i] != graphTokens[i] {
-			t.Fatalf("token %d: plain %d, replayed %d", i, plainTokens[i], graphTokens[i])
+	// Every KV pool format takes the same split-key attention kernel, and the
+	// dynamic variant reads the position from device memory, so each format's
+	// replayed graph must reproduce its own plain token stream and all formats
+	// must agree with each other.
+	var reference []int32
+	for _, kvType := range []tensor.DType{tensor.F32, tensor.F16, tensor.Q8_0} {
+		plainTokens, plainMS := run(Options{KVType: kvType})
+		graphTokens, graphMS := run(Options{KVType: kvType, EnableGraph: true,
+			GraphMinSteps: 2})
+		if len(plainTokens) != len(graphTokens) {
+			t.Fatalf("%s: plain path produced %d tokens, replayed path %d", kvType,
+				len(plainTokens), len(graphTokens))
 		}
+		for i := range plainTokens {
+			if plainTokens[i] != graphTokens[i] {
+				t.Fatalf("%s token %d: plain %d, replayed %d", kvType, i,
+					plainTokens[i], graphTokens[i])
+			}
+		}
+		if reference == nil {
+			reference = plainTokens
+		} else {
+			for i := range reference {
+				if plainTokens[i] != reference[i] {
+					t.Fatalf("%s token %d: %d, F32 %d", kvType, i, plainTokens[i],
+						reference[i])
+				}
+			}
+		}
+		t.Logf("%s %d decode steps: plain %.3f ms/step (%.2f tok/s), replayed %.3f"+
+			" ms/step (%.2f tok/s), ratio %.3f", kvType, steps, plainMS, 1000/plainMS,
+			graphMS, 1000/graphMS, graphMS/plainMS)
 	}
-	t.Logf("%d decode steps: plain %.3f ms/step (%.2f tok/s), replayed %.3f ms/step"+
-		" (%.2f tok/s), ratio %.3f", steps, plainMS, 1000/plainMS, graphMS, 1000/graphMS,
-		graphMS/plainMS)
 }

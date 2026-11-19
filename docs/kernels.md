@@ -842,8 +842,11 @@ size changes:
 | Q8_0 | `ceil(kv_dim/32)` groups of one FP16 scale plus 32 int8 values |
 
 `kv_write_paged` quantizes per 32-value group for Q8_0; attention kernels decode
-K and V through the same row format. Prefix-cache keys include the format so
-cached blocks are never reused across formats.
+K and V through the same row format. The split-key decode kernel reads one
+32-value Q8_0 group, one 8-byte F16 span, or one 16-byte F32 span per lane in
+the score phase, and a 4-value Q8_0 group, 4-byte F16 pair, or 8-byte F32 pair
+per lane in the value phase, so all three formats share one mapping. Prefix-cache
+keys include the format so cached blocks are never reused across formats.
 
 ### 7.4 Attention query layout
 
