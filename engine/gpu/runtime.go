@@ -61,11 +61,17 @@ func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Opt
 		Blocks:              blocks,
 		BlockSize:           blockSize,
 		PrefillChunk:        chunk,
-		EnableGraph:         false,
-		GraphMinSteps:       1,
+		EnableGraph:         opts.EnableGraph,
+		GraphMinSteps:       opts.GraphMinSteps,
 		KVType:              opts.KVType,
 		LegacyBlasAttention: opts.LegacyBlasAttention,
 		ForceTiledAttention: opts.ForceTiledAttention,
+		ForceDecodeGemv:     opts.ForceDecodeGemv,
+		Int8Matvec:          opts.Int8Matvec,
+		PrequantizedInt8:    opts.PrequantizedInt8,
+		LegacyDeltaNet:      opts.LegacyDeltaNet,
+		NoResidualFusion:    opts.NoResidualFusion,
+		NoPairFusion:        opts.NoPairFusion,
 	})
 	if err != nil {
 		return nil, err
@@ -78,8 +84,8 @@ func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Opt
 	}
 	session, err := m.NewSession(table, 0, nil, SessionOptions{
 		Capacity:      capacity,
-		EnableGraph:   false,
-		GraphMinSteps: 1,
+		EnableGraph:   opts.EnableGraph,
+		GraphMinSteps: opts.GraphMinSteps,
 		Trace:         true,
 	})
 	if err != nil {

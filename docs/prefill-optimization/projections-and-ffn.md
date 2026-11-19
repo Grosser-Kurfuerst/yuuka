@@ -61,7 +61,7 @@ differ by 0.1 ms at this length. Prioritize Q4_K, then Q5_K.
    [the counter reducer](../../scripts/prefill_counters.py) when extending it
    to a new tile or sweep order. The old reducer assumes eight waves and
    seven submissions per cell. Earlier double-buffer and register-prefetch
-   experiments are recorded in [the previous roadmap](../roadmap3.md#10-rejected-routes-and-open-questions).
+   experiments are recorded in [decisions and rejected routes](../benchmarks.md#decisions-and-rejected-routes).
 4. **Promote by shape.** The first target is at most **1.05 ms** and a
    reproducible improvement in unprofiled pp512. Select the winning native
    variant inside the MMQ launcher if the Go-level route is still MMQ.

@@ -115,14 +115,16 @@ hard-coded from another GPU.
 
 | Kernel family | Main scenario | Optimization focus |
 | --- | --- | --- |
-| `gemv_q4_k` | Single-token decode | Packed reads, fused dequantization, Wave reduction |
-| `gemv_q6_k` | Decode | High-precision K-quant layout |
-| `gemv_q8_0` | Decode / baseline | Simple, stable high-bandwidth quantization |
-| `gemv_q4_0` / `gemv_q5_0` | Decode / broader GGUF coverage | Nibble and high-bit unpack, batch reuse |
+| `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
+| `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
+| `lm_head_stream` epilogues | Decode matvec (selected) | Same streaming kernel with the residual add in the epilogue, or walking a second packed matrix to form the SwiGLU product (`GEMV_RESIDUAL`, `GEMV_PAIR`) |
+| `recurrent_token` | Gated delta-net per-token state (selected) | Head state in registers across four thread groups, decay and update fused in one pass, gated RMSNorm folded in |
+| `conv_l2norm` | Recurrent convolution and q/k L2 norm (selected) | One block per 256 channels, whole norm groups per block, ring state advanced in place |
+| `gemv_q4_k` / `gemv_q6_k` / `gemv_q8_0` / `gemv_q4_0` / `gemv_q5_0` | Decode fallback, narrow projections, kernel reference | Packed reads, fused dequantization, block reduction |
 | `gemm_fp16_wmma` | Prefill baseline | Tiling, WMMA, LDS, pipelining |
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
 | `gemm_q6_k_wmma` | Quantized prefill | Scale handling, tile reuse |
-| `lm_head_stream` | Prefill tail output projection | Stream each packed weight row once, reuse it across the row block |
+
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
 | `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
 | `paged_attention` | Decode | Block table, shared KV heads, long-context split |
@@ -166,13 +168,99 @@ requirements:
 
 ### 5.3 Workgroup mapping
 
-The main design axes to benchmark:
+Two mappings exist and `backend/hip.SelectDecodeGemvPath` is the measured rule
+between them. Both compute the same per-weight products through `decode_span4`;
+they differ in how much of the machine one output row keeps busy.
 
-- one wave per output channel versus multiple output channels per workgroup;
-- vectorized loads versus narrower packed loads;
-- register reuse versus LDS staging for scales and partial sums;
-- batch sizes 1, 2, 4, 8, and 16 to find the GEMV/GEMM crossover;
-- accumulation precision and deterministic reduction order.
+**Per-row GEMV** (`gemv_*_kernel`): one 256-thread block per output row, one
+packed element per thread per K step, a block-wide tree reduction, and for
+Q4_K/Q5_K two barriers per 256-value step for the scale staging. It reads the
+activation once per output row, so a Q4_K row reads 10 KiB of activation against
+1.44 KiB of weights. Measured 25-76 GB/s on the decode shapes.
+
+**Streaming** (`lm_head_kernel`, section 6.5): one wave owns four output
+channels and walks the K axis; a lane reads 16 bytes of packed weights per step,
+the activation row is staged in shared memory once per block, accumulators stay
+in registers, and the only reduction is one wave shuffle per channel. No block
+barrier sits inside the K loop. Measured 90-287 GB/s on the same shapes at 2.1-8.6
+instructions per weight fewer, and 0.16 LDS instructions per weight against up to
+2.66.
+
+The rule, in output width at `n_in = 2560` and one row: the streaming form wins
+from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1), so the
+selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
+family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
+recurrent projections are the only decode shapes that land on the fallback.
+
+**Epilogues and the two-matrix form.** The same kernel carries two
+plan-selected extensions. `GEMV_RESIDUAL` adds a residual row to every output
+element in the epilogue, which folds the ADD that ends a sub-layer into the
+projection and lets the output alias the residual row. `GEMV_PAIR` walks a second
+packed matrix of the same dtype in the same block over the same staged activation
+row, either writing both rows or forming `silu(A x) * (B x)`, which replaces
+`ffn_gate`, `ffn_up`, and `SILU_MUL` with one operation. Both are plan-build-time
+choices; the plain form stays for the int8 and per-row routes.
+
+Three shapes of this idea were measured and rejected
+([benchmarks.md](benchmarks.md#decode-fusion)): eight output
+channels per wave (28% slower, the wider wave spills), a 512-value K step (7%
+slower, the staging tile costs more than the barriers it removes), and a pair that
+dispatches the decoder at run time so the two matrices could mix dtypes (40%
+slower than the templated decode, because the switch dominates a loop that runs
+0.3 instructions per weight). A pair of matrices whose widths differ by 8:1
+(`q` and `k`) is also slower than two launches, because the grid follows the wider
+matrix.
+
+**Int8 variant, implemented and not selected.** `gemv_i8_kernel` keeps the same
+mapping but dots the four packed digits of a lane against the Q8_1 activation
+word with one `v_dot4`, applying the block scale and the Q4_K/Q5_K minimum once
+per sub-block instead of once per weight. It is reachable through
+`Options.Int8Matvec` and is measured slower end to end than the FP32 streaming
+kernel: 20.07 ms of matvec against 21.39 ms, plus 1.09 ms for the separate
+activation quantization, in a step where the fused variant costs 21.9 ms because
+every block re-quantizes the row. The decode step is not instruction bound at
+127 GB/s of a 244 GB/s read ceiling, so halving the arithmetic moves 6%. The
+numbers are in [benchmarks.md](benchmarks.md#int8-decode-matvec).
+
+Numerics. The per-row kernel sums a strided set of K values per thread and
+reduces over the block; the streaming kernel sums four neighbours per lane and
+reduces across the wave. Both accumulate in FP32, so the difference is that
+reassociation: `TestGPUStreamingDecodeMatchesGemv` measures 8.34e-06 maximum
+absolute logit difference over eight greedy decode steps of the real model, with
+identical tokens, and `tests/hip/gemv_test.cpp` checks every dtype against the
+host dot product at 2e-3 relative and against the per-row kernel at 2.4e-4
+absolute.
+
+#### 5.3.1 Measured decode shapes
+
+One submission per plan, matrix resident, five warmups and twenty-five timed
+submissions; `kernel` is the traced kernel time from
+`scripts/decode_profile.sh`, which excludes the launch the host column includes:
+
+| Shape | dtype | per-row GB/s | streaming GB/s |
+| --- | --- | ---: | ---: |
+| `ffn_gate` 2560 -> 9216 | Q4_K | 40.5 | 286.6 |
+| `ffn_down` 9216 -> 2560 | Q6_K | 81.6 | 256.1 |
+| `ffn_down` 9216 -> 2560 | Q4_K | 43.6 | 192.6 |
+| `attn_q` 2560 -> 8192 | Q4_K | 40.6 | 258.2 |
+| `attn_qkv` 2560 -> 8192 | Q5_K | 43.1 | 248.6 |
+| `attn_gate` 2560 -> 4096 | Q4_K | 39.9 | 254.8 |
+| `attn_output` 4096 -> 2560 | Q4_K | 42.6 | 203.2 |
+| `ssm_out` 4096 -> 2560 | Q5_K | 44.2 | 203.4 |
+| `attn_k` 2560 -> 1024 | Q4_K | 30.3 | 90.4 |
+| `attn_v` 2560 -> 1024 | Q6_K | 51.4 | 136.7 |
+| `ssm_beta` 2560 -> 32 | Q8_0 | 26.9 | 5.0 |
+| `lm_head` 2560 -> 248320 | Q6_K | 46.5 | 184.2 |
+
+The three cells below 150 GB/s are the 1024-output attention projections: a
+32-block grid cannot fill a 40-compute-unit device, and one such submission costs
+16 microseconds, so the decode step spends 0.26 ms of its 33.4 ms on the sixteen
+of them. Closing that needs split-K or fewer channels per block, which is not
+taken yet.
+
+Inside the decode step the same kernels run at 94-187 GB/s rather than the
+isolated figures, because a token rotates through 2.7 GB of weights and every
+matrix is cold in the 32 MB MALL ([benchmarks.md](benchmarks.md#decode-matvec)).
 
 ### 5.4 Q4_0 and Q5_0
 
@@ -336,7 +424,7 @@ up, and `SILU_MUL` operations remain. Q/K/V, beta/alpha, and RMSNorm fusions are
 not implemented.
 
 Larger tiles, an int8 tensor-core path, and the remaining projection fusions
-remain candidates under [roadmap2.md](roadmap2.md); they are not implemented and
+remain candidates; they are not implemented and
 are not claimed in the benchmark results.
 
 ### 6.3 Int8 MMQ GEMM
@@ -431,9 +519,9 @@ Earlier generic kernel resources on gfx1151: 133 VGPRs, 38-40 SGPRs, no spills, 
 Generic baseline throughput at `M = 512` (sweep, five timed submissions after two
 warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
 12.4-14.4 TFLOP/s across the three shapes, against 13.5-14.1, 12.6-13.4, and
-11.0-11.6 TFLOP/s before the layout and occupancy change. The route is still
-1.2-1.3x below llama.cpp's MMQ kernel in this baseline.
-[Original attribution](roadmap3.md#4-stage-s1-mmq-gemm-highest-value-73-of-the-gap)
+11.0-11.6 TFLOP/s before the layout and occupancy change. At this baseline,
+the generic route ran 1.2–1.3× below llama.cpp's MMQ kernel on the same
+device. [Measured attribution](benchmarks.md#prefill-gemm)
 
 The q/k/v and qkv/gate groups read the same normalized tile, so the plan
 quantizes it once per group instead of once per projection
@@ -442,8 +530,10 @@ quantizes it once per group instead of once per projection
 
 When gate, up and down all select MMQ, the FFN uses the same Q8_1 inputs
 for gate and up, then reuses those buffers for down on the same stream.
-The ABI 6 `SILU_MUL_QUANT_Q8_1` operation reads the FP32 gate and up
-projections, applies SwiGLU and writes Q8_1 digits and block scales. It
+The `SILU_MUL_QUANT_Q8_1` operation reads the FP32 gate and up
+projections, applies SwiGLU and writes Q8_1 digits and block scales.
+The combined prefill and decode ABI 9 assigns it opcode 43 and assigns
+opcodes 38–42 to the fused decode operations. The fused quantizer
 uses the plain quantizer's scale, rounding and sum rules and skips
 materializing the activated FP32 tensor. The compact final FFN uses
 its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/acceptance/05-ffn-fusion.md)
@@ -528,8 +618,8 @@ measures 1324 tok/s on the same GGUF and device, against llama.cpp HIP at
 2346 tok/s for the same 512-token prompt in the current reference build. The
 2026-11-16 split was matmul 293 ms, the gated delta-net chunk 50 ms, and
 prefill attention 19 ms at position 0 and 562 ms at position 7680; attention at
-position 7680 dropped from 2030 ms to 643 ms. The ordered optimization plan and
-per-workstream status are in [roadmap2.md](roadmap2.md).
+position 7680 dropped from 2030 ms to 643 ms. The per-workstream measured status
+is in [benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 ### 6.5 Streaming LM head
 
@@ -543,8 +633,9 @@ chunk ends after the final K/V write. Speculative verification computes
 every requested row through attention and FFN.
 [Validation and timings](prefill-optimization/acceptance/06-final-query.md)
 
-`lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the prefill tail
-projection:
+`lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
+projection in the prefill and decode tails. It also serves decode matvecs
+when `SelectDecodeGemvPath` selects `DecodeGemvStreaming`:
 
 ```text
 out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16
@@ -596,14 +687,22 @@ timed submissions after two warmups) on the recorded gfx1151 device, `n_in`
 
 In the 512-row prefill plan of `TestGPUProfilePrefill` the tail costs 2.84-2.92 ms
 of a 287 ms chunk, against 11.3 ms for the single-row GEMV tail before this
-kernel ([roadmap3.md](roadmap3.md#7-stage-s4-prefill-lm-head)). The kernel is
+kernel. The kernel is
 bandwidth bound: the same 521 MB Q6_K matrix streams at 244 GB/s in a pure read
 loop on this device, so 2.90 ms is about 85% of that ceiling.
+
+The decode tail runs the same single-row instantiation. In the profiled decode
+step of `TestGPUProfileDecode` it costs 2.79 ms at 187 GB/s against 11.23 ms at
+46 GB/s for the per-row GEMV, which is 8.4 ms of a 97.4 ms step.
 
 Numerics. The per-element products are the same FP32 products the decode GEMV
 forms, including the K-quant scale-then-minimum order; only the summation order
 differs, because a lane accumulates four neighbours and the last five additions
-are a shuffle tree. `tests/hip/prefill_test.cpp` checks all eight dtypes against
+are a shuffle tree. The opt-in int8 variant of the same kernel replaces the FP32
+products with a `v_dot4` over Q8_1 digits: it moves decode logits by up to 0.2656
+over eight greedy steps with identical tokens, against the 0.0031-0.264 band the
+prefill int8 route records, and its kernel output matches a host reference that
+uses the same digits to 5.7e-4 relative. `tests/hip/prefill_test.cpp` checks all eight dtypes against
 the independent host dot products for one, three, and sixteen rows and requires
 a repeated run to be bitwise identical; `TestPlanLMHeadMatchesDequant` checks
 Q6_K and Q8_0 against dequantized CPU dots (Q8_0 is bitwise equal), and the
@@ -611,9 +710,26 @@ model-level gates are unchanged (`TestGPUMatchesCPU` 0.00309944,
 `TestGPUChunkedPrefillLongContext` top-1 `33075` with zero difference).
 
 A shape the kernel does not cover keeps the per-row GEMV tail; nothing silently
-changes numerically. The measured crossover is `N = 1024` at `n_in = 2560`,
-where Q8_0 is level with the GEMV and every other dtype is ahead; below that the
-staging of the activation tile costs more than it saves.
+changes numerically. `backend/hip.SelectLMHeadPath` is the one rule both tails
+use: dtype in the GEMV family, `n_in` a multiple of 256, `n_out` at or above
+`lmHeadMinOutputs`, and 1-16 rows.
+
+The crossover was re-measured at the decode width (`n_in = 2560`, one row) with
+`build/yuuka_gemv_decode_sweep --threshold`, five warmups and twenty-five timed
+submissions per cell. The streaming kernel wins from 512 outputs upward for
+Q4_K, Q5_K, and Q6_K, and from 1536 upward for Q8_0 and F16, where the per-row
+GEMV's vectorized path is still ahead at 1024 (0.022 ms against 0.035 ms). The
+threshold stays at 1024 because one number covers every dtype without
+regressing Q8_0, which is level there, and because no model shape sits in the
+512-1536 range: an output projection is vocabulary sized. The table is in
+[benchmarks.md](benchmarks.md#decode-matvec).
+
+Numerics of the decode route. The per-row GEMV sums a strided set of K values
+per thread and reduces over the block; the streaming kernel sums four
+neighbours per lane and reduces across the wave. Both accumulate in FP32, and
+`TestGPUStreamingTailMatchesGemv` measures the difference on the real model:
+4.8e-06 maximum absolute logit difference over eight greedy decode steps, with
+identical tokens.
 
 ## 7. Attention
 
@@ -945,16 +1061,58 @@ it is LDS-latency bound, with 106-164 VGPRs and three 8-wave workgroups resident
 per CU against a 47-67 cycle LDS latency, and it issues 2.7M instructions per CU
 per layer. Every product is an FP32 FMA-pipe loop; the reference implementation
 instead runs its dense products on the FP16 WMMA path (`mmb_dense`), which is
-the step that would make this form competitive (see
-[roadmap3.md](roadmap3.md#51-implementation-2026-11-18)).
+the step that would make this form competitive.
 
 Correctness: `tests/hip/prefill_test.cpp` runs both paths against the same CPU
 reference (chunked maximum absolute difference `1.6e-7`, per-token `2.1e-7`) and
 checks that a repeated execution reproduces the outputs bitwise.
 
+### 9.2 Per-token form in decode
+
+Decode runs one token at a time, so the chunkwise form does not apply and the
+recurrence is evaluated directly. Two operators replace the five the decode plan
+used before the fusion (`CONV1D`, two `L2NORM`, `GDN`, `GATED_RMSNORM`):
+
+- `conv_l2norm_f32_kernel` applies the short convolution to all 8192 channels,
+  advancing its ring state, and then the L2 norm to the q and k groups with the q
+  scale. One block owns 256 channels, which is exactly two 128-wide norm groups,
+  so a norm never crosses a block and needs no cross-block reduction.
+- `recurrent_token_f32_kernel` owns one head per block with 512 threads: four
+  thread groups share a column of the state, each holding 32 of its 128 rows in
+  registers. The block loads the column once, forms `S^T k` with the decay applied
+  to the sum (because `S^T k` over the decayed state is `decay * (S^T k)` over the
+  loaded state), exchanges the four partials through shared memory, forms
+  `d = (v - S^T k) * beta`, and then applies the decay, the rank-1 update, and
+  `S^T q` in one pass over the registers before writing the column back once. The
+  gated RMSNorm of the head is folded into the same block because its reduction is
+  over that head's own values: `out` receives the normalized row and the raw
+  delta-net row is not written.
+
+The state layout is unchanged, so the chunked prefill path and the decode path
+consume the same buffers; nothing about the prefill operators moved.
+
+Numerics. The five-pass kernel rounds the decayed state to memory and forms
+`S^T k` from it; the fused kernel forms `decay * (S^T k)` with one rounding and
+applies the update as a fused multiply-add. The column sums are also reassociated
+across the four thread groups. `tests/hip/deltanet_test.cpp` bounds both device
+paths against an independent host implementation of the documented order of
+operations: 3e-8 on the normalized output and 7e-9 on the state between the two
+device paths, over three tokens with a decay of about 0.75. The decay is chosen
+far from one on purpose: with a decay of 0.997 a missing factor on `S^T k`
+produces a 1.6e-5 difference, and with 0.75 it produces 2.6e-4, which the 1e-5
+bound rejects.
+
+Measured design choice ([benchmarks.md](benchmarks.md#gated-delta-net)): the
+register-resident form
+reaches 375 GB/s of state traffic against 125 GB/s for a shared-memory-resident
+form of the same recurrence, because a 64 KB state fills the workgroup shared
+budget and leaves no room for the normalization; 512 threads beat 256 by 6% and
+beat a plain read-and-write copy of the same bytes, which makes memory-level
+parallelism per lane the limiter rather than bandwidth.
+
 SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
-epilogue, together with fusing the gate/up GEMMs themselves, is a candidate
-under [roadmap2.md](roadmap2.md); no fused implementation is claimed. Every
+epilogue, together with fusing the gate/up GEMMs themselves, is a candidate;
+no fused implementation is claimed. Every
 fusion must be evaluated on all of:
 
 - kernel launch count;
@@ -987,8 +1145,26 @@ per plan, not per tensor per token.
 Dispatch is recorded in one explicit Go selector:
 `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
 rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
-Single-token decode submits one GEMV per matrix; there is no separate runtime
-GEMV batch selector.
+The decode plan decides the fused matvec forms when it is built, not at run time:
+`Model.decodeMatmulResidual` takes the residual epilogue when the streaming route
+is selected, and `Model.decodeMatmulPair` takes the two-matrix form when both
+shapes are on the streaming route, the two weight dtypes are equal, and — for the
+SwiGLU epilogue — the widths match. Everything else keeps the separate
+operations, and `Options.NoResidualFusion` / `Options.NoPairFusion` restore them
+for differential measurement.
+
+The decode plan builds a recurrent layer from `RECURRENT_TOKEN` and
+`CONV_L2NORM` when the model's geometry is inside what those kernels are compiled
+for (a 128-wide state and 256-aligned channel counts) and from the five separate
+operators otherwise; nothing is decided at run time, and a fused operation whose
+geometry is outside that set is rejected instead of routed elsewhere.
+`Options.LegacyDeltaNet` forces the unfused plan for the differential test.
+
+Single-token decode submits one matvec per matrix. `SelectDecodeGemvPath`
+chooses between the per-row GEMV and the streaming kernel per operation
+(section 5.3), and the output projection takes the same rule; the int8 variant is
+reachable through the same selector behind a flag that defaults to off. There is
+no separate runtime GEMV batch selector.
 
 Each plan addition validates the dtype, quantization row layout, shape
 constraints, and buffer ranges. Unsupported combinations fail during planning;

@@ -32,6 +32,7 @@ if(YUUKA_ENABLE_HIP)
         kernels/hip/attention/attention.hip
         kernels/hip/embedding/embedding.hip
         kernels/hip/gemv/gemv_quant.hip
+        kernels/hip/gemv/gemv_i8.hip
         kernels/hip/gemm/gemm.hip
         kernels/hip/gemm/wmma_gemm.hip
         kernels/hip/gemm/mmq_gemm.hip
@@ -47,6 +48,7 @@ if(YUUKA_ENABLE_HIP)
         kernels/hip/prefill/gdn_chunk.hip
         kernels/hip/prefill/attention_blas.hip
         kernels/hip/ssm/ssm.hip
+        kernels/hip/ssm/deltanet.hip
     )
     target_include_directories(yuuka_hip PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/backend/hip/bridge
@@ -83,6 +85,12 @@ if(YUUKA_ENABLE_HIP)
 
         add_executable(yuuka_moe_sweep bench/hip/moe_sweep.cpp)
         target_link_libraries(yuuka_moe_sweep PRIVATE yuuka_hip)
+
+        add_executable(yuuka_gemv_decode_sweep bench/hip/gemv_decode_sweep.cpp)
+        target_link_libraries(yuuka_gemv_decode_sweep PRIVATE yuuka_hip)
+
+        add_executable(yuuka_deltanet_sweep bench/hip/deltanet_sweep.hip)
+        target_link_libraries(yuuka_deltanet_sweep PRIVATE hip::device)
     endif()
 
     if(YUUKA_BUILD_TESTS)
@@ -126,6 +134,11 @@ if(YUUKA_ENABLE_HIP)
         target_link_libraries(yuuka_hip_moe_test PRIVATE yuuka_hip)
         add_test(NAME hip_moe_correctness COMMAND yuuka_hip_moe_test)
         set_tests_properties(hip_moe_correctness PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(yuuka_hip_deltanet_test tests/hip/deltanet_test.cpp)
+        target_link_libraries(yuuka_hip_deltanet_test PRIVATE yuuka_hip)
+        add_test(NAME hip_deltanet_correctness COMMAND yuuka_hip_deltanet_test)
+        set_tests_properties(hip_deltanet_correctness PROPERTIES SKIP_RETURN_CODE 77)
 
         add_executable(yuuka_hip_plan_validation_test tests/hip/plan_validation_test.cpp)
         target_link_libraries(yuuka_hip_plan_validation_test PRIVATE yuuka_hip)

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 8
+#define YUUKA_HIP_ABI_VERSION 9
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -139,7 +139,12 @@ typedef enum yuuka_op_code {
     YUUKA_OP_DEQUANT_F16 = 35,
     YUUKA_OP_QUANT_Q8_1 = 36,
     YUUKA_OP_LM_HEAD = 37,
-    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 38
+    YUUKA_OP_GEMV_Q8_1 = 38,
+    YUUKA_OP_RECURRENT_TOKEN = 39,
+    YUUKA_OP_CONV_L2NORM = 40,
+    YUUKA_OP_GEMV_RESIDUAL = 41,
+    YUUKA_OP_GEMV_PAIR = 42,
+    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -165,6 +170,17 @@ typedef enum yuuka_op_code {
 #define YUUKA_GEMM_PATH_WMMA 2u
 #define YUUKA_GEMM_PATH_MMQ 3u
 
+/* Int8 decode matvec: out[n_out] = W[n_out, n_in] * x. buf[0] holds the packed
+ * weights, buf[3] the FP32 output, n[0] = n_in, n[1] = n_out, u[0] = dtype.
+ * u[1] selects where the Q8_1 activation comes from:
+ *
+ *   0  buf[1] holds the int8 digits and buf[2] their float2 block scales, both
+ *      written by YUUKA_OP_QUANT_Q8_1;
+ *   1  buf[1] holds the FP32 activation row and the block quantizes it into
+ *      shared memory itself, so no quantization operation is submitted.
+ *
+ * Q4_K, Q5_K, Q6_K, and Q8_0 are supported; rows are not, because speculative
+ * verification keeps the FP32 streaming kernel. */
 typedef struct yuuka_op {
     uint32_t code;
     uint32_t flags;
@@ -305,7 +321,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *
  * GEMV, GEMM, GEMM_SWIGLU, GEMV_BATCH, LM_HEAD, the legacy single-token family (RMSNORM, L2NORM,
  * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
- * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
+ * COPY, SCALE, and KV_WRITE), the fused delta-net pair (CONV_L2NORM and
+ * RECURRENT_TOKEN), the fused decode matvec pair (GEMV_RESIDUAL and
+ * GEMV_PAIR), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
  * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
  * DEQUANT_F16, QUANT_Q8_1, and SILU_MUL_QUANT_Q8_1. Unsupported
@@ -361,6 +379,40 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   LM_HEAD:             buf0 packed weights, buf1 FP32 x, buf2 FP32 out;
  *                        n={n_in,n_out,rows}; u[0]=dtype; n_in must be a
  *                        multiple of 256 and rows at most 16
+ *   RECURRENT_TOKEN:     buf0 state, buf1 q, buf2 k, buf3 v, buf4 alpha,
+ *                        buf5 beta, buf6 dt, buf7 a, buf8 out, buf9 norm
+ *                        weight, buf10 gate; off[1..3] select q, k, and v;
+ *                        n={groups,heads,state}; f[0]=eps. state is
+ *                        [heads,state,state] FP32 in the chunked prefill
+ *                        layout, q and k are [groups,state], v, out, and gate
+ *                        are [heads,state], and out receives the gated RMSNorm
+ *                        of the head rather than the raw delta-net result.
+ *                        state must be 128, and the operation fails with
+ *                        YUUKA_ERR_UNSUPPORTED for any other width.
+ *   GEMV_RESIDUAL:       buf0 packed weights, buf1 FP32 x, buf2 FP32 out,
+ *                        buf3 FP32 residual; n={n_in,n_out,rows}; u[0]=dtype.
+ *                        Same shape rules as LM_HEAD; out = W x + residual, and
+ *                        out may alias the residual row.
+ *   GEMV_PAIR:           buf0 weights A, buf1 weights B, buf2 FP32 x,
+ *                        buf3 FP32 out A, buf4 FP32 out B;
+ *                        n={n_in,n_out_a,n_out_b}; u[0]=dtype (both matrices),
+ *                        u[2]=epilogue. Both matrices are walked over the same
+ *                        activation row in one launch, which is the decode
+ *                        counterpart of GEMM_SWIGLU and the projection merge of
+ *                        the decode plan. Epilogue 0 writes both rows;
+ *                        epilogue 1 requires n_out_a == n_out_b and writes
+ *                        silu(A x) * (B x) into out A with buf4 unused. u[1] must
+ *                        equal u[0]: a mixed-dtype pair is rejected, because a
+ *                        run-time dispatch inside the span loop is measured 60%
+ *                        slower than the templated decode.
+ *   CONV_L2NORM:         buf0 conv state, buf1 conv weights, buf2 qkv, buf3 out;
+ *                        n={channels,kernel,qk_channels,q_channels,state};
+ *                        f[0]=eps; f[1]=q scale. out receives the SiLU of the
+ *                        convolution, and its first qk_channels channels are
+ *                        then L2 normalized per group of state values, with
+ *                        q_scale applied to the first q_channels. channels and
+ *                        qk_channels must be multiples of 256 and state must be
+ *                        128; other shapes fail with YUUKA_ERR_UNSUPPORTED.
  *
  * Paged family. The block table is an int32 buffer with ceil(capacity/block_size)
  * entries mapping logical token positions to pool blocks. The pool holds

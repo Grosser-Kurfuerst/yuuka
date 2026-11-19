@@ -1,5 +1,6 @@
 #include "yuuka_hip.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -422,6 +423,246 @@ bool run_batch_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * 
     return ok;
 }
 
+// run_stream_case checks the streaming channel-parallel matvec, which the
+// decode graph selects for every shape the dispatch rule covers.
+// It compares one row block against the host dot product and against the
+// per-row GEMV on the same weights, so a change of summation order is the only
+// source of difference.
+bool run_stream_case(yuuka_device * device, yuuka_stream * stream,
+                     yuuka_event * event, yuuka_dtype dtype, const char * name,
+                     int64_t n_in, int64_t n_out, std::mt19937 & rng) {
+    if (n_in % 256 != 0) {
+        std::fprintf(stderr, "streaming case %s n_in=%lld is not a K step\n", name,
+                     static_cast<long long>(n_in));
+        return false;
+    }
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<size_t>(n_in));
+    for (float & value : x) value = xdist(rng);
+
+    Case tc;
+    if (!make_case(dtype, name, n_in, tc)) {
+        return false;
+    }
+    std::vector<uint8_t> weights(static_cast<size_t>(tc.row_bytes) * n_out);
+    std::vector<float> expected(n_out);
+    for (int64_t row = 0; row < n_out; ++row) {
+        uint8_t * base = weights.data() + row * tc.row_bytes;
+        fill_weights(base, tc.dtype, n_in, rng);
+        expected[row] = tc.ref(base, x.data(), n_in);
+    }
+
+    yuuka_buffer * wbuf = nullptr;
+    yuuka_buffer * xbuf = nullptr;
+    yuuka_buffer * obuf = nullptr;
+    yuuka_buffer * rbuf = nullptr;
+    bool ok = check(yuuka_buffer_alloc(device, weights.size(), &wbuf), "alloc weights") &&
+              check(yuuka_buffer_alloc(device, x.size() * 4, &xbuf), "alloc x") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &obuf), "alloc out") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &rbuf), "alloc per-row out") &&
+              check(yuuka_memcpy_h2d(wbuf, weights.data(), weights.size()), "h2d weights") &&
+              check(yuuka_memcpy_h2d(xbuf, x.data(), x.size() * 4), "h2d x");
+    if (ok) {
+        yuuka_plan * stream_plan = nullptr;
+        yuuka_plan * row_plan = nullptr;
+        ok = check(yuuka_plan_create(device, &stream_plan), "stream plan") &&
+             check(yuuka_plan_create(device, &row_plan), "row plan");
+        if (ok) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_LM_HEAD;
+            op.buf[0] = wbuf;
+            op.buf[1] = xbuf;
+            op.buf[2] = obuf;
+            op.n[0] = static_cast<uint64_t>(n_in);
+            op.n[1] = static_cast<uint64_t>(n_out);
+            op.n[2] = 1;
+            op.u[0] = static_cast<uint32_t>(tc.dtype);
+            ok = check(yuuka_plan_add(stream_plan, &op), "add streaming op");
+            yuuka_op row_op{};
+            row_op.code = YUUKA_OP_GEMV;
+            row_op.buf[0] = wbuf;
+            row_op.buf[1] = xbuf;
+            row_op.buf[2] = rbuf;
+            row_op.n[0] = static_cast<uint64_t>(n_in);
+            row_op.n[1] = static_cast<uint64_t>(n_out);
+            row_op.u[0] = static_cast<uint32_t>(tc.dtype);
+            ok = ok && check(yuuka_plan_add(row_plan, &row_op), "add per-row op");
+            ok = ok && check(yuuka_plan_execute(stream_plan, stream, 0, 0, 1, event),
+                             "execute streaming") &&
+                 check(yuuka_event_wait(event), "streaming event wait") &&
+                 check(yuuka_plan_execute(row_plan, stream, 0, 0, 1, event),
+                       "execute per-row") &&
+                 check(yuuka_event_wait(event), "per-row event wait");
+        }
+        if (stream_plan != nullptr) yuuka_plan_destroy(stream_plan);
+        if (row_plan != nullptr) yuuka_plan_destroy(row_plan);
+    }
+    std::vector<float> got(n_out);
+    std::vector<float> got_row(n_out);
+    ok = ok && check(yuuka_memcpy_d2h(got.data(), obuf, n_out * 4), "d2h") &&
+         check(yuuka_memcpy_d2h(got_row.data(), rbuf, n_out * 4), "d2h per-row");
+    float worst_ref = 0.0f;
+    float worst_row = 0.0f;
+    if (ok) {
+        for (int64_t row = 0; row < n_out; ++row) {
+            const float tolerance = 2e-3f * (1.0f + std::fabs(expected[row]));
+            const float ref_diff = std::fabs(got[row] - expected[row]);
+            const float row_diff = std::fabs(got[row] - got_row[row]);
+            worst_ref = std::max(worst_ref, ref_diff);
+            worst_row = std::max(worst_row, row_diff);
+            if (ref_diff > tolerance) {
+                std::fprintf(stderr, "%s n_in=%lld n_out=%lld row %lld: got %.6f"
+                             " expected %.6f\n", tc.name,
+                             static_cast<long long>(n_in), static_cast<long long>(n_out),
+                             static_cast<long long>(row), got[row], expected[row]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s n_in=%lld n_out=%lld streaming: %s (max |ref| %.3g,"
+                " max |per-row| %.3g)\n", tc.name,
+                static_cast<long long>(n_in), static_cast<long long>(n_out),
+                ok ? "ok" : "FAILED", worst_ref, worst_row);
+    yuuka_buffer_free(rbuf);
+    yuuka_buffer_free(obuf);
+    yuuka_buffer_free(xbuf);
+    yuuka_buffer_free(wbuf);
+    return ok;
+}
+
+// run_int8_case checks the int8 decode matvec. It
+// quantizes the activation with YUUKA_OP_QUANT_Q8_1 and compares the int8 result
+// against the FP32 streaming kernel on the same weights, which isolates the
+// arithmetic against an independent reference: the test downloads the Q8_1
+// digits and block scales the quantizer wrote, rebuilds the quantized activation
+// row, and dots it with the dequantized weights through the same host reference
+// the other cells use. That reference is exact, so the tolerance only covers the
+// association order of the per-block scale application (1e-3 relative). The
+// quantization error itself is a property of Q8_1, not of the kernel, and is
+// reported separately as the difference against the FP32 route.
+bool run_int8_case(yuuka_device * device, yuuka_stream * stream,
+                   yuuka_event * event, yuuka_dtype dtype, const char * name,
+                   int64_t n_in, int64_t n_out, std::mt19937 & rng) {
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<size_t>(n_in));
+    for (float & value : x) value = xdist(rng);
+    Case tc;
+    if (!make_case(dtype, name, n_in, tc)) {
+        return false;
+    }
+    std::vector<uint8_t> weights(static_cast<size_t>(tc.row_bytes) * n_out);
+    for (int64_t row = 0; row < n_out; ++row) {
+        fill_weights(weights.data() + row * tc.row_bytes, tc.dtype, n_in, rng);
+    }
+
+    yuuka_buffer * wbuf = nullptr;
+    yuuka_buffer * xbuf = nullptr;
+    yuuka_buffer * qsbuf = nullptr;
+    yuuka_buffer * dsbuf = nullptr;
+    yuuka_buffer * refbuf = nullptr;
+    yuuka_buffer * int8buf = nullptr;
+    bool ok = check(yuuka_buffer_alloc(device, weights.size(), &wbuf), "alloc weights") &&
+              check(yuuka_buffer_alloc(device, x.size() * 4, &xbuf), "alloc x") &&
+              check(yuuka_buffer_alloc(device, n_in, &qsbuf), "alloc q8 digits") &&
+              check(yuuka_buffer_alloc(device, (n_in / 32) * 8, &dsbuf), "alloc q8 scales") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &refbuf), "alloc ref") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &int8buf), "alloc int8") &&
+              check(yuuka_memcpy_h2d(wbuf, weights.data(), weights.size()), "h2d weights") &&
+              check(yuuka_memcpy_h2d(xbuf, x.data(), x.size() * 4), "h2d x");
+    if (ok) {
+        yuuka_plan * ref_plan = nullptr;
+        yuuka_plan * int8_plan = nullptr;
+        ok = check(yuuka_plan_create(device, &ref_plan), "ref plan") &&
+             check(yuuka_plan_create(device, &int8_plan), "int8 plan");
+        if (ok) {
+            yuuka_op quant{};
+            quant.code = YUUKA_OP_QUANT_Q8_1;
+            quant.buf[0] = xbuf;
+            quant.buf[1] = qsbuf;
+            quant.buf[2] = dsbuf;
+            quant.n[0] = static_cast<uint64_t>(n_in);
+            quant.n[1] = 1;
+            ok = check(yuuka_plan_add(int8_plan, &quant), "add quantize");
+            yuuka_op ref{};
+            ref.code = YUUKA_OP_LM_HEAD;
+            ref.buf[0] = wbuf;
+            ref.buf[1] = xbuf;
+            ref.buf[2] = refbuf;
+            ref.n[0] = static_cast<uint64_t>(n_in);
+            ref.n[1] = static_cast<uint64_t>(n_out);
+            ref.n[2] = 1;
+            ref.u[0] = static_cast<uint32_t>(tc.dtype);
+            ok = ok && check(yuuka_plan_add(ref_plan, &ref), "add fp32 reference");
+            yuuka_op i8{};
+            i8.code = YUUKA_OP_GEMV_Q8_1;
+            i8.buf[0] = wbuf;
+            i8.buf[1] = qsbuf;
+            i8.buf[2] = dsbuf;
+            i8.buf[3] = int8buf;
+            i8.n[0] = static_cast<uint64_t>(n_in);
+            i8.n[1] = static_cast<uint64_t>(n_out);
+            i8.u[0] = static_cast<uint32_t>(tc.dtype);
+            ok = ok && check(yuuka_plan_add(int8_plan, &i8), "add int8 op");
+            ok = ok && check(yuuka_plan_execute(ref_plan, stream, 0, 0, 1, event),
+                             "execute reference") &&
+                 check(yuuka_event_wait(event), "reference event wait") &&
+                 check(yuuka_plan_execute(int8_plan, stream, 0, 0, 1, event),
+                       "execute int8") &&
+                 check(yuuka_event_wait(event), "int8 event wait");
+        }
+        if (ref_plan != nullptr) yuuka_plan_destroy(ref_plan);
+        if (int8_plan != nullptr) yuuka_plan_destroy(int8_plan);
+    }
+    std::vector<float> ref_out(n_out);
+    std::vector<float> int8_out(n_out);
+    std::vector<int8_t> digits(static_cast<size_t>(n_in));
+    std::vector<float> scales(static_cast<size_t>(n_in / 32) * 2);
+    ok = ok && check(yuuka_memcpy_d2h(ref_out.data(), refbuf, n_out * 4), "d2h ref") &&
+         check(yuuka_memcpy_d2h(int8_out.data(), int8buf, n_out * 4), "d2h int8") &&
+         check(yuuka_memcpy_d2h(digits.data(), qsbuf, n_in), "d2h digits") &&
+         check(yuuka_memcpy_d2h(scales.data(), dsbuf, (n_in / 32) * 8), "d2h scales");
+    // Rebuild the activation the kernel actually multiplies: block scale times
+    // digit, exactly as the quantizer wrote them.
+    std::vector<float> xq(static_cast<size_t>(n_in));
+    for (int64_t i = 0; i < n_in; ++i) {
+        xq[i] = scales[(i / 32) * 2] * static_cast<float>(digits[i]);
+    }
+    float worst = 0.0f;
+    float worst_quant = 0.0f;
+    if (ok) {
+        for (int64_t row = 0; row < n_out; ++row) {
+            const float want = tc.ref(weights.data() + row * tc.row_bytes, xq.data(), n_in);
+            const float tolerance = 1e-3f * (1.0f + std::fabs(want));
+            const float diff = std::fabs(int8_out[row] - want);
+            worst = std::max(worst, diff / (1.0f + std::fabs(want)));
+            worst_quant = std::max(worst_quant,
+                                   std::fabs(int8_out[row] - ref_out[row]) /
+                                       (1.0f + std::fabs(ref_out[row])));
+            if (diff > tolerance) {
+                std::fprintf(stderr, "%s n_in=%lld n_out=%lld row %lld: int8 %.6f"
+                             " reference %.6f (fp32 route %.6f)\n", tc.name,
+                             static_cast<long long>(n_in), static_cast<long long>(n_out),
+                             static_cast<long long>(row), int8_out[row], want,
+                             ref_out[row]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s n_in=%lld n_out=%lld int8: %s (worst %.3g vs quantized reference,"
+                " %.3g vs fp32 route)\n", tc.name, static_cast<long long>(n_in),
+                static_cast<long long>(n_out), ok ? "ok" : "FAILED", worst,
+                worst_quant);
+    yuuka_buffer_free(int8buf);
+    yuuka_buffer_free(refbuf);
+    yuuka_buffer_free(dsbuf);
+    yuuka_buffer_free(qsbuf);
+    yuuka_buffer_free(xbuf);
+    yuuka_buffer_free(wbuf);
+    return ok;
+}
+
 int main() {
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
@@ -487,6 +728,43 @@ int main() {
     ok = ok && run_batch_case(device, stream, event, YUUKA_DTYPE_Q6_K,
                               "Q6_K large-K", 9216, 2560, 2, rng);
 
+    // The streaming family serves the whole decode matvec set, so it is checked
+    // for every dtype, at the K-step widths the model uses, at output counts
+    // that leave a partial final block, and against the per-row GEMV.
+    const int64_t stream_widths[] = {256, 512, 768, 2560};
+    const int64_t stream_outputs[] = {1, 5, 33, 129, 1024};
+    const struct { yuuka_dtype dtype; const char * name; } stream_dtypes[] = {
+        {YUUKA_DTYPE_F32, "F32"}, {YUUKA_DTYPE_F16, "F16"},
+        {YUUKA_DTYPE_Q4_0, "Q4_0"}, {YUUKA_DTYPE_Q5_0, "Q5_0"},
+        {YUUKA_DTYPE_Q8_0, "Q8_0"}, {YUUKA_DTYPE_Q4_K, "Q4_K"},
+        {YUUKA_DTYPE_Q5_K, "Q5_K"}, {YUUKA_DTYPE_Q6_K, "Q6_K"},
+    };
+    for (const auto & item : stream_dtypes) {
+        for (int64_t width : stream_widths) {
+            for (int64_t outputs : stream_outputs) {
+                ok = ok && run_stream_case(device, stream, event, item.dtype,
+                                           item.name, width, outputs, rng);
+            }
+        }
+    }
+
+    // The int8 route covers the K-quants and Q8_0 at one row; it is compared
+    // against the FP32 streaming kernel on the same digits' worth of weights.
+    const int64_t int8_widths[] = {256, 512, 2560};
+    const int64_t int8_outputs[] = {1, 33, 129};
+    const struct { yuuka_dtype dtype; const char * name; } int8_dtypes[] = {
+        {YUUKA_DTYPE_Q4_K, "Q4_K"}, {YUUKA_DTYPE_Q5_K, "Q5_K"},
+        {YUUKA_DTYPE_Q6_K, "Q6_K"}, {YUUKA_DTYPE_Q8_0, "Q8_0"},
+    };
+    for (const auto & item : int8_dtypes) {
+        for (int64_t width : int8_widths) {
+            for (int64_t outputs : int8_outputs) {
+                ok = ok && run_int8_case(device, stream, event, item.dtype, item.name,
+                                         width, outputs, rng);
+            }
+        }
+    }
+
     yuuka_buffer * dummy = nullptr;
     if (ok && check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {
         const struct { yuuka_dtype dtype; uint64_t width; } invalid[] = {
@@ -506,6 +784,27 @@ int main() {
                        YUUKA_DTYPE_Q8_0, nullptr) != YUUKA_ERR_INVALID_ARGUMENT) {
             std::fprintf(stderr, "overflowing output width was not rejected\n");
             ok = false;
+        }
+        // A width that is not a K step cannot be served by the streaming family;
+        // the plan must reject it so dispatch falls back to the per-row GEMV.
+        for (uint64_t width : {32ull, 288ull, 544ull}) {
+            yuuka_plan * plan = nullptr;
+            if (!check(yuuka_plan_create(device, &plan), "plan create")) break;
+            yuuka_op op{};
+            op.code = YUUKA_OP_LM_HEAD;
+            op.buf[0] = dummy;
+            op.buf[1] = dummy;
+            op.buf[2] = dummy;
+            op.n[0] = width;
+            op.n[1] = 4;
+            op.n[2] = 1;
+            op.u[0] = YUUKA_DTYPE_Q8_0;
+            if (yuuka_plan_add(plan, &op) == YUUKA_OK) {
+                std::fprintf(stderr, "streaming width %llu that is not a K step was"
+                             " accepted\n", static_cast<unsigned long long>(width));
+                ok = false;
+            }
+            yuuka_plan_destroy(plan);
         }
 
         // Plan construction must reject unsupported dtype/shape combinations

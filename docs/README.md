@@ -17,8 +17,8 @@ treated as format and correctness references only.
 > Q4_0/Q5_0 tensors, and a CPU reference path for `qwen35moe` with
 > IQ2_XXS/IQ2_S/IQ3_S tensor support. NPU support is a
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
-> and does not execute model operations. All first-release success criteria in
-> [roadmap.md](roadmap.md) are met, including the 128/256-token decode matrix in
+> and does not execute model operations. All first-release success criteria are
+> met, including the 128/256-token decode matrix in
 > [benchmarks.md](benchmarks.md). See the implementation status below,
 > [npu.md](npu.md), [hardware.md](hardware.md), and
 > [benchmarks.md](benchmarks.md).
@@ -87,9 +87,6 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
-| [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
-| [roadmap2.md](roadmap2.md) | Ordered prefill optimization plan: measured attribution, workstreams, gates, and references | Kernel and performance contributors |
-| [roadmap3.md](roadmap3.md) | Prefill gap closure plan against the llama.cpp reference: 2026-11-18 attribution, stages S0-S4, gates, and rejected routes | Kernel and performance contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
@@ -126,8 +123,10 @@ Implemented and tested:
 - rocWMMA FP16 and quantized prefill GEMM with measured 64x64 and 32x64 tile
   selection, an int8 MMQ route for K-quant weights (Q8_1 activations, exact
   int32 WMMA accumulation, FP32 scales), a fused gate/up SwiGLU kernel, a
-  streaming LM head that reads the output matrix once per row block of up to
-  16 rows, a
+  streaming channel-parallel matvec that reads each packed weight row once, serves
+  the decode matvec family and both output projections (one wave per four output
+  channels, LDS-staged activation, wave reduction) with an opt-in int8 variant
+  over Q8_1 activations that is measured slower and stays off, a
   rocBLAS FP16 baseline, causal paged
   prefill attention with an FP16 MMA kernel for F32 and F16 pools (four query
   heads per workgroup, 16-key tiles, FP32 online softmax) and a tiled fallback
@@ -137,13 +136,20 @@ Implemented and tested:
   resident for the whole chunk. With the int8 MMQ prefill GEMM the 512-token
   prefill rate is 1324 tok/s, up from 313 tok/s before the delta-net and GEMM
   work, and position-7680 attention dropped from 2030 ms to 643 ms; the
-  measured status is in [roadmap2.md](roadmap2.md).
+  measured status is in [benchmarks.md](benchmarks.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
-  The CLI and server select it with `--backend hip` when built with
-  `-tags hip`.
+  Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm
+  kernel and one per-token state kernel that keeps a head's 128x128 state in
+  registers and folds in the gated RMSNorm), which took the 24 recurrent layers
+  from 8.18 ms to 0.79 ms of the decode step; the unfused operators stay
+  reachable through `Options.LegacyDeltaNet`. The CLI and server select HIP with
+  `--backend hip` when built with `-tags hip`.
 - Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
-  event profile path, and per-quantization/per-batch decode baselines.
+  event profile path, and per-quantization/per-batch decode baselines. The decode
+  matvec carries two plan-selected fusions: the residual add in its epilogue and
+  a two-matrix form that forms the gate/up pair and its SwiGLU product in one
+  launch, which removed 128 operations from a decode step.
 - CPU reference dequantization and matrix-vector products for `IQ2_XXS`,
   `IQ2_S`, and `IQ3_S`, validated against ggml's dequantizers on blocks from
   Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf. HIP kernels for these IQ types are not
@@ -202,15 +208,16 @@ Other architectures are rejected at load time.
 ## Reading paths
 
 - **New contributor:** [README](README.md) → [architecture](architecture.md) →
-  the document for your area → [roadmap](roadmap.md).
-- **Hardware bring-up:** [hardware](hardware.md) → [roadmap Phase 0](roadmap.md#3-phase-0--bootstrap-and-hardware-validation).
+  the document for your area → [testing](testing.md).
+- **Hardware bring-up:** [hardware](hardware.md) → [benchmarks](benchmarks.md) →
+  [testing](testing.md).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
-  [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode) →
+  [benchmarks](benchmarks.md) →
   [Qwen prefill implementation plan](prefill-optimization/README.md).
 - **Runtime/service work:** [architecture](architecture.md) →
-  [serving](serving.md) → [roadmap Phase 4](roadmap.md#7-phase-4--multi-request-serving).
+  [serving](serving.md) → [benchmarks](benchmarks.md).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →
-  [roadmap Phase 1](roadmap.md#4-phase-1--minimal-inference-loop).
+  [architecture](architecture.md).
 
 ## Glossary
 

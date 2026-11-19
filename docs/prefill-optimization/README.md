@@ -11,8 +11,7 @@ MoE, need their own supported runtime and measurements.
 index. The matched-input tuned comparison cleared the 5% margin at 512,
 2048 and 8192 tokens. The 128-token result was within 1% of the reference.
 The measurements at `bfd36c0` are the starting point for this plan.
-The earlier experiments and rejected variants are recorded in the
-[previous roadmap](../roadmap3.md).
+See the [earlier experiments and rejected variants](../benchmarks.md#decisions-and-rejected-routes).
 
 ## Document index
 

@@ -66,7 +66,7 @@ Therefore:
 - Do not claim later-phase behavior or performance that has no checked-in
   evidence.
 - The default starting point for new work is the first incomplete item in the
-  roadmap, unless the user assigns a specific slice.
+  phase order of section 8, unless the user assigns a specific slice.
 
 ## 4. Source-of-truth documents
 
@@ -78,13 +78,12 @@ Therefore:
 | Scheduler, KV cache, HIP Graph, API, observability | [docs/serving.md](docs/serving.md) |
 | Correctness strategy, test matrix, benchmarks, regression gates | [docs/testing.md](docs/testing.md) |
 | Deferred NPU strategy and interface reservations | [docs/npu.md](docs/npu.md) |
-| Phases, deliverables, exit criteria, risks | [docs/roadmap.md](docs/roadmap.md) |
 | Documentation index, goals, non-goals, glossary | [docs/README.md](docs/README.md) |
 
 Precedence:
 
 1. For a concrete API or behavioral contract, the document for that area wins.
-2. For implementation order and acceptance, `docs/roadmap.md` and
+2. For implementation order and acceptance, section 8 of this file and
    `docs/testing.md` win.
 3. For process and language policy, this file wins.
 4. If a contract is missing or contradictory, stop and resolve it in the
@@ -160,7 +159,7 @@ yuuka/
 ├── kernels/hip/               # Device kernels by operator family
 ├── bench/                     # Benchmark harnesses
 ├── tests/                     # Integration and golden tests
-├── docs/                      # Design and roadmap documents
+├── docs/                      # Design documents
 ├── scripts/                   # Toolchain, fixture, and CI helpers
 ├── CMakeLists.txt
 └── go.mod
@@ -175,8 +174,8 @@ Dependency direction:
 
 ## 8. Phase discipline
 
-Implement in roadmap order. A phase may be explored early, but it must not be
-declared complete before its exit criteria are met.
+Implement in the phase order of this section. A phase may be explored early,
+but it must not be declared complete before its exit criteria are met.
 
 | Phase | Focus | Do not claim complete without |
 | --- | --- | --- |
@@ -412,7 +411,7 @@ non-aligned shapes.
 ```
 
 - Reference the affected document or phase when the change implements a
-  roadmap item.
+  phase deliverable.
 - Do not commit model weights, benchmark datasets, secrets, build outputs, or
   large generated artifacts.
 - Do not rewrite shared history or force-push unless the user explicitly asks.
@@ -450,7 +449,7 @@ remains reachable. Do not silently reduce scope.
 - Changing a documented tolerance without evidence and review.
 - Claiming performance results without the required benchmark metadata.
 - Adding NPU, distributed, multi-GPU, training, or general graph-compiler work
-  before the roadmap phase permits it.
+  before the current phase permits it.
 - Holding a scheduler lock while waiting on the GPU.
 - Passing Go pointers into asynchronous HIP work.
 - Committing model files, build outputs, credentials, or generated logs.

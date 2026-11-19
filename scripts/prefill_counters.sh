@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Reproduce the prefill counter attribution of docs/roadmap3.md section 2.4.
+# Reproduce the prefill counter attribution of docs/benchmarks.md.
 #
-# Stage S0 tooling: run build/yuuka_prefill_sweep under rocprofv3 with the
+# Run build/yuuka_prefill_sweep under rocprofv3 with the
 # instruction counters and again with the stall/occupancy counters, optionally
 # trace a llama.cpp reference run, and reduce both databases to the per-MMA
 # table. The reduction pairs gemm_mmq dispatches with sweep cells in submission
@@ -26,7 +26,7 @@ sweep="${build}/yuuka_prefill_sweep"
 library="${build}/libyuuka_hip.so"
 reducer="${root}/scripts/prefill_counters.py"
 
-# docs/roadmap3.md section 2.1: the attribution is only comparable against this
+# The attribution is only comparable against this
 # model and this device.
 recorded_model_sha256="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 expected_target="${YUUKA_GPU_TARGET:-gfx1151}"
@@ -40,7 +40,7 @@ usage() {
     cat <<'EOF'
 usage: prefill_counters.sh [options]
 
-Collect and reduce the roadmap3 section 2.4 per-MMA prefill counters.
+Collect and reduce the per-MMA prefill counters.
 
   --model PATH        GGUF used for the reference run. Its SHA-256 must match
                       the recorded attribution hash. Defaults to

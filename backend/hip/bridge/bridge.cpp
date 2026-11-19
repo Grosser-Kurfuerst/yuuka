@@ -346,6 +346,204 @@ yuuka_status validate_lm_head_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// validate_gemv_i8_plan_op checks an int8 decode matvec: weights, the Q8_1
+// digits and block scales of the activation, and one FP32 output row.
+// check_stream_matvec_shapes applies the LM_HEAD shape rules that the two fused
+// streaming forms share: a packed dtype the kernel implements, a 256-aligned
+// input width, a bounded row block, 16-byte aligned offsets, and the derived
+// buffer sizes.
+struct stream_matvec_sizes {
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+};
+
+yuuka_status check_stream_matvec_shapes(const yuuka_op & op, uint64_t max_rows,
+                                        stream_matvec_sizes * sizes) {
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t rows = op.n[2];
+    if (!check_gemv_shapes(n_in, op.u[0]) || n_in % 256 != 0) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported dtype %u or input width %llu",
+                    op.u[0], static_cast<unsigned long long>(n_in));
+    }
+    if (n_out == 0 || rows == 0 || rows > max_rows) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid output width %llu or row block %llu",
+                    static_cast<unsigned long long>(n_out),
+                    static_cast<unsigned long long>(rows));
+    }
+    for (int i = 0; i < 4; ++i) {
+        if ((op.off[i] % 16) != 0) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "stream matvec offsets must be"
+                                                   " 16-byte aligned");
+        }
+    }
+    uint64_t row_bytes = 0;
+    if (!checked_row_bytes(n_in, op.u[0], &row_bytes) ||
+        __builtin_mul_overflow(row_bytes, n_out, &sizes->weight_bytes) ||
+        __builtin_mul_overflow(n_in, rows * uint64_t(sizeof(float)), &sizes->input_bytes) ||
+        __builtin_mul_overflow(n_out, rows * uint64_t(sizeof(float)),
+                               &sizes->output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "stream matvec dimensions overflow");
+    }
+    sizes->row_bytes = row_bytes;
+    return YUUKA_OK;
+}
+
+// validate_gemv_residual_plan_op checks the streaming matvec with the residual
+// epilogue: buf0 weights, buf1 x, buf2 out, buf3 residual. out may alias the
+// residual row, so both ranges are checked independently.
+yuuka_status validate_gemv_residual_plan_op(const yuuka_op & op) {
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv residual buffer %d is null", i);
+        }
+    }
+    stream_matvec_sizes sizes;
+    yuuka_status status = check_stream_matvec_shapes(op, 16, &sizes);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], sizes.weight_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], sizes.input_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], sizes.output_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], sizes.output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv residual buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_gemv_pair_plan_op checks the two-matrix streaming form: buf0 and buf1
+// are packed matrices that may differ in dtype and width, buf2 is the shared
+// activation row, and buf3/buf4 are their outputs. Epilogue 0 writes both rows;
+// epilogue 1 is the SwiGLU product, which needs equal widths and leaves buf4
+// unused.
+yuuka_status validate_gemv_pair_plan_op(const yuuka_op & op) {
+    const uint64_t n_out_a = op.n[1];
+    const uint64_t n_out_b = op.n[2];
+    const uint32_t epilogue = op.u[2];
+    if (epilogue > 1) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "unknown gemv pair epilogue %u", epilogue);
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv pair buffer %d is null", i);
+        }
+    }
+    if (epilogue == 1 && (n_out_a != n_out_b || op.buf[4] != nullptr)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "gemv swiglu pair needs equal widths and no second output");
+    }
+    if (epilogue == 0 && op.buf[4] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv pair buffer 4 is null");
+    }
+    const uint64_t n_in = op.n[0];
+    if (!check_gemv_shapes(n_in, op.u[0]) || n_in % 256 != 0) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemv pair dtype %u or input"
+                                          " width %llu",
+                    op.u[0], static_cast<unsigned long long>(n_in));
+    }
+    if (op.u[1] != 0 && op.u[1] != op.u[0]) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "gemv pair needs one dtype for both matrices, got %u and %u",
+                    op.u[0], op.u[1]);
+    }
+    if (n_out_a == 0 || n_out_b == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid gemv pair output widths");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if ((op.off[i] % 16) != 0) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "gemv pair offsets must be 16-byte aligned");
+        }
+    }
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes_a = 0;
+    uint64_t weight_bytes_b = 0;
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes_a = 0;
+    uint64_t output_bytes_b = 0;
+    if (!checked_row_bytes(n_in, op.u[0], &row_bytes) ||
+        __builtin_mul_overflow(row_bytes, n_out_a, &weight_bytes_a) ||
+        __builtin_mul_overflow(row_bytes, n_out_b, &weight_bytes_b) ||
+        __builtin_mul_overflow(n_in, uint64_t(sizeof(float)), &input_bytes) ||
+        __builtin_mul_overflow(n_out_a, uint64_t(sizeof(float)), &output_bytes_a) ||
+        __builtin_mul_overflow(n_out_b, uint64_t(sizeof(float)), &output_bytes_b)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv pair dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes_a) ||
+        !buffer_range_ok(op.buf[1], op.off[1], weight_bytes_b) ||
+        !buffer_range_ok(op.buf[2], op.off[2], input_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], output_bytes_a) ||
+        (epilogue == 0 && !buffer_range_ok(op.buf[4], op.off[4], output_bytes_b))) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv pair buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_gemv_i8_plan_op(const yuuka_op & op) {
+    const uint32_t source = op.u[1];
+    if (source > 1) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "unknown int8 gemv activation source %u",
+                    source);
+    }
+    // The output always lives in buf[3]; the fused form leaves buf[2] unused.
+    for (int i = 0; i < 4; ++i) {
+        if (i == 2 && source == 1) {
+            continue;
+        }
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv buffer %d is null", i);
+        }
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint32_t dtype = op.u[0];
+    if (n_in == 0 || n_out == 0 || n_in % 256 != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid int8 gemv shape %llu -> %llu",
+                    static_cast<unsigned long long>(n_in),
+                    static_cast<unsigned long long>(n_out));
+    }
+    const bool k_quant = dtype == YUUKA_DTYPE_Q4_K || dtype == YUUKA_DTYPE_Q5_K ||
+                         dtype == YUUKA_DTYPE_Q6_K;
+    if (!k_quant && dtype != YUUKA_DTYPE_Q8_0) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported int8 gemv dtype %u", dtype);
+    }
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t digit_bytes = 0;
+    uint64_t scale_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (!checked_row_bytes(n_in, dtype, &row_bytes) ||
+        __builtin_mul_overflow(row_bytes, n_out, &weight_bytes) ||
+        __builtin_mul_overflow(n_in, uint64_t(1), &digit_bytes) ||
+        __builtin_mul_overflow(n_in / 32, uint64_t(2 * sizeof(float)), &scale_bytes) ||
+        __builtin_mul_overflow(n_out, uint64_t(sizeof(float)), &out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv weight buffer is too small");
+    }
+    if (source == 0) {
+        if (!buffer_range_ok(op.buf[1], op.off[1], digit_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv digit buffer is too small");
+        }
+        if (!buffer_range_ok(op.buf[2], op.off[2], scale_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv scale buffer is too small");
+        }
+    } else if (!buffer_range_ok(op.buf[1], op.off[1], n_in * sizeof(float))) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "int8 gemv activation buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[3], op.off[3], out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "int8 gemv output buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 // validate_gemm_plan_op checks a prefill GEMM operation. Path AUTO and WMMA
 // read FP32 activations and accept every supported weight dtype. Path BLAS is
 // the rocBLAS FP16 baseline and therefore requires FP16 activations.
@@ -1331,6 +1529,105 @@ yuuka_status validate_gdn_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// validate_recurrent_token_plan_op checks the fused per-token delta-net
+// operator. The register-resident kernel is compiled for a 128-wide state, so
+// any other width is unsupported rather than silently routed elsewhere.
+yuuka_status validate_recurrent_token_plan_op(const yuuka_op & op) {
+    const uint64_t groups = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t state_size = op.n[2];
+    if (groups == 0 || heads == 0 || groups > heads) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid recurrent token dimensions");
+    }
+    if (state_size != 128) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "recurrent token supports a 128-wide state, got %llu",
+                    static_cast<unsigned long long>(state_size));
+    }
+    for (int i = 0; i < 11; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent token buffer %d is null", i);
+        }
+    }
+    uint64_t state_elements = 0;
+    uint64_t group_elements = 0;
+    uint64_t head_elements = 0;
+    uint64_t state_bytes = 0;
+    uint64_t group_bytes = 0;
+    uint64_t row_bytes = 0;
+    uint64_t param_bytes = 0;
+    uint64_t state_weight_bytes = 0;
+    if (__builtin_mul_overflow(heads, state_size, &state_elements) ||
+        __builtin_mul_overflow(state_elements, state_size, &state_elements) ||
+        __builtin_mul_overflow(groups, state_size, &group_elements) ||
+        __builtin_mul_overflow(heads, state_size, &head_elements) ||
+        !checked_float_bytes(state_elements, &state_bytes) ||
+        !checked_float_bytes(group_elements, &group_bytes) ||
+        !checked_float_bytes(head_elements, &row_bytes) ||
+        !checked_float_bytes(heads, &param_bytes) ||
+        !checked_float_bytes(op.n[2], &state_weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent token dimensions overflow");
+    }
+    const uint64_t bytes[11] = {state_bytes, group_bytes, group_bytes, row_bytes,
+                                param_bytes, param_bytes, param_bytes, param_bytes,
+                                row_bytes,  state_weight_bytes, row_bytes};
+    const uint64_t offsets[11] = {op.off[0], op.off[1], op.off[2], op.off[3], 0, 0,
+                                  0, 0, op.off[8], 0, 0};
+    for (int i = 0; i < 11; ++i) {
+        if (!buffer_range_ok(op.buf[i], offsets[i], bytes[i])) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent token buffer %d is too small",
+                        i);
+        }
+    }
+    return YUUKA_OK;
+}
+
+// validate_conv_l2norm_plan_op checks the fused convolution and L2 norm. The
+// kernel normalizes whole 128-value groups inside a 256-channel block, so a
+// shape whose groups would cross a block boundary is unsupported.
+yuuka_status validate_conv_l2norm_plan_op(const yuuka_op & op) {
+    const uint64_t channels = op.n[0];
+    const uint64_t kernel = op.n[1];
+    const uint64_t qk_channels = op.n[2];
+    const uint64_t q_channels = op.n[3];
+    const uint64_t state = op.n[4];
+    if (channels == 0 || kernel < 2 || qk_channels > channels) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid conv L2Norm dimensions");
+    }
+    if (state != 128) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "conv L2Norm supports a 128-wide norm group, got %llu",
+                    static_cast<unsigned long long>(state));
+    }
+    if (channels % 256 != 0 || qk_channels % 256 != 0 || q_channels % state != 0 ||
+        q_channels > qk_channels) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "conv L2Norm requires 256-aligned channels and whole norm groups");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "conv L2Norm buffer %d is null", i);
+        }
+    }
+    uint64_t state_elements = 0;
+    uint64_t weight_elements = 0;
+    uint64_t state_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t channel_bytes = 0;
+    if (__builtin_mul_overflow(channels, kernel - 1, &state_elements) ||
+        __builtin_mul_overflow(channels, kernel, &weight_elements) ||
+        !checked_float_bytes(state_elements, &state_bytes) ||
+        !checked_float_bytes(weight_elements, &weight_bytes) ||
+        !checked_float_bytes(channels, &channel_bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], state_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], weight_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], channel_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], channel_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "conv L2Norm buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 yuuka_status validate_elementwise_plan_op(const yuuka_op & op, int buffers) {
     const uint64_t count = op.n[0];
     if (count == 0) {
@@ -1755,6 +2052,19 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             }
             break;
         }
+        case YUUKA_OP_GEMV_Q8_1: {
+            if (op.u[1] == 0) {
+                yuuka::launch_gemv_i8_f32out(
+                    op_ptr<float>(op, 3), op_ptr<const void>(op, 1),
+                    op_ptr<const void>(op, 2), op_ptr<const void>(op, 0), op.n[0],
+                    op.n[1], op.u[0], stream);
+            } else {
+                yuuka::launch_gemv_i8_fused_f32out(
+                    op_ptr<float>(op, 3), op_ptr<const float>(op, 1),
+                    op_ptr<const void>(op, 0), op.n[0], op.n[1], op.u[0], stream);
+            }
+            break;
+        }
         case YUUKA_OP_GEMV_BATCH: {
             yuuka_status status = launch_gemv_batch_dispatch(op, stream);
             if (status != YUUKA_OK) {
@@ -1921,6 +2231,47 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                                      op_ptr<const float>(op, 2),
                                      op_ptr<float>(op, 3),
                                      int(op.n[0]), int(op.n[1]), stream);
+            break;
+        case YUUKA_OP_GEMV_RESIDUAL:
+            yuuka::launch_lm_head_residual_f32out(op_ptr<float>(op, 2),
+                                                  op_ptr<const float>(op, 1),
+                                                  op_ptr<const void>(op, 0),
+                                                  op_ptr<const float>(op, 3),
+                                                  op.n[0], op.n[1], op.n[2], op.u[0],
+                                                  stream);
+            break;
+        case YUUKA_OP_GEMV_PAIR:
+            yuuka::launch_lm_head_pair_f32out(op_ptr<float>(op, 3),
+                                              op_ptr<float>(op, 4),
+                                              op_ptr<const float>(op, 2),
+                                              op_ptr<const void>(op, 0),
+                                              op_ptr<const void>(op, 1), op.n[0],
+                                              op.n[1], op.n[2], op.u[0],
+                                              int(op.u[2]), stream);
+            break;
+        case YUUKA_OP_RECURRENT_TOKEN:
+            yuuka::launch_recurrent_token_f32(
+                op_ptr<float>(op, 0),
+                op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2),
+                op_ptr<const float>(op, 3),
+                op_ptr<const float>(op, 4),
+                op_ptr<const float>(op, 5),
+                op_ptr<const float>(op, 6),
+                op_ptr<const float>(op, 7),
+                op_ptr<float>(op, 8),
+                op_ptr<const float>(op, 9),
+                op_ptr<const float>(op, 10),
+                int(op.n[0]), int(op.n[1]), op.f[0], stream);
+            break;
+        case YUUKA_OP_CONV_L2NORM:
+            yuuka::launch_conv_l2norm_f32(
+                op_ptr<float>(op, 0),
+                op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2),
+                op_ptr<float>(op, 3),
+                int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]), op.f[0],
+                op.f[1], stream);
             break;
         case YUUKA_OP_GDN:
             yuuka::launch_gdn_f32(
@@ -3237,6 +3588,21 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_LM_HEAD:
                 status = validate_lm_head_plan_op(*op);
+                break;
+            case YUUKA_OP_GEMV_Q8_1:
+                status = validate_gemv_i8_plan_op(*op);
+                break;
+            case YUUKA_OP_RECURRENT_TOKEN:
+                status = validate_recurrent_token_plan_op(*op);
+                break;
+            case YUUKA_OP_CONV_L2NORM:
+                status = validate_conv_l2norm_plan_op(*op);
+                break;
+            case YUUKA_OP_GEMV_RESIDUAL:
+                status = validate_gemv_residual_plan_op(*op);
+                break;
+            case YUUKA_OP_GEMV_PAIR:
+                status = validate_gemv_pair_plan_op(*op);
                 break;
             case YUUKA_OP_KV_WRITE_PAGED:
                 status = validate_kv_write_paged_plan_op(*op, false);

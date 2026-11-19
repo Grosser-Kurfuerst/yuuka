@@ -34,8 +34,8 @@ func TestAddGemvRejectsUndersizedBuffer(t *testing.T) {
 	if err := plan.AddGemv(w, x, out, 256, 4, tensor.Q4_K); err == nil {
 		t.Fatal("undersized weight buffer was accepted")
 	}
-	if plan.Ops() != 0 {
-		t.Fatalf("rejected operation was added: %d", plan.Ops())
+	if plan.OpCount() != 0 {
+		t.Fatalf("rejected operation was added: %d", plan.OpCount())
 	}
 }
 

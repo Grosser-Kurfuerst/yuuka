@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 8
+const RequiredABI = 9
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -118,6 +118,17 @@ func (d *Device) Alloc(bytes uint64) (*Buffer, error) {
 
 // Bytes returns the allocation size.
 func (b *Buffer) Bytes() uint64 { return b.bytes }
+
+// ID returns a process-local identity for the allocation. Diagnostic tooling
+// uses it to match a planned operation slot (OpInfo.Bufs) to the buffer it
+// reads; the value must not be dereferenced and becomes meaningless once the
+// buffer is freed.
+func (b *Buffer) ID() uintptr {
+	if b == nil || b.ptr == nil {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(b.ptr))
+}
 
 // Close releases the allocation exactly once.
 func (b *Buffer) Close() error {
@@ -349,12 +360,13 @@ func statusError(st C.yuuka_status, what string) error {
 	return fmt.Errorf("hip: %s: %s", what, message)
 }
 
-// Plan batches generic device operations into one submission.
+// Plan batches generic device operations into one submission. It keeps a
+// Go-side shadow of the operations it added so diagnostics can name them.
 type Plan struct {
 	ptr    *C.yuuka_plan
 	device *Device
 	tail   bool
-	ops    int
+	ops    []OpInfo
 }
 
 func (d *Device) NewPlan() (*Plan, error) {
@@ -382,7 +394,24 @@ func (p *Plan) add(op C.yuuka_op) error {
 	if err := status(C.yuuka_plan_add(p.ptr, &op), "plan_add"); err != nil {
 		return err
 	}
-	p.ops++
+	info := OpInfo{
+		Index: len(p.ops),
+		Code:  uint32(op.code),
+		Flags: uint32(op.flags),
+		Roles: opRoles(uint32(op.code)),
+	}
+	for i := range info.N {
+		info.N[i] = int64(op.n[i])
+	}
+	for i := range info.U {
+		info.U[i] = uint32(op.u[i])
+	}
+	for i := range info.Bufs {
+		if op.buf[i] != nil {
+			info.Bufs[i] = uintptr(unsafe.Pointer(op.buf[i]))
+		}
+	}
+	p.ops = append(p.ops, info)
 	return nil
 }
 
@@ -649,6 +678,141 @@ func (p *Plan) AddGDNAt(state, q *Buffer, qOff uint64, k *Buffer, kOff uint64, v
 	op.n[0] = C.uint64_t(groups)
 	op.n[1] = C.uint64_t(heads)
 	op.n[2] = C.uint64_t(stateSize)
+	return p.add(op)
+}
+
+// AddConvL2Norm appends the fused short convolution and L2 norm of a gated
+// delta-net layer: out receives the SiLU of the convolution for every channel,
+// and then its first qkChannels values are L2 normalized per group of stateSize,
+// with qScale applied to the first qChannels of them. The convolution ring state
+// in convState is advanced for every channel. channels and qkChannels must be
+// multiples of 256 and stateSize must be 128; other shapes are rejected by the
+// bridge with YUUKA_ERR_UNSUPPORTED.
+func (p *Plan) AddConvL2Norm(convState, weights, qkv, out *Buffer, channels, kernel, qkChannels, qChannels, stateSize int, eps, qScale float32) error {
+	if err := p.check(convState, weights, qkv, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_CONV_L2NORM}
+	op.buf[0] = convState.ptr
+	op.buf[1] = weights.ptr
+	op.buf[2] = qkv.ptr
+	op.buf[3] = out.ptr
+	op.n[0] = C.uint64_t(channels)
+	op.n[1] = C.uint64_t(kernel)
+	op.n[2] = C.uint64_t(qkChannels)
+	op.n[3] = C.uint64_t(qChannels)
+	op.n[4] = C.uint64_t(stateSize)
+	op.f[0] = C.float(eps)
+	op.f[1] = C.float(qScale)
+	return p.add(op)
+}
+
+// AddGemvResidualAt appends the streaming matvec with the
+// residual epilogue: out = W*x + residual. out may alias residual, which is how
+// the decode plan ends a sub-layer in one launch instead of a matvec plus an ADD.
+// The shape and dtype rules are those of AddLMHeadAt, and rows must be 1..16.
+func (p *Plan) AddGemvResidualAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, res *Buffer, resOff uint64, nIn, nOut, rows int64, dtype tensor.DType) error {
+	if err := p.check(w, x, out, res); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_RESIDUAL}
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	op.buf[2] = out.ptr
+	op.buf[3] = res.ptr
+	op.off[0] = C.uint64_t(wOff)
+	op.off[1] = C.uint64_t(xOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.off[3] = C.uint64_t(resOff)
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(rows)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// Epilogues of AddGemvPairAt.
+const (
+	// PairWriteBoth writes both projection rows.
+	PairWriteBoth = 0
+	// PairSwiglu writes silu(A*x) * (B*x) into the first output and requires equal
+	// output widths.
+	PairSwiglu = 1
+)
+
+// AddGemvPairAt appends two single-row matvecs over one activation row as a
+// single launch. The two matrices may differ in packed dtype and
+// width, which is what lets the plan merge projections that are independent but
+// share their input row. With PairSwiglu the second output is unused and nil is
+// allowed; with PairWriteBoth both outputs are written.
+func (p *Plan) AddGemvPairAt(a *Buffer, aOff uint64, b *Buffer, bOff uint64, x *Buffer, xOff uint64, outA *Buffer, outAOff uint64, outB *Buffer, outBOff uint64, nIn, nOutA, nOutB int64, dtypeA, dtypeB tensor.DType, epilogue int) error {
+	if err := p.check(a, b, x, outA); err != nil {
+		return err
+	}
+	if outB == nil {
+		if epilogue != PairSwiglu {
+			return errors.New("hip: a gemv pair that writes both rows needs both outputs")
+		}
+	} else if err := p.check(outB); err != nil {
+		return err
+	}
+	if epilogue != PairWriteBoth && epilogue != PairSwiglu {
+		return fmt.Errorf("hip: unknown gemv pair epilogue %d", epilogue)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_PAIR}
+	op.buf[0] = a.ptr
+	op.buf[1] = b.ptr
+	op.buf[2] = x.ptr
+	op.buf[3] = outA.ptr
+	if outB != nil {
+		op.buf[4] = outB.ptr
+	}
+	op.off[0] = C.uint64_t(aOff)
+	op.off[1] = C.uint64_t(bOff)
+	op.off[2] = C.uint64_t(xOff)
+	op.off[3] = C.uint64_t(outAOff)
+	if outB != nil {
+		op.off[4] = C.uint64_t(outBOff)
+	}
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOutA)
+	op.n[2] = C.uint64_t(nOutB)
+	op.u[0] = C.uint32_t(dtypeA)
+	op.u[1] = C.uint32_t(dtypeB)
+	op.u[2] = C.uint32_t(epilogue)
+	return p.add(op)
+}
+
+// AddRecurrentTokenAt appends one token of a gated delta-net layer with the
+// head's state held in registers. out receives the gated RMSNorm of the head,
+// not the raw delta-net result: the operator fuses the decay, both S^T products,
+// the rank-1 update, and the normalization, because the normalization reduces
+// over the same head's values. state is [heads,stateSize,stateSize] FP32 and is
+// updated in place; q and k are indexed by group, v, out, and gate by head.
+// stateSize must be 128.
+func (p *Plan) AddRecurrentTokenAt(state, q *Buffer, qOff uint64, k *Buffer, kOff uint64, v *Buffer, vOff uint64, alpha, beta, dt, a, out, normWeight, gate *Buffer, groups, heads, stateSize int, eps float32) error {
+	if err := p.check(state, q, k, v, alpha, beta, dt, a, out, normWeight, gate); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_RECURRENT_TOKEN}
+	op.buf[0] = state.ptr
+	op.buf[1] = q.ptr
+	op.buf[2] = k.ptr
+	op.buf[3] = v.ptr
+	op.buf[4] = alpha.ptr
+	op.buf[5] = beta.ptr
+	op.buf[6] = dt.ptr
+	op.buf[7] = a.ptr
+	op.buf[8] = out.ptr
+	op.buf[9] = normWeight.ptr
+	op.buf[10] = gate.ptr
+	op.off[1] = C.uint64_t(qOff)
+	op.off[2] = C.uint64_t(kOff)
+	op.off[3] = C.uint64_t(vOff)
+	op.n[0] = C.uint64_t(groups)
+	op.n[1] = C.uint64_t(heads)
+	op.n[2] = C.uint64_t(stateSize)
+	op.f[0] = C.float(eps)
 	return p.add(op)
 }
 
@@ -1050,6 +1214,91 @@ func (p *Plan) AddLMHeadAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *
 	op.n[1] = C.uint64_t(nOut)
 	op.n[2] = C.uint64_t(rows)
 	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddGemvQ8_1At appends an int8 decode matvec: out = W * x with x already
+// quantized to Q8_1 by AddQuantizeQ8_1At, which writes qs (the int8 digits) and
+// ds (the float2 block scales). Only one row is served: speculative verification
+// keeps the FP32 streaming kernel. Q4_K, Q5_K, Q6_K, and Q8_0 weights are
+// supported, nIn must be a multiple of 256, and any other shape fails here
+// rather than falling back silently.
+func (p *Plan) AddGemvQ8_1At(w *Buffer, wOff uint64, qs, ds, out *Buffer, nIn, nOut int64, dtype tensor.DType) error {
+	return p.addGemvQ8_1(w, wOff, qs, ds, out, nIn, nOut, dtype, false)
+}
+
+// AddGemvQ8_1FusedAt appends the same int8 decode matvec with the activation
+// quantized inside the matvec block: x is the FP32 activation row, the block
+// stages its digits in shared memory, and no separate quantization operation is
+// submitted for the group. It computes the same product as AddGemvQ8_1At with the
+// same quantizer contract, so the two are interchangeable per shape.
+func (p *Plan) AddGemvQ8_1FusedAt(w *Buffer, wOff uint64, x, out *Buffer, nIn, nOut int64, dtype tensor.DType) error {
+	return p.addGemvQ8_1(w, wOff, x, nil, out, nIn, nOut, dtype, true)
+}
+
+func (p *Plan) addGemvQ8_1(w *Buffer, wOff uint64, x, ds, out *Buffer, nIn, nOut int64, dtype tensor.DType, fused bool) error {
+	if nIn <= 0 || nOut <= 0 {
+		return errors.New("hip: int8 GEMV dimensions must be positive")
+	}
+	if nIn%256 != 0 {
+		return fmt.Errorf("hip: int8 GEMV width %d is not a multiple of 256", nIn)
+	}
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K, tensor.Q8_0:
+	default:
+		return fmt.Errorf("%w: hip: int8 GEMV dtype %s", ErrUnsupported, dtype)
+	}
+	rowBytes, err := dtype.RowBytes(nIn)
+	if err != nil {
+		return fmt.Errorf("hip: int8 GEMV shape: %w", err)
+	}
+	buffers := []*Buffer{w, x, out}
+	if !fused {
+		buffers = []*Buffer{w, x, ds, out}
+	}
+	if err := p.check(buffers...); err != nil {
+		return err
+	}
+	if wOff%16 != 0 {
+		return fmt.Errorf("hip: int8 GEMV weight offset %d is not 16-byte aligned", wOff)
+	}
+	if wOff > w.bytes || int64(rowBytes)*nOut > int64(w.bytes-wOff) {
+		return fmt.Errorf("hip: int8 GEMV weight buffer holds %d bytes, want %d",
+			w.bytes-wOff, int64(rowBytes)*nOut)
+	}
+	if fused {
+		if int64(x.bytes) < nIn*4 {
+			return fmt.Errorf("hip: int8 GEMV activation buffer holds %d bytes, want %d",
+				x.bytes, nIn*4)
+		}
+	} else {
+		if int64(x.bytes) < nIn {
+			return fmt.Errorf("hip: int8 GEMV digit buffer holds %d bytes, want %d",
+				x.bytes, nIn)
+		}
+		if int64(ds.bytes) < (nIn/32)*8 {
+			return fmt.Errorf("hip: int8 GEMV scale buffer holds %d bytes, want %d",
+				ds.bytes, (nIn/32)*8)
+		}
+	}
+	if int64(out.bytes) < nOut*4 {
+		return fmt.Errorf("hip: int8 GEMV output buffer holds %d bytes, want %d",
+			out.bytes, nOut*4)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_Q8_1}
+	op.off[0] = C.uint64_t(wOff)
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	if !fused {
+		op.buf[2] = ds.ptr
+	}
+	op.buf[3] = out.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.u[0] = C.uint32_t(dtype)
+	if fused {
+		op.u[1] = 1
+	}
 	return p.add(op)
 }
 
@@ -1743,8 +1992,8 @@ func (p *Plan) ExecuteProfiled(stream *Stream, token int32, position uint32, run
 	if event != nil {
 		ev = event.ptr
 	}
-	codes := make([]C.uint32_t, p.ops)
-	times := make([]C.uint64_t, p.ops)
+	codes := make([]C.uint32_t, len(p.ops))
+	times := make([]C.uint64_t, len(p.ops))
 	var codesPtr *C.uint32_t
 	var timesPtr *C.uint64_t
 	if len(codes) != 0 {
@@ -1835,5 +2084,20 @@ func (g *Graph) Close() error {
 	return nil
 }
 
-// Ops returns the number of operations in the plan.
-func (p *Plan) Ops() int { return p.ops }
+// Ops returns a copy of the plan's operation shadow in submission order. The
+// slice has one entry per operation the plan holds, including tail operations
+// that an Execute call can skip; ExecuteProfiled returns times only for the
+// operations it executed, so a call with runTail=false lines its results up
+// with a prefix of this slice. The copy keeps the caller from mutating the
+// plan's record; it is a diagnostic path, not a hot-path accessor.
+func (p *Plan) Ops() []OpInfo {
+	if p == nil {
+		return nil
+	}
+	out := make([]OpInfo, len(p.ops))
+	copy(out, p.ops)
+	return out
+}
+
+// OpCount returns the number of operations in the plan.
+func (p *Plan) OpCount() int { return len(p.ops) }

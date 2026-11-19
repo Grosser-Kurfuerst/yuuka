@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/yuuka-ai/yuuka/backend/hip"
+	"github.com/yuuka-ai/yuuka/tensor"
 )
 
 // prefillMatmul appends the measured implementation for one prefill matmul.
@@ -34,6 +35,135 @@ func (m *Model) prefillMatmulPath(plan *hip.Plan, w weight, x *hip.Buffer, xOff 
 		return plan.AddGemmPathAt(w.buf, 0, x, xOff, out, outOff,
 			nIn, nOut, rows, w.dtype, hip.GemmWMMA)
 	}
+}
+
+// decodeMatmul appends one decode matvec. The channel-parallel kernel serves
+// every shape the decode graph dispatches except the 32-output recurrent
+// projections, where the per-row GEMV stays; within that set the K-quants and
+// Q8_0 dot the Q8_1 activation with int8 v_dot4 and the other dtypes keep FP32
+// (docs/kernels.md section 5.3).
+//
+// The int8 route reads digits that decodeActGroup quantized for this group of
+// matvecs, so a matvec on a row that was not prepared is a planning error and
+// fails here rather than reading stale activations.
+func (m *Model) decodeMatmul(plan *hip.Plan, w weight, x, out *hip.Buffer,
+	nIn, nOut int64) error {
+	path := hip.DecodeGemvPerRow
+	if !m.forceDecodeGemv {
+		path = hip.SelectDecodeGemvPath(w.dtype, nIn, nOut, m.int8Matvec)
+	}
+	switch path {
+	case hip.DecodeGemvInt8:
+		if !m.prequantizedInt8 {
+			// The block quantizes the row it reads, so no quantization
+			// operation is submitted for the group.
+			return plan.AddGemvQ8_1FusedAt(w.buf, 0, x, out, nIn, nOut, w.dtype)
+		}
+		if m.int8Act != x || m.int8ActWidth != nIn {
+			return fmt.Errorf("gpu: %s matvec on an activation row that was not"+
+				" quantized for the group", hip.DecodeGemvInt8)
+		}
+		return plan.AddGemvQ8_1At(w.buf, 0, m.act8.qs, m.act8.ds, out, nIn, nOut, w.dtype)
+	case hip.DecodeGemvStreaming:
+		return plan.AddLMHeadAt(w.buf, 0, x, 0, out, 0, nIn, nOut, 1, w.dtype)
+	default:
+		return plan.AddGemv(w.buf, x, out, nIn, nOut, w.dtype)
+	}
+}
+
+// decodeMatmulResidual appends the decode matvec that ends a sub-layer together
+// with its residual add. out = W*x + res in one launch when the streaming kernel
+// is selected; the per-row route
+// keeps the two operations it has always had, because that kernel has no
+// epilogue and the choice is made here, at plan build time, not at run time.
+func (m *Model) decodeMatmulResidual(plan *hip.Plan, w weight, x, out, res *hip.Buffer,
+	nIn, nOut int64) error {
+	if !m.noResidualFusion && !m.forceDecodeGemv && !m.int8Matvec &&
+		hip.SelectDecodeGemvPath(w.dtype, nIn, nOut, false) == hip.DecodeGemvStreaming {
+		return plan.AddGemvResidualAt(w.buf, 0, x, 0, out, 0, res, 0, nIn, nOut, 1, w.dtype)
+	}
+	if err := m.decodeMatmul(plan, w, x, m.act.tmp, nIn, nOut); err != nil {
+		return err
+	}
+	return plan.Add(out, m.act.tmp, nOut)
+}
+
+// decodeMatmulPair appends two projections that read the same activation row as
+// one launch. It needs both shapes on the streaming route, because the fused
+// block forms both dots over one traversal of the row; otherwise the plan keeps
+// the two matvecs, and with the SwiGLU epilogue the separate SILU_MUL as well.
+//
+// The choice is made here, at plan build time, and the two forms are asserted to
+// agree by the differential tests in decode_fusion_test.go.
+func (m *Model) decodeMatmulPair(plan *hip.Plan, a, b weight, x, outA, outB *hip.Buffer,
+	nIn, nOutA, nOutB int64, epilogue int) error {
+	// The pair kernel decodes both matrices with one instantiation, so it needs
+	// one weight dtype; a mixed pair keeps the two matvecs. That is a plan-build
+	// decision, not a silent route change.
+	usable := !m.noPairFusion && !m.forceDecodeGemv && !m.int8Matvec &&
+		a.dtype == b.dtype &&
+		hip.SelectDecodeGemvPath(a.dtype, nIn, nOutA, false) == hip.DecodeGemvStreaming &&
+		hip.SelectDecodeGemvPath(b.dtype, nIn, nOutB, false) == hip.DecodeGemvStreaming &&
+		(epilogue != hip.PairSwiglu || nOutA == nOutB)
+	if usable {
+		// The SwiGLU epilogue consumes the second row inside the kernel, so the
+		// fused form takes no second output.
+		second := outB
+		if epilogue == hip.PairSwiglu {
+			second = nil
+		}
+		return plan.AddGemvPairAt(a.buf, 0, b.buf, 0, x, 0, outA, 0, second, 0, nIn,
+			nOutA, nOutB, a.dtype, b.dtype, epilogue)
+	}
+	if err := m.decodeMatmul(plan, a, x, outA, nIn, nOutA); err != nil {
+		return err
+	}
+	if err := m.decodeMatmul(plan, b, x, outB, nIn, nOutB); err != nil {
+		return err
+	}
+	if epilogue == hip.PairSwiglu {
+		return plan.AddSiluMul(outA, outB, outA, nOutA)
+	}
+	return nil
+}
+
+// decodeMatmulSwiglu appends the gate and up projections and their SwiGLU
+// product, either as one fused launch or as two matvecs and a SILU_MUL.
+func (m *Model) decodeMatmulSwiglu(plan *hip.Plan, gate, up weight, x, out *hip.Buffer,
+	nIn, nOut int64) error {
+	return m.decodeMatmulPair(plan, gate, up, x, out, m.act.ffnUp, nIn, nOut, nOut,
+		hip.PairSwiglu)
+}
+
+// decodeActGroup prepares the Q8_1 digits of one decode activation row for the
+// matvecs that read it. It emits one quantization operation for the group, which
+// is what keeps the activation from being re-quantized per projection, and skips
+// it when no consumer takes the int8 route so a model whose weights are all FP32
+// pays nothing. The plan is sequential, so the digits stay valid until the next
+// group.
+func (m *Model) decodeActGroup(plan *hip.Plan, x *hip.Buffer, nIn int64,
+	consumers ...tensor.DType) error {
+	m.int8Act = nil
+	m.int8ActWidth = 0
+	if m.forceDecodeGemv || !m.int8Matvec || !m.prequantizedInt8 {
+		return nil
+	}
+	needed := false
+	for _, dtype := range consumers {
+		if hip.IsInt8DecodeDType(dtype) {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return nil
+	}
+	if err := plan.AddQuantizeQ8_1At(x, 0, m.act8.qs, m.act8.ds, nIn, 1); err != nil {
+		return err
+	}
+	m.int8Act = x
+	m.int8ActWidth = nIn
+	return nil
 }
 
 // prefillProjection is one prefill matmul that reads the shared activation
@@ -153,8 +283,11 @@ func (m *Model) buildDecodePlan(s *Session, trace bool) (*hip.Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := plan.AddGemv(output.buf, m.act.norm, m.act.logits,
-		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype); err != nil {
+	if err := m.decodeActGroup(plan, m.act.norm, int64(cfg.HiddenSize), output.dtype); err != nil {
+		return nil, err
+	}
+	if err := m.decodeMatmul(plan, output, m.act.norm, m.act.logits,
+		int64(cfg.HiddenSize), int64(cfg.VocabSize)); err != nil {
 		return nil, err
 	}
 	return plan, nil
@@ -195,13 +328,23 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := plan.AddRMSNorm(m.act.x, attnNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(q.buf, m.act.norm, m.act.q, hidden, qDim, q.dtype); err != nil {
+	// q, k, and v read the same normalized row, so its Q8_1 digits are produced
+	// once for the group.
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, q.dtype, k.dtype, v.dtype); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(k.buf, m.act.norm, m.act.k, hidden, kvDim, k.dtype); err != nil {
+	// q, k, and v are independent and read the same row, but only a pair of
+	// comparable widths pays for a merge: the q and k pair was measured 0.4 ms
+	// slower per step than two launches, because the grid follows the wider
+	// matrix and the narrow one then shares its staging. They keep
+	// their own launches.
+	if err := m.decodeMatmul(plan, q, m.act.norm, m.act.q, hidden, qDim); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(v.buf, m.act.norm, m.act.v, hidden, kvDim, v.dtype); err != nil {
+	if err := m.decodeMatmul(plan, k, m.act.norm, m.act.k, hidden, kvDim); err != nil {
+		return err
+	}
+	if err := m.decodeMatmul(plan, v, m.act.norm, m.act.v, hidden, kvDim); err != nil {
 		return err
 	}
 	if err := plan.AddRMSNormHeadsAt(m.act.q, 0, qNorm.buf, m.act.q, 0,
@@ -229,10 +372,22 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 		m.capacity, s.capacity, m.blockSize, scale, m.kvType); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(o.buf, m.act.attn, m.act.tmp, oDim, hidden, o.dtype); err != nil {
+	if err := m.decodeActGroup(plan, m.act.attn, oDim, o.dtype); err != nil {
 		return err
 	}
-	return plan.Add(m.act.x, m.act.tmp, hidden)
+	return m.decodeMatmulResidual(plan, o, m.act.attn, m.act.x, m.act.x, oDim, hidden)
+}
+
+// fusedDeltaNet reports whether the recurrent layer can take the fused
+// conv_l2norm and recurrent_token pair. Both kernels are compiled for a 128-wide
+// state and for norm groups and channel blocks that do not cross, so a model
+// with any other recurrent shape keeps the separate operators instead of failing
+// the plan.
+func (m *Model) fusedDeltaNet(convDim, qkDim, keyDim, stateSize int64) bool {
+	if m.legacyDeltaNet {
+		return false
+	}
+	return stateSize == 128 && convDim%256 == 0 && qkDim%256 == 0 && keyDim%128 == 0
 }
 
 func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight) error {
@@ -283,46 +438,75 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	if err := plan.AddRMSNorm(m.act.x, attnNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(qkv.buf, m.act.norm, m.act.qkv, hidden, convDim, qkv.dtype); err != nil {
+	// The qkv, gate, alpha, and beta projections all read the normalized row.
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, qkv.dtype, gate.dtype,
+		alpha.dtype, beta.dtype); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(gate.buf, m.act.norm, m.act.z, hidden, inner, gate.dtype); err != nil {
+	// The qkv projection and the delta-net gate read the same row, but their
+	// dtypes differ in this model (Q5_K against Q4_K) and their widths are 2:1, so
+	// they keep separate launches.
+	if err := m.decodeMatmul(plan, qkv, m.act.norm, m.act.qkv, hidden, convDim); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(beta.buf, m.act.norm, m.act.beta, hidden, rank, beta.dtype); err != nil {
+	if err := m.decodeMatmul(plan, gate, m.act.norm, m.act.z, hidden, inner); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(alpha.buf, m.act.norm, m.act.alpha, hidden, rank, alpha.dtype); err != nil {
+	if err := m.decodeMatmul(plan, beta, m.act.norm, m.act.beta, hidden, rank); err != nil {
 		return err
 	}
-	if err := plan.AddConv1D(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv, int(convDim), cfg.SSMConvKernel); err != nil {
+	if err := m.decodeMatmul(plan, alpha, m.act.norm, m.act.alpha, hidden, rank); err != nil {
 		return err
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
-	if err := plan.AddL2NormAt(m.act.conv, 0, m.act.conv, 0,
-		int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, qScale); err != nil {
+	if m.fusedDeltaNet(convDim, 2*keyDim, keyDim, stateSize) {
+		// conv_l2norm advances the convolution state and normalizes the q and k
+		// channels; recurrent_token keeps the head's state in registers and
+		// writes the gated RMSNorm of the head directly, so the raw delta-net
+		// row (m.act.gdn) is not materialized.
+		if err := plan.AddConvL2Norm(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv,
+			int(convDim), cfg.SSMConvKernel, int(2*keyDim), int(keyDim), int(stateSize),
+			cfg.RMSNormEps, qScale); err != nil {
+			return err
+		}
+		if err := plan.AddRecurrentTokenAt(s.recState[layerIndex],
+			m.act.conv, 0,
+			m.act.conv, uint64(keyDim)*4,
+			m.act.conv, uint64(2*keyDim)*4,
+			m.act.alpha, m.act.beta, dt.buf, a.buf, m.act.gdnNorm, norm.buf, m.act.z,
+			cfg.SSMGroupCount, cfg.SSMTimeStepRank, int(stateSize),
+			cfg.RMSNormEps); err != nil {
+			return err
+		}
+	} else {
+		if err := plan.AddConv1D(s.conv[layerIndex], conv.buf, m.act.qkv, m.act.conv, int(convDim), cfg.SSMConvKernel); err != nil {
+			return err
+		}
+		if err := plan.AddL2NormAt(m.act.conv, 0, m.act.conv, 0,
+			int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, qScale); err != nil {
+			return err
+		}
+		if err := plan.AddL2NormAt(m.act.conv, uint64(keyDim)*4, m.act.conv, uint64(keyDim)*4,
+			int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, 1); err != nil {
+			return err
+		}
+		if err := plan.AddGDNAt(s.recState[layerIndex],
+			m.act.conv, 0,
+			m.act.conv, uint64(keyDim)*4,
+			m.act.conv, uint64(2*keyDim)*4,
+			m.act.alpha, m.act.beta, dt.buf, a.buf, m.act.gdn,
+			cfg.SSMGroupCount, cfg.SSMTimeStepRank, int(stateSize)); err != nil {
+			return err
+		}
+		if err := plan.AddGatedRMSNorm(m.act.gdn, norm.buf, m.act.z, m.act.gdnNorm,
+			rank, stateSize, cfg.RMSNormEps); err != nil {
+			return err
+		}
+	}
+	if err := m.decodeActGroup(plan, m.act.gdnNorm, inner, out.dtype); err != nil {
 		return err
 	}
-	if err := plan.AddL2NormAt(m.act.conv, uint64(keyDim)*4, m.act.conv, uint64(keyDim)*4,
-		int64(cfg.SSMGroupCount), stateSize, cfg.RMSNormEps, 1); err != nil {
-		return err
-	}
-	if err := plan.AddGDNAt(s.recState[layerIndex],
-		m.act.conv, 0,
-		m.act.conv, uint64(keyDim)*4,
-		m.act.conv, uint64(2*keyDim)*4,
-		m.act.alpha, m.act.beta, dt.buf, a.buf, m.act.gdn,
-		cfg.SSMGroupCount, cfg.SSMTimeStepRank, int(stateSize)); err != nil {
-		return err
-	}
-	if err := plan.AddGatedRMSNorm(m.act.gdn, norm.buf, m.act.z, m.act.gdnNorm,
-		rank, stateSize, cfg.RMSNormEps); err != nil {
-		return err
-	}
-	if err := plan.AddGemv(out.buf, m.act.gdnNorm, m.act.tmp, inner, hidden, out.dtype); err != nil {
-		return err
-	}
-	return plan.Add(m.act.x, m.act.tmp, hidden)
+	return m.decodeMatmulResidual(plan, out, m.act.gdnNorm, m.act.x, m.act.x, inner, hidden)
 }
 
 func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
@@ -344,19 +528,18 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	if err := plan.AddRMSNorm(m.act.x, postNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(gate.buf, m.act.norm, m.act.ffnGate, hidden, ffn, gate.dtype); err != nil {
+	// Gate and up read the same normalized row.
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, gate.dtype, up.dtype); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(up.buf, m.act.norm, m.act.ffnUp, hidden, ffn, up.dtype); err != nil {
+	if err := m.decodeMatmulSwiglu(plan, gate, up, m.act.norm, m.act.ffnGate, hidden, ffn); err != nil {
 		return err
 	}
-	if err := plan.AddSiluMul(m.act.ffnGate, m.act.ffnUp, m.act.ffnGate, ffn); err != nil {
+	if err := m.decodeActGroup(plan, m.act.ffnGate, ffn, down.dtype); err != nil {
 		return err
 	}
-	if err := plan.AddGemv(down.buf, m.act.ffnGate, m.act.tmp, ffn, hidden, down.dtype); err != nil {
-		return err
-	}
-	return plan.Add(m.act.x, m.act.tmp, hidden)
+	// The projection that ends the sub-layer adds the residual itself.
+	return m.decodeMatmulResidual(plan, down, m.act.ffnGate, m.act.x, m.act.x, ffn, hidden)
 }
 
 type prefillOutput uint8

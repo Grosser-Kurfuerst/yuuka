@@ -110,9 +110,48 @@ void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
  * bandwidth instead of one GEMV per row. Every dtype in yuuka_dtype is
  * supported. n_in must be a multiple of 256 and rows must be at most 16; an
  * out-of-range shape or an unknown dtype launches nothing. */
+// launch_lm_head_residual_f32out is the streaming single-row-block matvec with
+// the residual epilogue: out = W x + res, where res may alias out.
+// Passing a null res gives the plain form.
+void launch_lm_head_residual_f32out(float * out, const float * x, const void * w,
+                                    const float * res, uint64_t n_in, uint64_t n_out,
+                                    uint64_t rows, uint32_t dtype, hipStream_t stream);
+// launch_lm_head_pair_f32out runs two single-row matvecs over one activation row
+// in one launch. Both matrices share the packed dtype but may differ in width. A
+// runtime dtype dispatch inside the span loop costs 60% of the achieved bandwidth
+// on gfx1151, so the pair is templated and the caller must not mix dtypes. With
+// swiglu
+// the two dots are combined as silu(a) * b into out0 and out1 is unused;
+// otherwise both rows are written. It is the decode counterpart of GEMM_SWIGLU
+// and the narrow-projection merge of the decode plan.
+void launch_lm_head_pair_f32out(float * out0, float * out1, const float * x,
+                                const void * w0, const void * w1, uint64_t n_in,
+                                uint64_t n_out0, uint64_t n_out1, uint32_t dtype,
+                                int swiglu, hipStream_t stream);
 void launch_lm_head_f32out(float * out, const float * x, const void * w,
                            uint64_t n_in, uint64_t n_out, uint64_t rows,
                            uint32_t dtype, hipStream_t stream);
+
+/* Int8 decode matvec.
+ *
+ * out[n_out] = W[n_out, n_in] * x, with x quantized to Q8_1 by
+ * launch_quantize_q8_1 (qs holds n_in int8 digits, ds its float2 block scales,
+ * which this kernel does not need because it sums the digits per sub-block
+ * itself). Q4_K, Q5_K, Q6_K, and Q8_0 weights are decoded straight to int8 and
+ * dotted with one v_dot4 per four weights. One row only; n_in must be a multiple
+ * of 256. An unknown dtype or a width outside that rule launches nothing, which
+ * leaves the caller on the FP32 streaming or per-row route. */
+void launch_gemv_i8_f32out(float * out, const void * qs, const void * ds,
+                           const void * w, uint64_t n_in, uint64_t n_out,
+                           uint32_t dtype, hipStream_t stream);
+
+/* Fused int8 decode matvec: the same product as launch_gemv_i8_f32out, but the
+ * activation row is quantized inside the block from the FP32 row instead of
+ * reading a separately quantized copy. Q4_K, Q5_K, Q6_K, and Q8_0 weights, one
+ * row, n_in a multiple of 256. */
+void launch_gemv_i8_fused_f32out(float * out, const float * x, const void * w,
+                                 uint64_t n_in, uint64_t n_out, uint32_t dtype,
+                                 hipStream_t stream);
 
 /* Dequantizes a packed K-quant weight matrix into FP16.
  *
@@ -168,6 +207,23 @@ void launch_gdn_f32(float * state, const float * q, const float * k, const float
                     const float * alpha, const float * beta, const float * dt,
                     const float * a, float * out, int groups, int heads,
                     int state_size, hipStream_t stream);
+// launch_recurrent_token_f32 runs one token of a gated delta-net layer with the
+// head's state held in registers: decay, both S^T products, and the rank-1
+// update are one pass, and the gated RMSNorm of the head is folded in, so out
+// receives the normalized head row rather than the raw delta-net result. The
+// state_width is fixed at 128 (kernels/hip/ssm/deltanet.hip).
+void launch_recurrent_token_f32(float * state, const float * q, const float * k,
+                                const float * v, const float * alpha, const float * beta,
+                                const float * dt, const float * a, float * out,
+                                const float * norm_weight, const float * gate,
+                                int groups, int heads, float eps, hipStream_t stream);
+// launch_conv_l2norm_f32 applies the short convolution to every channel and then
+// the L2 norm to the first qk_channels channels, q_channels of which use
+// q_scale and the rest unity. channels and qk_channels must be multiples of 256
+// and the norm group width is fixed at 128.
+void launch_conv_l2norm_f32(float * conv_state, const float * weights, const float * qkv,
+                            float * out, int channels, int kernel, int qk_channels,
+                            int q_channels, float eps, float q_scale, hipStream_t stream);
 void launch_embedding_f32(float * out, const void * weights, int32_t token,
                           uint64_t row_bytes, int64_t cols, uint32_t dtype,
                           hipStream_t stream);

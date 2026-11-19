@@ -111,19 +111,6 @@ func TestGPUProfilePrefill(t *testing.T) {
 func logPrefillProfile(t *testing.T, kvType tensor.DType, position uint32,
 	wall time.Duration, times []hip.OpTime) {
 	t.Helper()
-	names := map[uint32]string{
-		1: "gemv", 2: "rmsnorm", 3: "l2norm", 4: "gated_rmsnorm",
-		5: "rope", 6: "attention", 7: "conv1d", 8: "gdn", 9: "silu_mul",
-		10: "add", 11: "copy", 12: "scale", 13: "embedding",
-		14: "kv_write", 15: "rmsnorm_heads", 16: "gemm",
-		17: "gemv_batch", 18: "rmsnorm_batch", 19: "rmsnorm_heads_batch",
-		20: "rope_batch", 21: "kv_write_batch", 22: "attention_prefill",
-		23: "recurrent_chunk", 24: "embedding_batch", 25: "cast_f16",
-		26: "kv_write_paged", 27: "attention_paged", 28: "kv_write_batch_paged",
-		29: "attention_prefill_paged",
-		34: "gemm_swiglu", 35: "dequant_f16", 36: "quant_q8_1", 37: "lm_head",
-		38: "silu_mul_quant_q8_1",
-	}
 	totals := make(map[uint32]uint64)
 	counts := make(map[uint32]int)
 	var total uint64
@@ -146,11 +133,7 @@ func logPrefillProfile(t *testing.T, kvType tensor.DType, position uint32,
 		kvType, position, float64(wall.Microseconds())/1000,
 		float64(total)/1e6, len(times))
 	for _, item := range rows {
-		name := names[item.code]
-		if name == "" {
-			name = "unknown"
-		}
-		t.Logf("  %-22s n=%4d %9.3f ms %5.1f%%", name, item.count,
+		t.Logf("  %-22s n=%4d %9.3f ms %5.1f%%", hip.OpName(item.code), item.count,
 			float64(item.ns)/1e6, 100*float64(item.ns)/float64(total))
 	}
 }

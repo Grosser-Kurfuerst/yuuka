@@ -40,6 +40,15 @@ type activations struct {
 	scores  *hip.Buffer
 }
 
+// int8Activations holds the Q8_1 form of one decode activation row. The plan
+// quantizes a row once per group of matvecs that read it, and the group's
+// operations reuse the same digits, so one pair of buffers serves the whole
+// decode graph.
+type int8Activations struct {
+	qs *hip.Buffer // int8 digits, one per activation value
+	ds *hip.Buffer // float2 block scales the quantizer writes
+}
+
 type prefillActivations struct {
 	attentionBlas  *hip.Buffer
 	attentionSplit *hip.Buffer
@@ -67,9 +76,13 @@ type prefillActivations struct {
 
 // Options configures a shared GPU model and its KV pool.
 type Options struct {
-	Blocks        int
-	BlockSize     int
-	PrefillChunk  int
+	Blocks       int
+	BlockSize    int
+	PrefillChunk int
+	// EnableGraph lets the session capture the decode plan into a HIP Graph
+	// after GraphMinSteps steps and replay it; serving.md owns the contract and
+	// the CLI and server leave it off. The replay path is measured on the
+	// reduced decode plan.
 	EnableGraph   bool
 	GraphMinSteps int
 	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
@@ -84,6 +97,37 @@ type Options struct {
 	// the FP16 MMA kernel would be selected. It exists so a differential test
 	// can compare the two kernels on identical plan inputs.
 	ForceTiledAttention bool
+	// ForceDecodeGemv keeps the per-row GEMV for every decode matvec, including
+	// the output projection, where SelectDecodeGemvPath selects the streaming
+	// kernel. It exists so a differential test can compare the two families on
+	// identical plan inputs; production sessions leave it false.
+	ForceDecodeGemv bool
+	// Int8Matvec selects the int8 decode matvec instead of the FP32 streaming
+	// kernel for the K-quants and Q8_0. It is off by default because the route
+	// is measured slower end to end on gfx1151, and it exists so the two
+	// arithmetics can be compared on identical plans (no default path changes).
+	Int8Matvec bool
+	// PrequantizedInt8 submits one Q8_1 quantization operation per activation
+	// group instead of letting each int8 matvec block quantize the row itself.
+	// It exists so the two activation sources can be measured against each other;
+	// the fused form is the selected one (docs/benchmarks.md).
+	PrequantizedInt8 bool
+	// NoResidualFusion keeps the decode matvec that ends a sub-layer and the
+	// separate residual ADD as two operations instead of letting the matvec add
+	// the residual in its epilogue, which is the default.
+	NoResidualFusion bool
+	// NoPairFusion keeps two projections that share an activation row as two
+	// launches instead of the fused pair that forms both dots over one traversal,
+	// which is the default. With the SwiGLU epilogue it also restores the
+	// separate SILU_MUL.
+	NoPairFusion bool
+	// LegacyDeltaNet builds the recurrent layer from the separate CONV1D,
+	// L2NORM, GDN, and GATED_RMSNORM operations instead of the fused
+	// CONV_L2NORM and RECURRENT_TOKEN pair, which is the selected path. It
+	// exists so a differential test can compare the two plans on identical
+	// inputs and so the unfused arithmetic stays reachable when a fused kernel
+	// is suspect; production sessions leave it false.
+	LegacyDeltaNet bool
 }
 
 const (
@@ -107,6 +151,7 @@ type Model struct {
 
 	weights map[string]weight
 	act     activations
+	act8    int8Activations
 	prefill prefillActivations
 
 	poolK     []*hip.Buffer
@@ -120,9 +165,21 @@ type Model struct {
 	attentionBlasCapable bool
 	attentionBlasEnabled bool
 	forceTiledAttention  bool
-	prefillRows          int
-	prefillGen           int64
-	prefillAll           []*hip.Buffer
+	forceDecodeGemv      bool
+	int8Matvec           bool
+	prequantizedInt8     bool
+	legacyDeltaNet       bool
+	noResidualFusion     bool
+	noPairFusion         bool
+	// int8Act and int8ActWidth record the activation row whose Q8_1 digits the
+	// int8 matvecs of the current group read. They are a build-time check: the
+	// plan is sequential, so a matvec on any other row means the planner forgot
+	// to quantize it.
+	int8Act      *hip.Buffer
+	int8ActWidth int64
+	prefillRows  int
+	prefillGen   int64
+	prefillAll   []*hip.Buffer
 
 	specLogits *hip.Buffer
 
@@ -170,6 +227,12 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		attentionBlasCapable: useBlasAttention,
 		attentionBlasEnabled: useBlasAttention,
 		forceTiledAttention:  opts.ForceTiledAttention,
+		forceDecodeGemv:      opts.ForceDecodeGemv,
+		int8Matvec:           opts.Int8Matvec,
+		prequantizedInt8:     opts.PrequantizedInt8,
+		legacyDeltaNet:       opts.LegacyDeltaNet,
+		noResidualFusion:     opts.NoResidualFusion,
+		noPairFusion:         opts.NoPairFusion,
 		device:               device,
 		stream:               stream,
 		event:                event,
@@ -266,6 +329,7 @@ func (m *Model) Allocations() int { return len(m.all) }
 
 func (m *Model) allocActivations() error {
 	cfg := m.config
+	var err error
 	sizes := []struct {
 		dst **hip.Buffer
 		n   uint64
@@ -295,6 +359,25 @@ func (m *Model) allocActivations() error {
 			return err
 		}
 		*entry.dst = buf
+	}
+	// One Q8_1 row wide enough for the widest decode matvec input: hidden for
+	// the attention and feed-forward projections, and each layer's own width for
+	// its output projection and value path.
+	widest := uint64(cfg.HiddenSize)
+	for _, width := range []uint64{
+		uint64(cfg.HeadCount * cfg.HeadDim),
+		uint64(cfg.SSMInnerSize),
+		uint64(cfg.FFNSize),
+	} {
+		if width > widest {
+			widest = width
+		}
+	}
+	if m.act8.qs, err = m.allocDevice(widest); err != nil {
+		return err
+	}
+	if m.act8.ds, err = m.allocDevice((widest / 32) * 8); err != nil {
+		return err
 	}
 	return nil
 }

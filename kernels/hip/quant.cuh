@@ -271,3 +271,118 @@ __device__ __forceinline__ float packed_value(uint32_t dtype, const uint8_t * ro
             return 0.0f;
     }
 }
+
+// pack4_i8 packs four values in -128..127 into one 32-bit word in little-endian
+// byte order, which is the int8 order dp4a consumes.
+__device__ __forceinline__ int32_t pack4_i8(int a, int b, int c, int d) {
+    return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
+}
+
+// decode_span4_i8 decodes the four consecutive values of one packed weight row
+// that start at k into the int8 form dp4a consumes, and returns the affine
+// (scale, bias) of the sub-block that contains them, so that the four values are
+// scale * q + bias with q the digit the kernel dots against the activations.
+// The digit is the unsigned nibble for Q4_K (0..15), Q5_K (0..31), and Q4_0
+// (0..15), the signed 6-bit value for Q6_K (-32..31), and int8 for Q8_0.
+//
+// The contract matches decode_span4: k is a multiple of four and the span lies
+// inside one scale block, which every 32-value block layout and the four-values-
+// per-lane mapping guarantee. The per-value arithmetic is the same as q4k_value,
+// q5k_value, q6k_value, and q8_value; the reference tests check that the int8
+// route and the FP32 route agree to the recorded tolerance.
+template <uint32_t DType>
+__device__ __forceinline__ void decode_span4_i8(const uint8_t * row, int64_t k,
+                                               int32_t & q, float & scale,
+                                               float & bias) {
+    if constexpr (DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K) {
+        constexpr int kBlockBytes = (DType == YUUKA_DTYPE_Q4_K) ? 144 : 176;
+        const uint8_t * blk = row + (k / 256) * kBlockBytes;
+        const int j = static_cast<int>(k % 256);
+        const int sub = j / 32;
+        const int within = j & 31;
+        const uint8_t * ql = blk + (DType == YUUKA_DTYPE_Q4_K ? 16 : 48) +
+                             (sub / 2) * 32 + within;
+        // A Q4_K/Q5_K row stride is 144 or 176 bytes, so the four-byte read is
+        // naturally aligned.
+        uint32_t packed = 0;
+        __builtin_memcpy(&packed, ql, 4);
+        packed = (packed >> ((sub & 1) ? 4 : 0)) & 0x0F0F0F0Fu;
+        if constexpr (DType == YUUKA_DTYPE_Q5_K) {
+            // The fifth bit of each digit is one bit of four consecutive qh
+            // bytes, and it belongs at bit 4 of the matching output byte.
+            uint32_t high = 0;
+            __builtin_memcpy(&high, blk + 16 + within, 4);
+            packed |= ((high >> sub) & 0x01010101u) << 4;
+        }
+        q = static_cast<int32_t>(packed);
+        uint8_t sc = 0;
+        uint8_t m = 0;
+        get_scale_min_k4(sub, blk + 4, sc, m);
+        scale = load_f16_device(blk) * static_cast<float>(sc);
+        bias = -(load_f16_device(blk + 2) * static_cast<float>(m));
+    } else if constexpr (DType == YUUKA_DTYPE_Q6_K) {
+        const uint8_t * blk = row + (k / 256) * 210;
+        const int j = static_cast<int>(k % 256);
+        const int n = j / 128;
+        const int l = j % 128;
+        const uint8_t * ql = blk + n * 64;
+        const uint8_t * qh = blk + 128 + n * 32;
+        int qlbase = 0;
+        int qhbase = 0;
+        int shift = 0;
+        int sidx = 0;
+        if (l < 32) {
+            qlbase = l;
+            qhbase = l;
+            shift = 0;
+            sidx = l / 16;
+        } else if (l < 64) {
+            // The second 32-value group takes the low nibble of the second 32
+            // ql bytes, and its high bits are the same qh bytes as the first.
+            qlbase = l;
+            qhbase = l - 32;
+            shift = 2;
+            sidx = (l - 32) / 16 + 2;
+        } else if (l < 96) {
+            qlbase = l - 64;
+            qhbase = l - 64;
+            shift = 4;
+            sidx = (l - 64) / 16 + 4;
+        } else {
+            qlbase = l - 64;
+            qhbase = l - 96;
+            shift = 6;
+            sidx = (l - 96) / 16 + 6;
+        }
+        // A Q6_K row stride is 210 bytes, so a block base is only two-byte
+        // aligned and the two four-byte reads go through load_u32_pair.
+        const uint32_t low = load_u32_pair(ql + qlbase);
+        const uint32_t high = load_u32_pair(qh + qhbase);
+        // The low two 32-value groups of a 128-value slice take the low nibble
+        // of ql and the upper two take the high nibble.
+        const uint32_t nibbles = ((l < 64) ? low : (low >> 4)) & 0x0F0F0F0Fu;
+        const uint32_t top = ((high >> shift) & 0x03030303u) << 4;
+        const uint32_t span = nibbles | top;
+        // Each 6-bit digit is signed by subtracting 32; subtracting the packed
+        // constant would borrow across bytes, so each byte is converted alone.
+        q = pack4_i8(static_cast<int>(span & 0xFF) - 32,
+                     static_cast<int>((span >> 8) & 0xFF) - 32,
+                     static_cast<int>((span >> 16) & 0xFF) - 32,
+                     static_cast<int>(span >> 24) - 32);
+        const auto * scales = reinterpret_cast<const int8_t *>(blk + 192);
+        scale = load_f16_device(blk + 208) *
+                static_cast<float>(scales[n * 8 + sidx]);
+        bias = 0.0f;
+    } else if constexpr (DType == YUUKA_DTYPE_Q8_0) {
+        const uint8_t * blk = row + (k / 32) * 34;
+        const int within = static_cast<int>(k & 31);
+        // A Q8_0 row stride is 34 bytes, so the read is two-byte aligned.
+        q = static_cast<int32_t>(load_u32_pair(blk + 2 + within));
+        scale = load_f16_device(blk);
+        bias = 0.0f;
+    } else {
+        q = 0;
+        scale = 0.0f;
+        bias = 0.0f;
+    }
+}

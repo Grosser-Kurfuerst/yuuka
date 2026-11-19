@@ -377,9 +377,8 @@ Start at [`docs/README.md`](docs/README.md). The main design contracts are:
   observability;
 - [`docs/testing.md`](docs/testing.md) - correctness strategy, test matrix,
   benchmark protocol, and regression gates;
-- [`docs/roadmap.md`](docs/roadmap.md) - phases, deliverables, and exit criteria;
-- [`docs/roadmap2.md`](docs/roadmap2.md) - ordered prefill optimization plan and
-  measured attribution.
+- [`docs/benchmarks.md`](docs/benchmarks.md) - measured prefill, decode, and
+  serving results with reproduction steps.
 
 ## License
 
