@@ -738,17 +738,15 @@ extra work; see [kernels.md](kernels.md#91-chunkwise-form).
 
 The remaining gaps, in order of size:
 
-1. Decode, 1.6x: llama.cpp streams the 2.726 GB of quantized weights at about
-   170 GB/s, near the practical memory roofline; yuuka streams the same weights at
-   129.7 GB/s inside a step after moving the whole matvec family to the
-   channel-parallel kernel ([decode matvec](#decode-matvec)). What remains is 90%
-   matvec at 129.7 GB/s against a 244 GB/s read ceiling, plus 0.79 ms of gated
-   delta-net and 1.6 ms of other operations in a 23.4 ms step; the delta-net and
-   the submission gaps left the critical path with those fusions
+1. Decode, 1.6x at a 128-token prompt and 2.0-3.3x from 512 tokens of context
+   up. Two causes, attributed per operation in
+   [decode gap attribution](#decode-gap-attribution) and planned in
+   [roadmap.md](roadmap.md): the matvec family reads the 2.726 GB of weights at
+   129.7 GB/s where llama.cpp reads the same bytes at 209 GB/s, and the
+   paged decode attention kernel is serial in position at 1.04 ms per layer and
+   512 tokens where llama.cpp spends 0.0105 ms. The delta-net, the norms, and
+   the submission gaps are 2.5 ms of the step together
    ([gated delta-net](#gated-delta-net), [decode fusion](#decode-fusion)).
-   The matvec's remaining loss is a per-launch ramp of about 22 us on the 5-19 MB
-   matrices, which only merges of same-dtype, comparable-width projections
-   amortize.
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
    runs at 17-18 TFLOP/s against llama.cpp's int8 MMQ kernel, measured at
    24.9 TFLOP/s on the same device in the 2026-11-16 attribution (see
@@ -760,6 +758,69 @@ The remaining gaps, in order of size:
 4. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
    into one weight pass; yuuka re-reads the weights per request because fused
    mixed-shape decode batching is not implemented.
+
+### Decode gap attribution
+
+Measured 2026-11-19 at commit `7b7aa4c` against `../llama.cpp` build
+`b1b770d90` (12359, version 1.0.0), not against the `strix-llama.cpp` build of
+[environment and protocol](#environment-and-protocol), so these rows are not
+same-session comparable with the tables above; the yuuka token rates in them
+agree with [decode](#decode-output-length) within clock drift. Protocol:
+`yuuka bench --kv-type f32 --chunk-size 512`, `llama-bench -ngl 99 -b 512 -ub 512`
+(F16 KV), greedy, warmup then medians; yuuka per-operation numbers from
+`TestGPUProfileDecode`, llama.cpp numbers from `rocprofv3 --kernel-trace` around
+`llama-bench -p 0 -n 32 -r 2`, 65 decode steps reduced by kernel name and grid.
+
+Token rate by context, both engines flat or not:
+
+| Test | yuuka t/s | llama.cpp t/s | ratio |
+| --- | ---: | ---: | ---: |
+| tg32 after pp128 | 41.24 | 61.30 | 0.67 |
+| tg128 after pp128 | 38.63 | 61.99 | 0.62 |
+| tg512 after pp128 | 34.37 | 61.94 | 0.55 |
+| tg128 after pp512 | 31.37 | 61.84 | 0.51 |
+| tg32 after pp2048 | 18.44 | 61.49 | 0.30 |
+
+Per operation, one decode step: yuuka is 23.42 ms at a 64-token context and
+31.02 ms at 512 tokens (profiled, which adds a submission gap per operation;
+the unprofiled loop is 23.40 and 30.15 ms). The matvec family is 21.0 ms in
+both columns, because it does not depend on context. `attention_paged` is
+0.14 ms at a 7-token context, 1.34 ms at 64, and 8.31 ms at 512: 1.9 us per
+position per layer, from one dependent KV load, one 256-thread tree reduction,
+and two block barriers per position over a grid of 16 blocks.
+
+The reference step is 14.75 ms of kernels in a 16.13 ms loop: 13.02 ms of
+`mul_mat_vec_q` over the same 2,726 MB, 0.29 ms of `quantize_q8_1` (217
+launches), 0.37 ms of `rms_norm_f32`, 0.27 ms of `k_get_rows_float_vec`, 0.23 ms
+of `gated_delta_net_cuda`, and 0.067 ms of `flash_attn_tile` plus combine for
+all eight full-attention layers, flat at 0.084 ms at a 527-token context; the
+remaining 0.5 ms is elementwise, copy, concat and convolution launches.
+
+Per-shape weight bandwidth of the same projections inside a step. yuuka
+launches one block per 32 output channels, the reference one block per two
+output rows:
+
+| Projection | dtype | K -> N | yuuka blocks | yuuka GB/s | ref blocks | ref GB/s |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `attn_k`, `attn_v` | Q4_K | 2560 -> 1024 | 32 | 49 | 512 | 174 |
+| `attn_output` | Q4_K | 4096 -> 2560 | 80 | 96 | 1,280 | 185 |
+| `ffn_down` | Q4_K | 9216 -> 2560 | 80 | 96 | 1,280 | 185 |
+| `ssm_out` | Q5_K | 4096 -> 2560 | 80 | 103 | 1,280 | 210 |
+| `ffn_down` | Q6_K | 9216 -> 2560 | 80 | 138 | 1,280 | 192 |
+| `attn_gate` | Q4_K | 2560 -> 4096 | 128 | 113 | 2,048 | 202 |
+| `attn_q` | Q4_K | 2560 -> 8192 | 256 | 123 | 4,096 | 212 |
+| `attn_qkv` | Q5_K | 2560 -> 8192 | 256 | 132 | 4,096 | 219 |
+| `ffn_gate`, `ffn_up` | Q4_K | 2560 -> 9216 x2 | 288 | 141 | 4,608 | 219 |
+| `lm_head` | Q6_K | 2560 -> 248320 | 7,760 | 186 | 124,160 | 235 |
+| `ssm_alpha`, `ssm_beta` | Q8_0 | 2560 -> 32 | 1 | 10 | 16 | 19 |
+
+The reference is flat in `N` and in `K`; yuuka's bandwidth follows the grid
+size and not the shape, from 49 GB/s at 32 blocks to 186 GB/s at 7,760. The
+`2560 -> 1024` Q4_K matrix reaches 65 GB/s even in the resident-matrix sweep,
+where its 1.47 MB fits the 32 MB MALL cache, so the small-`N` loss is not a
+memory-system effect. The kernel mapping behind it is described in
+[kernels.md](kernels.md#4-operator-family-map) and the fix in
+[roadmap.md](roadmap.md#root-causes).
 
 ## Decisions and rejected routes
 
