@@ -1761,11 +1761,19 @@ func (p *Plan) AddAttentionPrefillPagedOffsetFormatAt(q *Buffer, qOff uint64, kP
 // scratch for up to four FP32 key ranges. The native launcher selects the
 // split count using the position supplied to Execute.
 func (p *Plan) AddAttentionPrefillPagedSplitFormatAt(q, kPool, vPool, out, table, partial *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	return p.AddAttentionPrefillPagedSplitTypedAt(q, kPool, vPool, out, table, partial,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, tensor.F16)
+}
+
+// AddAttentionPrefillPagedSplitTypedAt appends gated prefill attention with
+// borrowed split scratch and the storage dtype of both KV buffers. The
+// executor chooses the split count at submission from the current position.
+func (p *Plan) AddAttentionPrefillPagedSplitTypedAt(q, kPool, vPool, out, table, partial *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {
 	if partial == nil {
 		return errors.New("hip: split attention scratch is nil")
 	}
 	return p.addAttentionPrefillPagedFlag(q, 0, kPool, vPool, out, 0, table, partial,
-		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, tensor.F16, 0, false, false)
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, 0, false, false)
 }
 
 func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {

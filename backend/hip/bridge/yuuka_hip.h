@@ -441,7 +441,12 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                           BLAS F16 KV path with buf5 FP16 scratch;
  *                           optional buf6 holds split-key FP32 scratch
  *                           with four [rows,heads,head_dim+2] records and
- *                           one [rows,heads] prefix maximum array;
+ *                           one [rows,heads] prefix maximum array for gated
+ *                           256-wide, four-query-per-KV-head F16/F32/Q8_0;
+ *                           off[1] and off[2] select pool ranges aligned to
+ *                           16 bytes (F32 WMMA), 8 bytes (F16 WMMA), or
+ *                           2 bytes (Q8_0). Forced tiled F32 and F16 use
+ *                           natural FP32 and FP16 alignment;
  *                           n={kv_heads,heads,head_dim,kv_dim,rows,displacement};
  *                           first query position is execute position plus
  *                           displacement tokens;

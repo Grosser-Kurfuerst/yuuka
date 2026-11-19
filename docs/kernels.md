@@ -954,23 +954,34 @@ a 64-token prompt with the top-1 token unchanged; that is the same magnitude as
 changing the KV storage format from F32 to F16 on the tiled kernel (0.011 on the
 same prompt), which is the accuracy regime the current route runs in.
 
-#### Split-key F16 prefill
+#### Split-key paged prefill
 
-On gfx1151 the gated F16 path with 256-wide heads and four query heads per
-KV head supports a four-way key split for 512, 1024 and 2048 query rows
-starting at positions 6144 through 14336, inclusive. The 64- and 513-row
-tails use the split route for start positions 7680 through 14336 when
-the configured chunk has reserved split scratch. The executor uses the
-current query position with the cached plan. Short prefixes, other row
-counts and the single-query output tail use the unsplit policy.
-[Phase 2 split cells](prefill-optimization/phase2/acceptance/08b-f16-split-cells.md)
+On gfx1151, gated GQA with 256-wide heads and four query heads per KV
+head uses the measured four-range policy below when split scratch is bound.
+Start positions are inclusive.
+
+| KV format | Query rows | Start positions |
+| --- | --- | --- |
+| F16 | 512, 1024, 2048 | 6144–14336 |
+| F16 | 64, 513 | 7680–14336 |
+| F32 | 512 | 6144–14336 |
+| Q8_0 | 512 | 8192–14336 |
+
+The executor uses the effective query start with the cached plan. Other
+row counts, earlier prefixes, missing scratch, and the single-query
+output tail use the unsplit policy. The F32 and Q8_0 paths stage K alone
+during the max scan. Their partials read the same KV storage format as
+unsplit WMMA. The merge applies the output gate once.
+
+[Cross-format split acceptance](prefill-optimization/phase2/acceptance/08d-cross-format-split.md)
 
 A score-only pass over the leading 512 keys supplies a starting maximum
 for the later ranges. Each range keeps its own online FP32 maximum, sum
 and value accumulator. A wave merges the records for each row and head,
 then applies the output gate. ABI 8 binds the optional FP32 records and
 prefix maxima in slot 6. The plan reuses this scratch across layers on
-the same stream. [Split-key acceptance](prefill-optimization/phase1/acceptance/07-long-attention.md)
+the same stream. [Original F16 acceptance](prefill-optimization/phase1/acceptance/07-long-attention.md) ·
+[Expanded F16 cells](prefill-optimization/phase2/acceptance/08b-f16-split-cells.md)
 
 The earlier group-of-four tiled kernel (`attention_prefill_paged_gqa_f32_kernel`)
 is removed: the MMA kernel serves the same group at every shape the tiled kernel

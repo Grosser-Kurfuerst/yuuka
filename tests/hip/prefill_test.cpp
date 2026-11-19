@@ -1870,7 +1870,8 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
 
 bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
                                   yuuka_event * event, std::mt19937 & rng,
-                                  int position, int rows = 17, int auto_splits = -1) {
+                                  int position, int rows = 17, int auto_splits = -1,
+                                  yuuka_dtype dtype = YUUKA_DTYPE_F16) {
     constexpr int heads = 16, kv_heads = 4, head_dim = 256;
     constexpr int kv_dim = kv_heads * head_dim, block_size = 16;
     const int capacity = position + rows;
@@ -1880,15 +1881,22 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> query(2 * outputs);
     for (float & x : query) x = dist(rng);
-    std::vector<uint16_t> key(size_t(blocks) * block_size * kv_dim), value(key.size());
-    for (uint16_t & x : key) x = float_to_half(dist(rng));
-    for (uint16_t & x : value) x = float_to_half(dist(rng));
+    const int pool_rows = blocks * block_size;
+    const size_t pool_bytes = pool_rows * row_bytes(dtype, kv_dim);
+    std::vector<uint8_t> key(pool_bytes), value(pool_bytes);
+    if (dtype == YUUKA_DTYPE_F16) {
+        for (size_t i = 0; i < pool_bytes; i += 2) put_half(key.data() + i, dist(rng));
+        for (size_t i = 0; i < pool_bytes; i += 2) put_half(value.data() + i, dist(rng));
+    } else {
+        key = pack_weights(dtype, rng, kv_dim, pool_rows);
+        value = pack_weights(dtype, rng, kv_dim, pool_rows);
+    }
     std::vector<int32_t> table(static_cast<size_t>(blocks));
     for (int i = 0; i < blocks; ++i) table[i] = blocks - i - 1;
     Buffer qb, kb, vb, ob, tb, sb, short_scratch;
     bool ok = alloc(device, qb, query.size() * sizeof(float)) &&
-              alloc(device, kb, key.size() * sizeof(uint16_t)) &&
-              alloc(device, vb, value.size() * sizeof(uint16_t)) &&
+              alloc(device, kb, key.size()) &&
+              alloc(device, vb, value.size()) &&
               alloc(device, ob, outputs * sizeof(float)) &&
               alloc(device, tb, table.size() * sizeof(int32_t)) &&
               alloc(device, sb, scratch_bytes) &&
@@ -1913,7 +1921,7 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
         op.n[4] = rows;
         op.u[0] = block_size;
         op.u[1] = capacity;
-        op.u[2] = YUUKA_DTYPE_F16;
+        op.u[2] = dtype;
         op.f[0] = 1.0f / std::sqrt(float(head_dim));
         bool success = true;
         if (flag != 0) {
@@ -1942,8 +1950,8 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
     if (auto_splits >= 0) {
         const uint32_t forced = auto_splits == 4 ? YUUKA_OP_FLAG_PREFILL_SPLIT_4 : 0;
         ok = ok && run(forced, control) && run(0, got, true) && got == control;
-        std::printf("auto split attention rows=%d position=%d splits=%d: %s\n",
-                    rows, position, auto_splits, ok ? "ok" : "FAILED");
+        std::printf("auto split attention dtype=%u rows=%d position=%d splits=%d: %s\n",
+                    dtype, rows, position, auto_splits, ok ? "ok" : "FAILED");
     } else {
         std::vector<float> repeated(outputs);
         ok = ok && run(0, control);
@@ -1958,8 +1966,8 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
                 ok = std::isfinite(diff) && diff <= 5e-3 * (1.0 + std::fabs(control[i]));
                 max_abs = std::max(diff, max_abs);
             }
-            std::printf("split attention position=%d splits=%d: %s (max abs %.3g)\n",
-                        position, splits, ok ? "ok" : "FAILED", max_abs);
+            std::printf("split attention dtype=%u position=%d splits=%d: %s (max abs %.3g)\n",
+                        dtype, position, splits, ok ? "ok" : "FAILED", max_abs);
             splits *= 2;
         }
     }
@@ -2419,6 +2427,13 @@ int main() {
     ok = test_attention_prefill_split(device, stream, event, rng, 14336, 511, 0) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 7679, 513, 0) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 7680, 513, 4) && ok;
+    for (yuuka_dtype dtype : {YUUKA_DTYPE_F32, YUUKA_DTYPE_Q8_0}) {
+        ok = test_attention_prefill_split(device, stream, event, rng, 0, 17, -1, dtype) && ok;
+        ok = test_attention_prefill_split(device, stream, event, rng, 527, 17, -1, dtype) && ok;
+        const int start = dtype == YUUKA_DTYPE_Q8_0 ? 8192 : 6144;
+        ok = test_attention_prefill_split(device, stream, event, rng, start - 1, 512, 0, dtype) && ok;
+        ok = test_attention_prefill_split(device, stream, event, rng, start, 512, 4, dtype) && ok;
+    }
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::PerToken) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::Chunkwise) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 64, RecurrentPath::PerToken) && ok;

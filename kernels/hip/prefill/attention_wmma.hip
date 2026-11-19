@@ -98,26 +98,28 @@ __device__ __forceinline__ void stage_kv_tile(
                     *reinterpret_cast<const uint2 *>(vsrc);
             }
         } else if constexpr (DType == YUUKA_DTYPE_Q8_0) {
-            static_assert(!KeyOnly);
             const int64_t offset = row * kv_row_bytes(DType, kv_dim) + (col / 32) * 34;
             const int digit = static_cast<int>(col % 32);
             stage_q8_kv_values(kdst, static_cast<const uint8_t *>(k_pool) + offset, digit);
-            stage_q8_kv_values(vh + kk * HD + d,
-                               static_cast<const uint8_t *>(v_pool) + offset, digit);
+            if constexpr (!KeyOnly) {
+                stage_q8_kv_values(vh + kk * HD + d,
+                                   static_cast<const uint8_t *>(v_pool) + offset, digit);
+            }
         } else {
-            static_assert(!KeyOnly);
             const float * ksrc =
                 static_cast<const float *>(k_pool) + row * kv_dim + col;
-            const float * vsrc =
-                static_cast<const float *>(v_pool) + row * kv_dim + col;
             const float4 k4 = *reinterpret_cast<const float4 *>(ksrc);
-            const float4 v4 = *reinterpret_cast<const float4 *>(vsrc);
             __half2 * kout = reinterpret_cast<__half2 *>(kdst);
-            __half2 * vout = reinterpret_cast<__half2 *>(vh + kk * HD + d);
             kout[0] = __floats2half2_rn(k4.x, k4.y);
             kout[1] = __floats2half2_rn(k4.z, k4.w);
-            vout[0] = __floats2half2_rn(v4.x, v4.y);
-            vout[1] = __floats2half2_rn(v4.z, v4.w);
+            if constexpr (!KeyOnly) {
+                const float * vsrc =
+                    static_cast<const float *>(v_pool) + row * kv_dim + col;
+                const float4 v4 = *reinterpret_cast<const float4 *>(vsrc);
+                __half2 * vout = reinterpret_cast<__half2 *>(vh + kk * HD + d);
+                vout[0] = __floats2half2_rn(v4.x, v4.y);
+                vout[1] = __floats2half2_rn(v4.z, v4.w);
+            }
         }
     }
 }
@@ -448,11 +450,8 @@ hipError_t launch_attention_wmma_width(
     }
 }
 
-}  // namespace
-
-namespace yuuka {
-
-hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q,
+template <uint32_t DType>
+hipError_t launch_attention_split_dtype(float * out, const float * q,
         const void * k_pool, const void * v_pool, const int32_t * block_table,
         int block_size, int kv_heads, int heads, int kv_dim, int rows,
         int position, float scale, float * partial, int splits, hipStream_t stream) {
@@ -462,7 +461,7 @@ hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q
          kWmmaHeads * kWmmaQTile * kWmmaKTile) * sizeof(__half);
     static const hipError_t attribute = hipFuncSetAttribute(
         reinterpret_cast<const void *>(
-            &attention_prefill_paged_wmma_kernel<YUUKA_DTYPE_F16, head_dim, false, true>),
+            &attention_prefill_paged_wmma_kernel<DType, head_dim, false, true>),
         hipFuncAttributeMaxDynamicSharedMemorySize, shared);
     if (attribute != hipSuccess) return attribute;
     const dim3 grid(kv_heads, (rows + kWmmaQTile - 1) / kWmmaQTile, splits);
@@ -472,19 +471,19 @@ hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q
             head_dim * sizeof(__half);
         static const hipError_t max_attribute = hipFuncSetAttribute(
             reinterpret_cast<const void *>(
-                &attention_prefill_paged_wmma_kernel<YUUKA_DTYPE_F16, head_dim, false, true, true>),
+                &attention_prefill_paged_wmma_kernel<DType, head_dim, false, true, true>),
             hipFuncAttributeMaxDynamicSharedMemorySize, max_shared);
         if (max_attribute != hipSuccess) return max_attribute;
         range_max = partial + static_cast<int64_t>(splits) * rows * heads * (head_dim + 2);
         const dim3 max_grid(grid.x, grid.y);
-        attention_prefill_paged_wmma_kernel<YUUKA_DTYPE_F16, head_dim, false, true, true>
+        attention_prefill_paged_wmma_kernel<DType, head_dim, false, true, true>
             <<<max_grid, kWmmaThreads, max_shared, stream>>>(
                 nullptr, q, k_pool, nullptr, block_table, block_size, heads,
                 kv_dim, rows, position, scale, range_max, splits);
         const hipError_t error = hipGetLastError();
         if (error != hipSuccess) return error;
     }
-    attention_prefill_paged_wmma_kernel<YUUKA_DTYPE_F16, head_dim, false, true>
+    attention_prefill_paged_wmma_kernel<DType, head_dim, false, true>
         <<<grid, kWmmaThreads, shared, stream>>>(
             partial, q, k_pool, v_pool, block_table, block_size, heads, kv_dim, rows,
             position, scale, range_max, splits);
@@ -494,6 +493,33 @@ hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q
     merge_attention_partials_f32<<<blocks, kWmmaThreads, 0, stream>>>(
         out, q, partial, rows, heads, splits);
     return hipGetLastError();
+}
+
+}  // namespace
+
+namespace yuuka {
+
+hipError_t launch_attention_prefill_paged_split(float * out, const float * q,
+        const void * k_pool, const void * v_pool, const int32_t * block_table,
+        int block_size, int kv_heads, int heads, int kv_dim, int rows,
+        int position, float scale, float * partial, int splits, uint32_t dtype,
+        hipStream_t stream) {
+    switch (dtype) {
+        case YUUKA_DTYPE_F16:
+            return launch_attention_split_dtype<YUUKA_DTYPE_F16>(
+                out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
+                kv_dim, rows, position, scale, partial, splits, stream);
+        case YUUKA_DTYPE_F32:
+            return launch_attention_split_dtype<YUUKA_DTYPE_F32>(
+                out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
+                kv_dim, rows, position, scale, partial, splits, stream);
+        case YUUKA_DTYPE_Q8_0:
+            return launch_attention_split_dtype<YUUKA_DTYPE_Q8_0>(
+                out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
+                kv_dim, rows, position, scale, partial, splits, stream);
+        default:
+            return hipErrorInvalidValue;
+    }
 }
 
 size_t attention_wmma_shared_bytes(int head_dim) {

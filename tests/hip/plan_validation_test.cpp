@@ -26,6 +26,91 @@ yuuka_op make_op(uint32_t code, yuuka_buffer * buf) {
     return op;
 }
 
+bool test_split_attention_validation(yuuka_device * device, yuuka_buffer * table,
+                                     yuuka_dtype dtype) {
+    constexpr uint64_t heads = 4, head_dim = 256, capacity = 16;
+    constexpr uint64_t scratch_bytes = heads * (4 * (head_dim + 2) + 1) * sizeof(float);
+    const uint64_t pool_bytes = capacity *
+        (dtype == YUUKA_DTYPE_Q8_0 ? head_dim / 32 * 34 : head_dim * sizeof(float));
+    const uint64_t pool_offset = dtype == YUUKA_DTYPE_Q8_0 ? 2 : 16;
+    yuuka_buffer * io = nullptr;
+    yuuka_buffer * pool = nullptr;
+    yuuka_buffer * short_pool = nullptr;
+    yuuka_buffer * scratch = nullptr;
+    yuuka_buffer * short_scratch = nullptr;
+    yuuka_plan * plan = nullptr;
+    bool ok = yuuka_buffer_alloc(device, scratch_bytes, &io) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, pool_offset + pool_bytes, &pool) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, pool_offset + pool_bytes - 1, &short_pool) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, scratch_bytes, &scratch) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, scratch_bytes - 1, &short_scratch) == YUUKA_OK &&
+              yuuka_plan_create(device, &plan) == YUUKA_OK;
+    if (ok) {
+        yuuka_op op{};
+        op.code = YUUKA_OP_ATTENTION_PREFILL_PAGED;
+        op.flags = YUUKA_OP_FLAG_PREFILL_SPLIT_4;
+        op.buf[0] = io;
+        op.buf[1] = op.buf[2] = pool;
+        op.buf[3] = io;
+        op.buf[4] = table;
+        op.buf[6] = scratch;
+        op.off[1] = op.off[2] = pool_offset;
+        op.off[3] = 2 * heads * head_dim * sizeof(float);
+        op.n[0] = 1;
+        op.n[1] = heads;
+        op.n[2] = op.n[3] = head_dim;
+        op.n[4] = 1;
+        op.u[0] = op.u[1] = capacity;
+        op.u[2] = dtype;
+        const auto add = [&](const yuuka_op & desc, yuuka_status status, const char * name) {
+            ok = expect(yuuka_plan_add(plan, &desc), status, name) && ok;
+        };
+        std::printf("Split attention validation dtype=%u\n", dtype);
+        add(op, YUUKA_OK, "split exact-fit pool and scratch");
+        yuuka_op bad = op;
+        bad.buf[1] = short_pool;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split key pool one byte short");
+        bad = op;
+        bad.buf[2] = short_pool;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split value pool one byte short");
+        bad = op;
+        bad.off[1] = 1;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split key pool unaligned");
+        bad = op;
+        bad.buf[6] = short_scratch;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split scratch one byte short");
+        bad.buf[6] = io;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split scratch aliases query");
+        bad.buf[6] = nullptr;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "forced split without scratch");
+        bad = op;
+        bad.off[6] = 1;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split scratch unaligned");
+        bad = op;
+        bad.n[2] = bad.n[3] = 128;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split unsupported head width");
+        bad = op;
+        bad.u[3] = 1;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split dense query");
+        bad = op;
+        bad.u[2] = YUUKA_DTYPE_Q4_K;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split unsupported KV dtype");
+        bad = op;
+        bad.flags |= YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split with forced tiled flag");
+        bad = op;
+        bad.flags |= 1u << 31;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split with unknown flag");
+    } else {
+        std::fprintf(stderr, "split validation setup: %s\n", yuuka_last_error());
+    }
+    if (plan != nullptr) yuuka_plan_destroy(plan);
+    for (auto * buf : {io, pool, short_pool, scratch, short_scratch}) {
+        if (buf != nullptr) yuuka_buffer_free(buf);
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -419,6 +504,9 @@ int main() {
         yuuka_buffer_free(wide);
     }
 
+    for (yuuka_dtype dtype : {YUUKA_DTYPE_F32, YUUKA_DTYPE_Q8_0}) {
+        ok = test_split_attention_validation(device, roomy, dtype) && ok;
+    }
     yuuka_plan_destroy(plan);
     yuuka_buffer_free(roomy);
     yuuka_buffer_free(tiny);

@@ -144,27 +144,40 @@ func TestGPULongSplitAttentionMatchesDirect(t *testing.T) {
 		prompts = append(prompts, "The only global variable sets the program's default concurrency limit. A second workload starts on Tuesday at six o'clock. ")
 		capacity = 16384 + 16
 	}
-	rt, err := NewWithKVType(reader, model, capacity, tensor.F16)
-	if err != nil {
-		t.Fatal(err)
+	type formatCase struct {
+		dtype tensor.DType
+		cases []splitCase
 	}
-	defer rt.Close()
-	for i, text := range prompts {
-		ids, err := tok.Encode(strings.Repeat(text, 2000))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, tc := range cases {
-			t.Run(fmt.Sprintf("prompt%d/length%d/chunk%d", i, tc.length, tc.chunk), func(t *testing.T) {
-				if len(ids) < tc.length {
-					t.Fatalf("prompt has %d tokens, want %d", len(ids), tc.length)
-				}
-				if err := rt.SetPrefillChunk(tc.chunk); err != nil {
+	formats := []formatCase{{tensor.F16, cases}}
+	if os.Getenv("YUUKA_TEST_ATTENTION_LONG") == "1" {
+		aligned := []splitCase{{8192, 512}, {16384, 512}}
+		formats = append(formats, formatCase{tensor.F32, aligned}, formatCase{tensor.Q8_0, aligned})
+	}
+	for _, format := range formats {
+		t.Run(format.dtype.String(), func(t *testing.T) {
+			rt, err := NewWithKVType(reader, model, capacity, format.dtype)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rt.Close()
+			for i, text := range prompts {
+				ids, err := tok.Encode(strings.Repeat(text, 2000))
+				if err != nil {
 					t.Fatal(err)
 				}
-				checkGPULongSplitAttention(t, rt, ids[:tc.length])
-			})
-		}
+				for _, tc := range format.cases {
+					t.Run(fmt.Sprintf("prompt%d/length%d/chunk%d", i, tc.length, tc.chunk), func(t *testing.T) {
+						if len(ids) < tc.length {
+							t.Fatalf("prompt has %d tokens, want %d", len(ids), tc.length)
+						}
+						if err := rt.SetPrefillChunk(tc.chunk); err != nil {
+							t.Fatal(err)
+						}
+						checkGPULongSplitAttention(t, rt, ids[:tc.length])
+					})
+				}
+			}
+		})
 	}
 }
 

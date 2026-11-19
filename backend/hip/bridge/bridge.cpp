@@ -1271,16 +1271,23 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
     if (!kv_pool_bytes(dtype, paged_blocks(capacity, block_size), block_size, kv_dim, &pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill pool dimensions overflow");
     }
-    if (!buffer_range_ok(op.buf[1], 0, pool_bytes) ||
-        !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
-        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small");
+    const bool wmma_shape = heads / kv_heads == 4 &&
+        (head_dim == 64 || head_dim == 128 || head_dim == 256) &&
+        (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) == 0;
+    uint64_t pool_alignment = 2;
+    if (dtype == YUUKA_DTYPE_F32) pool_alignment = wmma_shape ? 16 : 4;
+    if (dtype == YUUKA_DTYPE_F16 && wmma_shape) pool_alignment = 8;
+    if (op.off[1] % pool_alignment != 0 || op.off[2] % pool_alignment != 0 ||
+        !buffer_range_ok(op.buf[1], op.off[1], pool_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small or unaligned");
     }
     const uint32_t split_flag = op.flags & YUUKA_OP_FLAG_PREFILL_SPLIT_MASK;
     if (op.buf[6] != nullptr) {
-        if (dtype != YUUKA_DTYPE_F16 || head_dim != 256 || heads / kv_heads != 4 ||
+        if (head_dim != 256 || heads / kv_heads != 4 ||
             op.u[3] != 0 ||
             (op.flags & (YUUKA_OP_FLAG_PREFILL_BLAS | YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED)) != 0) {
-            return fail(YUUKA_ERR_UNSUPPORTED, "split attention requires gated F16 GQA with head width 256");
+            return fail(YUUKA_ERR_UNSUPPORTED, "split attention requires gated GQA with head width 256");
         }
         uint64_t bytes = 0;
         if (__builtin_mul_overflow(heads, rows, &bytes) || bytes > INT32_MAX ||
