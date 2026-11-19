@@ -1,5 +1,7 @@
 # Stage 1a: Direct MMQ for arbitrary row counts
 
+> **Status:** Landed in `3caea06`. See [Stage 1a acceptance](acceptance/01-direct-rows.md).
+
 Implementation plan for Step 1a of the [Phase 2 roadmap](roadmap.md#stage-1-p1-eliminate-prompt-length-and-tail-chunk-cliffs-4-independent-steps).
 
 ## 1. Goal and scope

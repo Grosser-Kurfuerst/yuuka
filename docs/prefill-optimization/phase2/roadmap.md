@@ -138,6 +138,26 @@ Items are ranked by **real-world TTFT impact × engineering ROI**:
    `6.2–9.3 ms` per chunk due to `9.6%` occupancy and `6.0%` L2 hit rate.
 4. **P4, P6b, and P7** follow in order of workload breadth versus ABI/plumbing complexity.
 
+### Recommended execution order
+
+While Section 3 ranks items by impact category, concrete implementation follows the
+dependency- and risk-ordered sequence below so each step cleans up measurements for the
+next and isolates numerical changes:
+
+| Order | Slice | Plan | Status | Why here |
+| :---: | --- | --- | --- | --- |
+| **1** | **Step 1a** (`rows >= 128` Direct MMQ) | [stage1a-direct-rows.md](stage1a-direct-rows.md) | **Landed** (`3caea06`, [01](acceptance/01-direct-rows.md)) | Removes the `{128, 512, 2048}` cliff (`128 -> 129` `+45.92 ms` projections) and adds the row-masking mechanism in Direct MMQ that Step 1b later reuses for `<128` rows. |
+| **2** | **Steps 5a & 5b** (prefix-cache `Snapshot` gating & ordering) | [stage5ab-snapshot-critical-path.md](stage5ab-snapshot-critical-path.md) | **Landed** (`6e267d7`, `c09cd06`, [02](acceptance/02-snapshot-critical-path.md)) | Pure Go `serving` change (`~22` production LoC, zero kernel/ABI/numerical risk) pulled ahead of `1c/1b` to eliminate dead/critical-path D2H + logit serialization before benchmarking server SSE TTFT on `1c/1b`. |
+| **3** | **Step 1c** (`rows < 128` GDN crossover) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#31-step-1c-prepared-gdn-below-128-rows) | **Landed** (`b833b4e`, `260094f`, [03](acceptance/03-sub128-gdn.md)) | ~5-line threshold change in `plan.go` (`gdnPreparedMinRows = 2`), byte-identical to control (per Phase 1 `04b-gdn.md`); landing it before `1b` fixes GDN while isolating `1b`'s projection arithmetic changes. |
+| **4** | **Step 1b** (`rows < 128` projection crossover) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#32-step-1b-sub-128-projection-routes) | **Blocked** ([04](acceptance/04-sub128-projections.md)) | Changes projection arithmetic (`PrefillStreaming` FP32 / masked `Q8_1` MMQ) once GDN is fixed; currently blocked on numerical tolerances (`Q8_1` short-chunk drift) and cross-prompt FP32 bounds. |
+| **5** | **Step 1d** (CLI default chunk re-sweep) | [Section 4 · Step 1d](#stage-1-p1-eliminate-prompt-length-and-tail-chunk-cliffs-4-independent-steps) | Pending (`1b`) | Must run *after* `1a–1c` so the `chunk = 512 / 1024 / 2048` crossover is tuned on the updated tail and sub-128 kernels rather than stale penalties. |
+| **6** | **Stage 2** (`ssm_alpha`/`ssm_beta` `Q8_0`) | [Section 4 · Stage 2](#stage-2-p2-optimize-narrow-q8_0-ssm_alpha-and-ssm_beta-projections) | Pending | Highest remaining per-chunk tax (`6.2–9.3 ms`) once boundary cliffs are gone; Candidate 2a precedes Candidate 2b to keep FP32 gate precision unless 2b is needed. |
+| **7** | **Stage 3** (`Q6_K` Direct WMMA) | [Section 4 · Stage 3](#stage-3-p3-add-gfx1151-direct-wmma-specialization-for-q6_k) | Pending | Benefits all arbitrary `>= 128` lengths automatically after Step 1a routes them to Direct MMQ (`9216->2560` first, then `2560->1024`). |
+| **8** | **Stage 4** (Long-context Attention) | [Section 4 · Stage 4](#stage-4-p4-long-context-attention-optimization-and-kv-format-expansion-4-steps) | Pending | Sub-steps `4a -> 4b -> 4c -> 4d`: F16 LDS padding -> `>8K` Split-Key -> `Q8_0` WMMA -> cross-format Split-Key plumbing. |
+| **9** | **Step 5c** (Contiguous GDN state) | [Section 4 · Stage 5](#stage-5-p5-yuuka-server-prefix-cache-snapshot-and-contiguous-gdn-state-3-steps) | Pending | Separated from `5a/5b` because merging 48 buffers changes `session.go` allocation layout and per-layer offsets; shrinks the off-critical-path copy itself. |
+| **10** | **Steps 6a & 6b** (`M=1` tail GEMV & norm fusion) | [Section 4 · Stage 6](#stage-6-p6-split-into-6a-compact-m1-tail-gemv_q8_1-and-6b-sub-layer-normquant-fusion) | Pending | `6a` (pull-forward fallback if `pp128` misses +5% by `~1 ms` after Stage 2), then `6b` fused `Add + RMSNorm (+ Q8_1)`. |
+| **11** | **Stage 7** (2D L2 cache swizzling) | [Section 4 · Stage 7](#stage-7-p7-workgroup-l2-cache-swizzling-for-wide-direct-mmq) | Pending | Final pass after Step 1a's new grid mapping and Stages 2–6 stabilize memory traffic, judged strictly by unprofiled wall time. |
+
 ---
 
 ## 4. Phased implementation plan
@@ -171,7 +191,8 @@ verified steps:
     97.752 ms. At pp8192, chunk 1024 improved from 4517.265 to 3906.133 ms
     and chunk 4096 from 4514.581 to 3957.490 ms. Same-chunk logits matched
     bitwise in all 18 cells. [Stage 1a acceptance](acceptance/01-direct-rows.md)
-- **Step 1b — Sub-128 projection crossover (`rows < 128`, GDN held fixed)**:
+- **Step 1b — Sub-128 projection crossover (`rows < 128`, GDN held fixed)**
+  ([implementation plan](stage1bc-sub128-rows.md), lands after Step 1c):
   - *Changes*: Benchmark masked `64`-row Direct MMQ, `wmma_k32`, `gemv_batch`, and the
     multi-row streaming kernel ([lm_head.hip](../../../kernels/hip/gemm/lm_head.hip), `1..16` rows)
     across `rows = 1, 2, 4, 8, 16, 18, 32, 48, 64, 88, 96, 127` with GDN held constant.
@@ -183,7 +204,14 @@ verified steps:
     `512+18` vs `530`: verify identical greedy top-1 and 3-step continuation, and record
     logit max-abs delta). Projection time on `127`, `512+1`, `512+18`, `600` (`512+88`),
     and `2048+2` drops monotonically with row count.
-- **Step 1c — Sub-128 GDN preparation crossover**:
+  - *Status*: **Blocked on numerical acceptance** (not landed in `HEAD`). Initial `Q8_1`
+    MMQ (`>= 17` rows) candidate exceeded the `0.3` max logit bound (`2.805252` at `127`
+    rows) and pushed `TestGPUAttentionPathsAgree` to `0.495347 > 0.05` at `64` rows; an
+    FP32 streaming-only trial (`<= 16` rows) regressed CPU error on additional Chinese/English
+    `1–2` row inputs. [Stage 1b trial record](acceptance/04-sub128-projections.md)
+- **Step 1c — Sub-128 GDN preparation crossover**
+  ([implementation plan](stage1bc-sub128-rows.md), lands before Step 1b because it is
+  expected to be byte-identical):
   - *Changes*: Sweep `gdn_prepare_splitreg` + `gdn_chunk_prepared` versus inline
     `gdn_chunk_splitreg` at `rows = 8, 16, 18, 32, 64, 96, 127` and lower the `rows >= 128`
     guard in [plan.go](../../../engine/gpu/plan.go) to the measured win point.
@@ -290,13 +318,18 @@ are currently hardcoded to `F16`, Stage 4 is executed as four incremental steps 
 
 ### Stage 5 (P5): `yuuka-server` prefix-cache `Snapshot` and contiguous GDN state (3 steps)
 
-- **Step 5a — Skip `Snapshot` and logit serialization when prefix cache is disabled**:
+- **Step 5a — Skip `Snapshot` and logit serialization when prefix cache is disabled**
+  ([implementation plan for 5a/5b](stage5ab-snapshot-critical-path.md)):
   - *Changes*: Pass a `capturePrefix bool` flag from [serving/manager.go](../../../serving/manager.go)
     (`m.cache != nil`) into `newGenerationTask` in [serving/task.go](../../../serving/task.go) so
     `PrefillOnce` skips `t.seq.Snapshot()` and `serializeLogits(logits)` entirely when
     `--prefix-cache=false` (can be pulled forward alongside Stage 1).
   - *Acceptance*: Removes `~8.5 ms` of dead D2H/CPU work on `--prefix-cache=false` SSE TTFT;
     all `serving` tests pass.
+  - *Measured (`6e267d7`)*: **Landed.** In-process snapshot cost was `2.56–3.27 ms` + `~0.14 ms`
+    serialization; SSE first-content latency improved by `2.13–4.23 ms` (`138`/`528`/`2048`
+    tokens) under `cache=false`, accepted against observed capture cost.
+    [Stage 5a/5b acceptance](acceptance/02-snapshot-critical-path.md)
 - **Step 5b — Move enabled prefix-cache `Snapshot` after first-token emission**:
   - *Changes*: When `capturePrefix` is true, run `sampleAndEmit(logits)` first in
     `PrefillOnce` so the first SSE token chunk flushes immediately, then capture
@@ -305,6 +338,10 @@ are currently hardcoded to `F16`, Stage 4 is executed as four incremental steps 
   - *Acceptance*: Measurable `~7–8 ms` reduction in user-observed first-token SSE latency
     with `--prefix-cache=true`; subsequent requests hitting the cached prefix produce
     bit-identical logits and greedy tokens against the pre-change order; passes `go test -race ./serving/...`.
+  - *Measured (`c09cd06`)*: **Landed.** Saved `9.43 ms` (`138` tokens) and `6.47 ms` (`528`
+    tokens) in SSE, `2.87 ms` (`TTFT - prefill` delta at `2050` tokens in same-process A/B),
+    with identical cached/uncached tokens and zero total-latency regression.
+    [Stage 5a/5b acceptance](acceptance/02-snapshot-critical-path.md)
 - **Step 5c — Consolidate 48 per-layer GDN buffers into contiguous session storage**:
   - *Changes*: In [session.go](../../../engine/gpu/session.go), allocate one contiguous buffer
     laid out in per-layer interleaved `[conv_0, rec_0, conv_1, rec_1, ...]` order and bind
@@ -350,3 +387,57 @@ are currently hardcoded to `F16`, Stage 4 is executed as four incremental steps 
     zero regression (`<= 1%`) on any shape in `yuuka_prefill_sweep`.
   - **Diagnostic evidence**: `rocprofv3` `L2CacheHit` and `FETCH_SIZE` are recorded to
     explain the mechanism, not used as standalone acceptance criteria.
+
+---
+
+## 5. Current progress snapshot (commit `260094f`)
+
+Cumulative interleaved verification on the reference `gfx1151` host (`2026-11-19`,
+`Qwen3.5-4B-Q4_K_M`, SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`,
+`F16 KV`, `chunk=512`, `concurrency=1`, greedy, `power=auto`, temp `38 -> 63 °C`, CTest
+`10/10` pass):
+
+### 5.1 Upstream `llama.cpp v1.0.0` (`b1b770d90`) vs `HEAD` (`260094f`)
+
+Using `bench/prefill-compare` in `yuuka-1, llama-1, llama-2, yuuka-2` order (`2` warmups,
+`5` reps per process, pooled `10` samples):
+
+| Prompt | `260094f` (`chunk=512`) | `llama.cpp v1.0.0` | Speedup | Top-1 | `260094f` (`chunk=1024`) |
+| ---: | ---: | ---: | ---: | :---: | ---: |
+| 127 | 116.10 ms (`1093.9 tok/s`) | 67.19 ms (`1890.1 tok/s`) | `-42.12%` | Match | — |
+| 128 | 67.70 ms (`1890.8 tok/s`) | 67.38 ms (`1899.7 tok/s`) | `-0.47%` | Match | — |
+| 129 | 86.82 ms (`1485.8 tok/s`) | 73.26 ms (`1760.9 tok/s`) | `-15.62%` | Match | — |
+| 140 | 88.02 ms (`1590.5 tok/s`) | 74.26 ms (`1885.3 tok/s`) | `-15.64%` | Match | — |
+| **511** | **219.43 ms** (`2328.7 tok/s`) | 234.52 ms (`2179.0 tok/s`) | **`+6.87%`** | Match | — |
+| **512** | **215.58 ms** (`2375.0 tok/s`) | 231.67 ms (`2210.0 tok/s`) | **`+7.46%`** | Match | — |
+| 513 (`512+1`) | 292.09 ms (`1756.3 tok/s`) | 245.96 ms (`2085.7 tok/s`) | `-15.79%` | Match | — |
+| 530 (`512+18`) | 273.36 ms (`1938.9 tok/s`) | 259.17 ms (`2045.0 tok/s`) | `-5.19%` | Match | — |
+| 600 (`512+88`) | 320.45 ms (`1872.4 tok/s`) | 286.40 ms (`2094.9 tok/s`) | `-10.62%` | Match | — |
+| 1024 | — | — | — | — | **425.71 ms (`2405.4 tok/s`)** |
+| **2048** | **899.37 ms** (`2277.2 tok/s`) | 948.31 ms (`2159.6 tok/s`) | **`+5.44%`** | Match | **862.68 ms (`2374.0 tok/s`)** |
+| 2050 (`2048+2`) | 987.76 ms (`2075.4 tok/s`) | 960.09 ms (`2135.2 tok/s`) | `-2.80%` | Match | — |
+| **8192** | **4122.63 ms** (`1987.1 tok/s`) | 4215.05 ms (`1943.5 tok/s`) | **`+2.24%`** | Match | **3911.58 ms (`2094.3 tok/s`)** |
+
+### 5.2 Cumulative pre-Phase-2 control (`846fc4f`) vs `260094f` (`1a + 5ab + 1c`)
+
+All 18 lengths in `bench/prefill-compare` (`ctrl-1, cand-1, cand-2, ctrl-2`, `chunk=512`)
+remained **bitwise identical (`maxdiff = 0`)**:
+
+- **Non-power-of-two `>= 128` (Step 1a)**: `129` `114.94 -> 88.65 ms` (`-22.87%`), `140`
+  `116.57 -> 89.22 ms` (`-23.47%`), `256` `138.36 -> 117.78 ms` (`-14.88%`), `511`
+  `259.78 -> 223.59 ms` (`-13.93%`). Aligned `128`, `512`, `1024` (`442.79 ms` at `c=512`),
+  `2048`, and `8192` stayed within `-0.80%` to `+0.12%`.
+- **Sub-128 prepared GDN (Step 1c)**: `18` `60.24 -> 58.25 ms` (`-3.31%`), `64`
+  `84.62 -> 80.67 ms` (`-4.66%`), `96` `115.67 -> 108.83 ms` (`-5.91%`), `127`
+  `126.55 -> 119.04 ms` (`-5.93%`).
+- **`yuuka-server` SSE first-content TTFT (`ctrl-1, cand-1, cand-2, ctrl-2`, `14` samples)**:
+  - `--prefix-cache=false`: `~140` `127.63 -> 93.44 ms` (`-34.19 ms`), `~530`
+    `284.46 -> 278.86 ms` (`-5.60 ms`), `~2050` `916.84 -> 912.39 ms` (`-4.45 ms`).
+  - `--prefix-cache=true` (misses): `~140` `129.12 -> 93.45 ms` (`-35.67 ms`), `~530`
+    `287.39 -> 278.94 ms` (`-8.45 ms`), `~2050` `917.92 -> 915.20 ms` (`-2.72 ms`).
+- **Prefix-cache increment (`bench/serving` on `260094f`, 512-token prefix, `hits=11 misses=1`)**:
+  `append=2` TTFT `91.881 ms` (prefill `87.524 ms`); `append=18` TTFT `66.922 ms` (prefill
+  `62.688 ms`).
+- **Remaining gap**: Because Step 1b is blocked on numerical acceptance, `2`-row prefill
+  (`85.34 ms`), `127`-row prefill (`116.10–119.04 ms`), and `1–2` row tails (`513` at
+  `292.09 ms`, `+76.5 ms` over `512`) still use the pre-Phase-2 sub-128 projection paths.
