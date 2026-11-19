@@ -5,7 +5,30 @@ Execution order 11. Run after the accepted Stage 1a row mapping and Stages 2–6
 ## Iteration 1 — Establish the current mapping and cost
 
 1. In [gemm_mmq_kernel](../../../kernels/hip/gemm/mmq_gemm.hip), the native launch grid is shared with generic MMQ. A Direct workgroup computes 128 output channels by 64 tokens. The two halves of physical grid X select consecutive token tiles within a 128-row Y band. The fixed Q4_K 512-row specialization hardcodes its geometry. Trace both that specialization and the runtime-shaped path for aligned and masked rows.
-2. Use the [direct-only sweep](../../../bench/hip/prefill_sweep.cpp) with identical weights and prequantized input on both builds. Record M=128,129,192,511,512,1024,2048,4096 with width and dtype. Use two warmups/nine timed multiplies for these cells, one exclusive process. Record per-shape median/spread and **unprofiled** pp512/2048 final-host-logit time. Separately collect `rocprofv3` `L2CacheHit` and `FETCH_SIZE` per kernel, resource counts and launched vs useful tiles. Use the [counter scripts](../../../scripts/prefill_counters.sh) with the matching sweep ordering; the existing reducer assumes the default sweep.
+2. Use the [direct-only sweep](../../../bench/hip/prefill_sweep.cpp) with identical weights and prequantized input on both builds. Record M=128,129,192,511,512,1024,2048,4096 with width and dtype. Each cell prints the mean of nine timed multiplies after two warmups. Run the unprofiled sweep in repeated processes, one at a time, and report the median and spread of those per-process means. Measure pp512/2048 final-host-logit time separately.
+
+### Collect L2 counters on gfx1151
+
+Use the same sweep source for all mappings. For each of linear, group 8 and group 16, select the corresponding build and matching HIP library. From the repository root, set `build_dir` to that build directory. Run the following in Bash with the GPU exclusively available. Each invocation creates a fresh output directory.
+
+```bash
+(
+  set -eu
+  sweep=$(realpath "$build_dir/yuuka_prefill_sweep")
+  out=$(mktemp -d)
+  cd "$out"
+  printf 'Sweep: %s\nResults: %s\n' "$sweep" "$out"
+  "$sweep" --direct-mmq > unprofiled.log
+  for metric in L2CacheHit FETCH_SIZE; do
+    rocprofv3 -d "$out" -o "$metric" -f rocpd --kernel-trace true \
+      --pmc "$metric" -- "$sweep" --direct-mmq > "$metric.log"
+  done
+)
+```
+
+1. Record the mapping, build SHA, ROCm version and reported counter units with each run. The [existing counter script](../../../scripts/prefill_counters.sh) collects instruction, LDS and occupancy metrics on the default sweep. The commands above request each L2 metric explicitly on `--direct-mmq`.
+2. Use the emitted `dtype M=… N=… K=…` lines as the ordered cell list. Verify that their keys and order match across both profiled logs and the unprofiled log. In each `*_results.db`, select `gemm_mmq_kernel` dispatches in launch order and join that metric's values on `kernel_dispatch.event_id = pmc_event.event_id` within the same database. Exclude the activation quantization kernel. Expect 11 MMQ dispatches per cell, discard its first two warmups and take the median of its nine counter values. If the counts differ, resolve the trace-to-cell mapping before comparing results.
+3. Compare mappings by `(dtype, M, N, K)`. Report L2 hit percentage, fetch volume per dispatch with its unit, and launched versus useful tile counts alongside the **unprofiled** timings. Keep the profiled logs solely for attribution.
 
 ## Iteration 2 — Test groups of 8 and 16 channel blocks
 

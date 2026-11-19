@@ -239,7 +239,8 @@ exponential state decay and gating across hundreds of recurrent steps:
     loads and warp reductions across `(64 channels, row_tile)` workgroups while preserving
     exact FP32 dequantized dot-product semantics.
 - **Candidate 2b — `Q8_1` activation int8 dot-product route**:
-  - Consume the group's existing `p.xQ8` / `p.xDS` buffers with `__builtin_amdgcn_sdot4`
+  - Consume the group's existing `p.xQ8` / `p.xDS` buffers with the signed-operand
+    `__builtin_amdgcn_sudot4` form used by [the gfx1151 matvec](../../../kernels/hip/gemv/gemv_i8.hip)
     over `Q8_0` weights. Because this quantizes the activation feeding `alpha`/`beta`, it
     changes GDN gate inputs relative to FP32.
 - **Acceptance criteria**:
@@ -376,8 +377,9 @@ are currently hardcoded to `F16`, Stage 4 is executed as four incremental steps 
 ### Stage 7 (P7): Workgroup L2 cache swizzling for wide Direct MMQ
 
 - **Concrete changes**:
-  - *Re-baseline first*: Re-collect `L2CacheHit`, `FETCH_SIZE`, and isolated/end-to-end
-    timings *after* Stage 1a changes the Direct MMQ `64`-row grid mapping.
+  - After the preceding stages, collect `L2CacheHit` and `FETCH_SIZE` on the direct MMQ
+    sweep for each mapping. Measure isolated and end-to-end latency in separate unprofiled
+    runs. Follow the [Stage 7 counter procedure](stage7-direct-mmq-swizzle.md#collect-l2-counters-on-gfx1151).
   - [mmq_gemm.hip](../../../kernels/hip/gemm/mmq_gemm.hip): Swizzle 2D workgroup indices into
     channel-tile groups (`8` or `16` channel blocks across token tiles) for wide matrices
     (`n_out >= 8192`) with multiple token tiles.
