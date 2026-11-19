@@ -238,7 +238,7 @@ tests skipped for lack of their separate fixtures.
 
 Accepted. All three final pure MMQ medians meet 1.05 ms and the
 unprofiled pp512 runs repeat the gain. Both the
-[kernel contract](../../kernels.md#gfx1151-q4_k-specialization) and the
+[kernel contract](../../kernels.md#gfx1151-direct-mmq-specialization) and the
 [benchmark index](../../benchmarks.md#prefill-prompt-length) link the
 implemented path and measurements.
 

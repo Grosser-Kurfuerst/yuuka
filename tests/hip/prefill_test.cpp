@@ -1746,6 +1746,10 @@ int main() {
     }
     ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q4_K, "mmq Q4_K FFN",
                        2560, 9216, 512, rng) && ok;
+    ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q4_K, "mmq Q4_K direct K",
+                       2560, 1024, 128, rng) && ok;
+    ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K, "mmq Q5_K direct SSM out",
+                       4096, 2560, 128, rng) && ok;
     ok = test_blas(device, stream, event, rng) && ok;
     const struct {
         yuuka_dtype dtype;

@@ -122,6 +122,8 @@ including isolated MMQ, complete FFN and prompt-length medians.
 The [final FFN acceptance](prefill-optimization/acceptance/03-final-ffn.md)
 records the next F16 KV comparison, with one FFN row in the ordinary
 prefill output tail.
+The [MMQ shape expansion](prefill-optimization/acceptance/04a-mmq-shapes.md)
+records projection shape medians and the short- and long-prompt A/B.
 
 ## Decode: output length
 
@@ -502,7 +504,7 @@ Each of these is a measured decision that still holds in the current code:
   register prefetch of the next step's weights (192 VGPRs, 161-195 spills,
   6.4 TFLOP/s), a 64-value K step (16.4 TFLOP/s), and rebuilding the rocWMMA
   gfx11 operand duplication by storing duplicate operands in LDS. The
-  [gfx1151 specialization](kernels.md#gfx1151-q4_k-specialization) uses
+  [gfx1151 specialization](kernels.md#gfx1151-direct-mmq-specialization) uses
   LDS broadcast and vectorized activation staging on the measured Q4_K cell.
 - **The chunkwise gated delta-net form is implemented but not selected.** It
   matches the per-token recurrence to `1.6e-7` and removes the per-token barrier

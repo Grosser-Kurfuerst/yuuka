@@ -440,25 +440,37 @@ quantizes it once per group instead of once per projection
 (`prefillProjections` in `engine/gpu/plan.go`); a 512-row chunk runs 128
 `quant_q8_1` operations instead of 168.
 
-#### gfx1151 Q4_K specialization
+#### gfx1151 direct MMQ specialization
 
-The native launcher selects the specialization for `M=512, K=2560,
-N=9216` with 16-byte aligned packed weights and Q8_1 digits. gfx1151
-compiles the direct WMMA path, and other device targets compile the
-generic kernel. The direct tile covers 128 channels by 64 tokens.
+The native launcher selects direct MMQ for the measured shapes in the
+table, `M` in 128, 512 or 2048, and 16-byte aligned packed weights and
+Q8_1 digits. gfx1151 compiles the direct WMMA path. Other device targets
+compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
+
+| Weights | Input width | Output widths |
+| --- | ---: | --- |
+| Q4_K | 2560 | 1024, 4096, 8192, 9216 |
+| Q4_K | 4096, 9216 | 2560 |
+| Q5_K | 2560 | 8192 |
+| Q5_K | 4096 | 2560 |
+
+The original Q4_K FFN cell `M=512, K=2560, N=9216` uses its compile-time
+dimensions. The other cells pass dimensions into the same tile algorithm.
 Each half of the generic grid's x range covers the same 128-channel
-tiles for a different 64-token half. The grid keeps 576 blocks and the
-shared-memory allocation stays at 30 KiB.
+tiles for a different 64-token half. The shared-memory allocation is 30 KiB.
 
 Within each 512-byte operand region, the specialized LDS layout stores
 two contiguous 16-value slices per row. Both halves of each wave load the
 same operand from LDS. A staging thread reads packed weight bytes once
 for two adjacent subblocks and writes both sets of digit slices into
-LDS. Each activation block uses 16-byte vector loads and stores. Its
+LDS. Q5_K reads the shared fifth-bit words and extracts a separate bit
+plane for each of the same subblocks. Each activation block uses
+16-byte vector loads and stores. Its
 staging thread writes the FP32 scale and scaled sum once. The kernel
 completes both integer WMMA instructions and
 FP32 scale/min correction of each fragment before consuming the next
-fragment. [Performance and validation](prefill-optimization/acceptance/02-q4-ffn.md)
+fragment. [FFN cell](prefill-optimization/acceptance/02-q4-ffn.md) ·
+[Additional projections](prefill-optimization/acceptance/04a-mmq-shapes.md)
 
 ### 6.4 Dispatch
 

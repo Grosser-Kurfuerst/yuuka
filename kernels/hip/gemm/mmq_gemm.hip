@@ -313,38 +313,64 @@ __device__ __forceinline__ void stage_activations(int8_t * tile_b, float2 * scal
     }
 }
 
-// A packed block stores two adjacent subblocks in the low and high nibbles
-// of the same bytes. Read the bytes once, then build both operand pairs.
-[[maybe_unused]] __device__ __forceinline__ void stage_direct_weights(
-    int8_t * tile_a, float * scale_a, const uint8_t * w, int64_t n0, int64_t k0) {
+template <uint32_t DType>
+__device__ __forceinline__ uint32_t direct_digits(uint32_t ql, uint32_t qh,
+                                                int nibble, int subblock) {
+    uint32_t digits = (ql >> (4 * nibble)) & 0x0f0f0f0fu;
+    if constexpr (DType == YUUKA_DTYPE_Q5_K) {
+        digits |= ((qh >> subblock) & 0x01010101u) << 4;
+    }
+    return digits;
+}
+
+// Load the low and high nibbles of two neighboring subblocks together.
+// Q5_K also shares their packed high-bit bytes.
+template <uint32_t DType>
+__device__ __forceinline__ void stage_direct_weights(
+    int8_t * tile_a, float * scale_a, const uint8_t * w, uint64_t row_bytes,
+    int64_t n0, int64_t k0) {
+    constexpr bool kQ5 = DType == YUUKA_DTYPE_Q5_K;
+    constexpr int kBlockBytes = kQ5 ? 176 : 144;
+    constexpr int kLowOffset = kQ5 ? 48 : 16;
     for (int index = threadIdx.x; index < kDirectTileI * (kPairsPerStep / 2);
          index += kThreads) {
         const int channel = index % kDirectTileI;
         const int packed_pair = index / kDirectTileI;
-        const uint8_t * row = w + (n0 + channel) * kDirectWeightStride;
-        const uint8_t * block = row + (k0 / 256) * 144;
+        const uint8_t * row = w + (n0 + channel) * row_bytes;
+        const uint8_t * block = row + (k0 / 256) * kBlockBytes;
         const int first_sub = ((k0 % 256) / 32) + packed_pair * 2;
         const auto * input = reinterpret_cast<const uint4 *>(
-            block + 16 + (first_sub / 2) * 32);
+            block + kLowOffset + (first_sub / 2) * 32);
         const uint4 low = input[0];
         const uint4 high = input[1];
+        uint4 high_bits_low{};
+        uint4 high_bits_high{};
+        if constexpr (kQ5) {
+            const auto * bits = reinterpret_cast<const uint4 *>(block + 16);
+            high_bits_low = bits[0];
+            high_bits_high = bits[1];
+        }
         const float scale = load_f16_device(block);
         const float minimum = -load_f16_device(block + 2);
         #pragma unroll
         for (int nibble = 0; nibble < 2; ++nibble) {
             const int pair = 2 * packed_pair + nibble;
-            const int shift = 4 * nibble;
-            constexpr uint32_t mask = 0x0f0f0f0fu;
+            const int subblock = first_sub + nibble;
             auto * dst = reinterpret_cast<uint4 *>(
                 tile_a + fragment_offset<true>(channel / 16, pair, channel % 16, 0));
-            dst[0] = make_uint4((low.x >> shift) & mask, (low.y >> shift) & mask,
-                                (low.z >> shift) & mask, (low.w >> shift) & mask);
+            dst[0] = make_uint4(
+                direct_digits<DType>(low.x, high_bits_low.x, nibble, subblock),
+                direct_digits<DType>(low.y, high_bits_low.y, nibble, subblock),
+                direct_digits<DType>(low.z, high_bits_low.z, nibble, subblock),
+                direct_digits<DType>(low.w, high_bits_low.w, nibble, subblock));
             dst[kPairBytes / (2 * sizeof(uint4))] = make_uint4(
-                (high.x >> shift) & mask, (high.y >> shift) & mask,
-                (high.z >> shift) & mask, (high.w >> shift) & mask);
+                direct_digits<DType>(high.x, high_bits_high.x, nibble, subblock),
+                direct_digits<DType>(high.y, high_bits_high.y, nibble, subblock),
+                direct_digits<DType>(high.z, high_bits_high.z, nibble, subblock),
+                direct_digits<DType>(high.w, high_bits_high.w, nibble, subblock));
             uint8_t sc = 0;
             uint8_t mn = 0;
-            get_scale_min_k4(first_sub + nibble, block + 4, sc, mn);
+            get_scale_min_k4(subblock, block + 4, sc, mn);
             scale_a[(2 * pair) * kDirectTileI + channel] = scale * static_cast<float>(sc);
             scale_a[(2 * pair + 1) * kDirectTileI + channel] = minimum * static_cast<float>(mn);
         }
@@ -356,18 +382,18 @@ __device__ __forceinline__ void stage_activations(int8_t * tile_b, float2 * scal
 // both halves of the consumer wave can load the same operand.
 [[maybe_unused]] __device__ __forceinline__ void stage_direct_activations(
     int8_t * tile_b, float2 * scale_b, const int8_t * xs, const float2 * xds,
-    int64_t m0, int64_t k0) {
+    int64_t n_in, int64_t m0, int64_t k0) {
     for (int index = threadIdx.x; index < kDirectTileJ * kPairsPerStep; index += kThreads) {
         const int token = index % kDirectTileJ;
         const int pair = index / kDirectTileJ;
         const int64_t row = m0 + token;
         const int64_t col = k0 + pair * 32;
-        const auto * input = reinterpret_cast<const uint4 *>(xs + row * kDirectInput + col);
+        const auto * input = reinterpret_cast<const uint4 *>(xs + row * n_in + col);
         auto * dst = reinterpret_cast<uint4 *>(tile_b + fragment_offset<true>(
             token / kFragRows, pair, token % kFragRows, 0));
         dst[0] = input[0];
         dst[kPairBytes / (2 * sizeof(uint4))] = input[1];
-        scale_b[pair * kDirectTileJ + token] = xds[row * (kDirectInput / 32) + col / 32];
+        scale_b[pair * kDirectTileJ + token] = xds[row * (n_in / 32) + col / 32];
     }
 }
 
@@ -417,7 +443,7 @@ __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
 // lane l element e holds output row 2*e + l/16 of column l%16 inside the
 // 16x16 tile. Consequently one activation scale per lane (its column) and eight
 // weight scales per lane (its rows) are applied per block.
-template <uint32_t DType, bool Direct = false>
+template <uint32_t DType, bool Direct = false, bool FixedShape = Direct>
 __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * xds,
                                 const uint8_t * w, int64_t n_in, int64_t n_out,
                                 int64_t rows, uint64_t row_bytes) {
@@ -426,10 +452,11 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
 #else
     constexpr bool kUseDirect = false;
 #endif
-    if constexpr (kUseDirect) {
+    if constexpr (kUseDirect && FixedShape) {
         n_in = kDirectInput;
         n_out = kDirectOutput;
         rows = kDirectRows;
+        row_bytes = kDirectWeightStride;
     }
     extern __shared__ __align__(16) unsigned char smem[];
     int8_t * tile_a = reinterpret_cast<int8_t *>(smem);
@@ -444,10 +471,11 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     const int row_base = (kUseDirect ? warp : (warp & 3)) * 16;
     const int col_base = kUseDirect ? 0 : (warp / 4) * 64;
 
-    const int64_t n0 = kUseDirect ? (blockIdx.x % kDirectBlocksI) * kDirectTileI
+    const unsigned direct_blocks_i = FixedShape ? kDirectBlocksI : gridDim.x / 2;
+    const int64_t n0 = kUseDirect ? static_cast<int64_t>(blockIdx.x % direct_blocks_i) * kDirectTileI
                                   : static_cast<int64_t>(blockIdx.x) * kTileI;
     const int64_t m0 = static_cast<int64_t>(blockIdx.y) * kTileJ
-                       + (kUseDirect ? (blockIdx.x / kDirectBlocksI) * kDirectTileJ : 0);
+                       + (kUseDirect ? (blockIdx.x / direct_blocks_i) * kDirectTileJ : 0);
 
     // Q6_K carries one scale per 16 values and Q4_K/Q5_K one per 32 values, so
     // the slice group that shares a scale differs by dtype.
@@ -484,8 +512,8 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     for (int64_t step = 0; step < steps; ++step) {
         const int64_t k0 = step * kStepK;
         if constexpr (kUseDirect) {
-            stage_direct_weights(tile_a, scale_a, w, n0, k0);
-            stage_direct_activations(tile_b, scale_b, xs, xds, m0, k0);
+            stage_direct_weights<DType>(tile_a, scale_a, w, row_bytes, n0, k0);
+            stage_direct_activations(tile_b, scale_b, xs, xds, n_in, m0, k0);
         } else {
             stage_weights<DType>(tile_a, scale_a, w, row_bytes, n0, n_out, k0);
             stage_activations(tile_b, scale_b, xs, xds, m0, rows, n_in, k0);
@@ -495,7 +523,7 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
         for (int pair = 0; pair < kPairsPerStep; ++pair) {
 #if defined(__gfx1151__)
             if constexpr (kUseDirect) {
-                static_assert(DType == YUUKA_DTYPE_Q4_K);
+                static_assert(DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K);
                 using Operand = int32_t __attribute__((ext_vector_type(4)));
                 using Accum = int32_t __attribute__((ext_vector_type(8)));
                 const int slice_offset = pair * kPairBytes;
@@ -616,20 +644,36 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     }
 }
 
-template <uint32_t DType, bool Direct = false>
+template <uint32_t DType, bool Direct = false, bool FixedShape = Direct>
 void launch_mmq_tile(float * out, const int8_t * xs, const float2 * xds,
                      const uint8_t * w, int64_t n_in, int64_t n_out, int64_t rows,
                      uint64_t row_bytes, hipStream_t stream) {
     static const hipError_t attribute = hipFuncSetAttribute(
-        reinterpret_cast<const void *>(&gemm_mmq_kernel<DType, Direct>),
+        reinterpret_cast<const void *>(&gemm_mmq_kernel<DType, Direct, FixedShape>),
         hipFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
     // A rejected attribute makes the launch below fail with a clear device
     // error through the caller's hipGetLastError check; nothing runs silently.
     (void)attribute;
     const dim3 grid(static_cast<unsigned>((n_out + kTileI - 1) / kTileI),
                     static_cast<unsigned>((rows + kTileJ - 1) / kTileJ));
-    gemm_mmq_kernel<DType, Direct><<<grid, kThreads, kSharedBytes, stream>>>(
+    gemm_mmq_kernel<DType, Direct, FixedShape><<<grid, kThreads, kSharedBytes, stream>>>(
         out, xs, xds, w, n_in, n_out, rows, row_bytes);
+}
+
+// The vectorized direct path was measured for these model projections on
+// gfx1151. Every selected cell fills the complete channel and token tiles.
+bool measured_direct_shape(uint32_t dtype, int64_t n_in, int64_t n_out, int64_t rows) {
+    if (rows != 128 && rows != 512 && rows != 2048) {
+        return false;
+    }
+    if (dtype == YUUKA_DTYPE_Q4_K) {
+        if (n_in == 2560) {
+            return n_out == 1024 || n_out == 4096 || n_out == 8192 || n_out == 9216;
+        }
+        return n_out == 2560 && (n_in == 4096 || n_in == 9216);
+    }
+    return dtype == YUUKA_DTYPE_Q5_K &&
+           ((n_in == 2560 && n_out == 8192) || (n_in == 4096 && n_out == 2560));
 }
 
 } // namespace
@@ -669,12 +713,18 @@ void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
     const int64_t in = static_cast<int64_t>(n_in);
     const int64_t on = static_cast<int64_t>(n_out);
     const int64_t m = static_cast<int64_t>(batch);
+    const bool direct = measured_direct_shape(dtype, in, on, m) &&
+                        reinterpret_cast<uintptr_t>(qs) % alignof(uint4) == 0 &&
+                        reinterpret_cast<uintptr_t>(w) % alignof(uint4) == 0;
     switch (dtype) {
         case YUUKA_DTYPE_Q4_K:
-            if (in == kDirectInput && on == kDirectOutput && m == kDirectRows &&
-                reinterpret_cast<uintptr_t>(qs) % alignof(uint4) == 0 &&
-                reinterpret_cast<uintptr_t>(w) % alignof(uint4) == 0) {
+            if (direct && in == kDirectInput && on == kDirectOutput && m == kDirectRows) {
                 launch_mmq_tile<YUUKA_DTYPE_Q4_K, true>(
+                    out, activations, scales, weights, in, on, m, row_bytes, stream);
+                break;
+            }
+            if (direct) {
+                launch_mmq_tile<YUUKA_DTYPE_Q4_K, true, false>(
                     out, activations, scales, weights, in, on, m, row_bytes, stream);
                 break;
             }
@@ -682,6 +732,11 @@ void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
                                              on, m, row_bytes, stream);
             break;
         case YUUKA_DTYPE_Q5_K:
+            if (direct) {
+                launch_mmq_tile<YUUKA_DTYPE_Q5_K, true, false>(
+                    out, activations, scales, weights, in, on, m, row_bytes, stream);
+                break;
+            }
             launch_mmq_tile<YUUKA_DTYPE_Q5_K>(out, activations, scales, weights, in,
                                              on, m, row_bytes, stream);
             break;
