@@ -305,8 +305,7 @@ target is missed. Numerics: identical tokens over eight greedy steps with
 0.2656 maximum logit difference against the FP32 route, and 5.7e-4 relative
 against the quantized host reference in `tests/hip/gemv_test.cpp`.
 
-Re-evaluated on the remapped one-row mapping (roadmap step 5), 2026-11-19, same
-device and model:
+Re-evaluated on the remapped one-row mapping, 2026-11-19, same device and model:
 
 | Route | Matvec in step | Profiled step | Step over 32 decode steps |
 | --- | ---: | ---: | ---: |
@@ -319,7 +318,7 @@ loses the gate/up pair fusion: the paired Q4_K projection drops from 193.6 GB/s
 as one launch to 184.4 GB/s as two, and the 217 activation quantizations add
 operations of their own. The route is therefore 0.67 ms per step slower end to
 end and stays opt-in (`Options.Int8Matvec` with `PrequantizedInt8`), which is the
-negative result the roadmap asked to record. `TestGPUInt8MatvecMatchesFp32` now
+recorded negative result. `TestGPUInt8MatvecMatchesFp32` now
 pins both the fused and the pre-quantized variants to the same tokens.
 
 ## Speculative decoding
@@ -766,7 +765,7 @@ The remaining gaps, in order of size:
    [decode gap attribution](#decode-gap-attribution)). The matvec family reads
    the 2.726 GB of weights at 176 GB/s where llama.cpp reads them at 209, and
    the tail (norm launches, delta-net, conv/L2) is 0.5-1 ms of the 17.2 ms step
-   ([decode tail](#decode-tail)). The roadmap closed the two structural causes:
+   ([decode tail](#decode-tail)). Two structural causes were closed:
    decode attention is split over the key range and the matvec is one wave per
    output row.
 2. Prefill at short and mid prompt lengths, 1.3-1.7x: the quantized prefill GEMM
@@ -864,8 +863,8 @@ What remains, in order of size:
 
 ### Split-key decode attention
 
-Landed in [roadmap.md](roadmap.md) step 2. Measured 2026-11-19 on the same
-device and model (SHA-256 `00fe7986...`), `yuuka bench --kv-type f32
+Split-key decode attention landed on 2026-11-19. Measured on the same device
+and model (SHA-256 `00fe7986...`), `yuuka bench --kv-type f32
 --chunk-size 512`, greedy, warmup 2 and 3 repetitions, against the same
 llama.cpp build `b1b770d90`:
 
@@ -885,7 +884,7 @@ over the eight full-attention layers costs 21-24 us per layer at a 512-token
 context, 55/49/37 us at 1024, and 93/67/57 us at 2048 for F32/F16/Q8_0 KV.
 
 The 2048-token F32 figure moves 16 MB of KV per layer, which is 68 us at the
-235 GB/s read ceiling recorded in [roadmap.md](roadmap.md#open-questions), so
+235 GB/s read ceiling measured on this device, so
 what remains there is the pool bytes rather than the kernel; F16 and Q8_0 read
 half and a quarter of that. The same profile with all three pools
 (`YUUKA_TEST_DECODE_KV`) measures 0.096/0.071/0.061 ms per layer at 2048 tokens

@@ -89,12 +89,10 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
-| [roadmap.md](roadmap.md) | Stepwise decode optimization plan: measured attribution, per-step gates, rejected routes | Kernel and runtime contributors |
 
 ### Module indexes
 
 - [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
-- [Decode optimization roadmap](roadmap.md#implementation-order) — Implementation stages and gates for the single-request decode gap against llama.cpp.
 
 ## Implementation status
 
@@ -215,8 +213,7 @@ Other architectures are rejected at load time.
   [testing](testing.md).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
   [benchmarks](benchmarks.md) →
-  [Qwen prefill implementation plan](prefill-optimization/README.md) →
-  [decode optimization roadmap](roadmap.md).
+  [Qwen prefill implementation plan](prefill-optimization/README.md).
 - **Runtime/service work:** [architecture](architecture.md) →
   [serving](serving.md) → [benchmarks](benchmarks.md).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →

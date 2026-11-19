@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the decode comparison of docs/roadmap.md against llama.cpp.
+# Reproduce the decode comparison against llama.cpp recorded in docs/benchmarks.md.
 #
 # One command for the two halves of the comparison:
 #
@@ -47,7 +47,7 @@ usage() {
     cat <<'EOF'
 usage: decode_compare.sh --model PATH [options]
 
-Print the decode comparison tables of docs/roadmap.md.
+Print the decode comparison tables recorded in docs/benchmarks.md.
 
   --model PATH        GGUF both engines read. Its SHA-256 must match the recorded
                       comparison hash. Defaults to $YUUKA_TEST_MODEL.
