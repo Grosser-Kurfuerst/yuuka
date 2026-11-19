@@ -668,6 +668,100 @@ bool test_gemm_mmq_row_tail(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
+bool test_direct_q6_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+                        int64_t width, int64_t channels, std::mt19937 & rng) {
+    constexpr int64_t full_rows = 512;
+    constexpr int64_t block_values = 256;
+    constexpr int64_t block_bytes = 210;
+    const int64_t weight_stride = width / block_values * block_bytes;
+    auto packed = pack_weights(YUUKA_DTYPE_Q6_K, rng, width, channels);
+    std::vector<int8_t> weights(width * channels), digits(width * full_rows);
+    std::vector<float> scales(channels * width / 16), activation_scales(full_rows * width / 16);
+    for (int64_t n = 0; n < channels; ++n) {
+        for (int64_t k = 0; k < width; k += block_values) {
+            uint8_t * block = packed.data() + n * weight_stride + k / block_values * block_bytes;
+            put_half(block + 208, (1 + rng() % 7) * 0.0005f);
+            const float d = half_to_float(uint16_t(block[208] | block[209] << 8));
+            for (int j = 0; j < 16; ++j) {
+                const int magnitude = 1 + int(rng() % 31);
+                const int sign = j % 2 == 0 ? 1 : -1;
+                block[192 + j] = uint8_t(int8_t(sign * magnitude));
+                scales[(n * width + k) / 16 + j] = d * float(sign * magnitude);
+            }
+            for (int j = 0; j < block_values; ++j) {
+                const int half = j / 128;
+                const int region = (j % 128) / 32;
+                const int lane = j % 32;
+                const uint8_t ql = block[half * 64 + (region % 2) * 32 + lane];
+                const uint8_t qh = block[128 + half * 32 + lane];
+                const int low = (ql >> (region >= 2 ? 4 : 0)) & 15;
+                const int high = (qh >> (2 * region)) & 3;
+                weights[n * width + k + j] = int8_t(low + 16 * high - 32);
+            }
+        }
+    }
+    for (size_t block = 0; block < digits.size() / 32; ++block) {
+        const float dx = (1 + rng() % 5) * 0.001f;
+        int total = 0;
+        for (int j = 0; j < 32; ++j) {
+            const int digit = int(rng() % 255) - 127;
+            digits[32 * block + j] = int8_t(digit);
+            total += digit;
+        }
+        activation_scales[2 * block] = dx;
+        activation_scales[2 * block + 1] = dx * float(total);
+    }
+    std::vector<float> expected(full_rows * channels);
+    for (int64_t r = 0; r < full_rows; ++r) {
+        const int8_t * x = digits.data() + r * width;
+        const float * ds = activation_scales.data() + r * (width / 16);
+        for (int64_t n = 0; n < channels; ++n) {
+            const int8_t * w = weights.data() + n * width;
+            const float * dw = scales.data() + n * (width / 16);
+            float acc = 0;
+            for (int64_t k = 0; k < width; k += 16) {
+                int sum = 0;
+                for (int j = 0; j < 16; ++j) {
+                    sum += int(x[k + j]) * int(w[k + j]);
+                }
+                acc = std::fma(dw[k / 16] * ds[(k / 32) * 2], float(sum), acc);
+            }
+            expected[r * channels + n] = acc;
+        }
+    }
+
+    Buffer wb, qs, ds, out;
+    std::vector<float> got((full_rows + 1) * channels);
+    bool ok = alloc(device, wb, packed.size()) && upload_vec(wb, packed) &&
+              alloc(device, qs, digits.size()) && upload_vec(qs, digits) &&
+              alloc(device, ds, activation_scales.size() * sizeof(float)) &&
+              upload_vec(ds, activation_scales) &&
+              alloc(device, out, got.size() * sizeof(float));
+    for (int64_t rows : {128, 129, 192, 511, 512}) {
+        if (!ok) break;
+        const size_t valid = rows * channels;
+        ok = check_gemm_partial_output(out, valid, got, [&]() {
+            return check(yuuka_gemm_mmq(stream, out.buf, qs.buf, ds.buf, wb.buf, width,
+                                        channels, rows, YUUKA_DTYPE_Q6_K, event), "Q6_K MMQ") &&
+                   check(yuuka_event_wait(event), "Q6_K MMQ wait");
+        });
+        double max_diff = 0;
+        for (size_t i = 0; i < valid && ok; ++i) {
+            const double diff = std::fabs(double(got[i]) - double(expected[i]));
+            ok = std::isfinite(diff) && diff <= 2e-4;
+            max_diff = std::max(max_diff, diff);
+        }
+        std::printf("Q6_K MMQ %lldx%lld M=%lld: %s (max abs %.3g)\n",
+                    static_cast<long long>(width), static_cast<long long>(channels),
+                    static_cast<long long>(rows), ok ? "ok" : "FAILED", max_diff);
+    }
+    release(out);
+    release(ds);
+    release(qs);
+    release(wb);
+    return ok;
+}
+
 // Use the binary16 spacing and the default nearest-even rounding mode as
 // the independent CPU oracle for the finite operand range of the fixture.
 float round_pair_fp16(float value) {
@@ -2194,6 +2288,8 @@ int main() {
     ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K, "mmq Q5_K partial SSM out",
                        4096, 2560, 140, tail_rng) && ok;
     ok = test_gemm_mmq_row_tail(device, stream, event, tail_rng) && ok;
+    std::mt19937 q6_rng(732);
+    ok = test_direct_q6_mmq(device, stream, event, 9216, 2560, q6_rng) && ok;
     ok = test_blas(device, stream, event, rng) && ok;
     const struct {
         yuuka_dtype dtype;

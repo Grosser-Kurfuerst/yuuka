@@ -8,3 +8,4 @@
 - [Stage 1b-2 Direct FP16 WMMA](04b-direct-fp16-wmma.md) — Medium short-chunk tiles, numerical parity, and prefill and serving acceptance.
 - [Step 1d CLI prefill chunk sweep](05-cli-chunk-policy.md) — Paired chunk timing, boundary prompts, CLI first output, and device workspace.
 - [Stage 2 narrow Q8_0 projections](06-narrow-q8-projections.md) — FP32 trial, equivalent WMMA pair, original-route numerics, and upstream prefill timing.
+- [Stage 3A Direct Q6_K FFN down](07a-direct-q6k-ffn.md) — Packed staging, per-16 scales, CPU tensor parity, and FFN down timing.

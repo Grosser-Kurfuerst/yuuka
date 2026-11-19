@@ -377,6 +377,41 @@ __device__ __forceinline__ void stage_direct_weights(
     }
 }
 
+// Decode one 32-value Q6_K region with the same nibble order as q6k_span8.
+// Packed words use two-byte-aligned loads. The high bit prevents a borrow
+// between bytes when recentering the unsigned digits to signed int8.
+[[maybe_unused]] __device__ __forceinline__ void stage_direct_q6_weights(
+    int8_t * tile_a, float * scale_a, const uint8_t * w, uint64_t row_bytes,
+    int64_t n0, int64_t k0) {
+    for (int index = threadIdx.x; index < kDirectTileI * kPairsPerStep; index += kThreads) {
+        const int channel = index % kDirectTileI;
+        const int pair = index / kDirectTileI;
+        const uint8_t * row = w + (n0 + channel) * row_bytes;
+        const uint8_t * block = row + (k0 / 256) * 210;
+        const int segment = static_cast<int>(k0 % 256) / 32 + pair;
+        const int half = segment / 4;
+        const int region = segment % 4;
+        const uint8_t * ql = block + half * 64 + (region & 1) * 32;
+        const uint8_t * qh = block + 128 + half * 32;
+        uint32_t digits[8];
+        #pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            const uint32_t low = (load_u32_pair(ql + 4 * word) >> ((region / 2) * 4)) & 0x0f0f0f0fu;
+            const uint32_t high = (load_u32_pair(qh + 4 * word) >> (region * 2)) & 0x03030303u;
+            const uint32_t packed = low | (high << 4);
+            digits[word] = ((packed | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+        }
+        auto * dst = reinterpret_cast<uint4 *>(
+            tile_a + fragment_offset<true>(channel / 16, pair, channel % 16, 0));
+        dst[0] = make_uint4(digits[0], digits[1], digits[2], digits[3]);
+        dst[kPairBytes / (2 * sizeof(uint4))] = make_uint4(digits[4], digits[5], digits[6], digits[7]);
+        const float scale = load_f16_device(block + 208);
+        const auto * scales = reinterpret_cast<const int8_t *>(block + 192 + 2 * segment);
+        scale_a[(2 * pair) * kDirectTileI + channel] = scale * static_cast<float>(scales[0]);
+        scale_a[(2 * pair + 1) * kDirectTileI + channel] = scale * static_cast<float>(scales[1]);
+    }
+}
+
 // One thread owns both 16-byte slices and
 // writes the corresponding scale once. Each slice is contiguous in LDS so
 // both halves of the consumer wave can load the same operand.
@@ -531,7 +566,11 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     for (int64_t step = 0; step < steps; ++step) {
         const int64_t k0 = step * kStepK;
         if constexpr (kUseDirect) {
-            stage_direct_weights<DType>(tile_a, scale_a, w, row_bytes, n0, k0);
+            if constexpr (kScalePer16) {
+                stage_direct_q6_weights(tile_a, scale_a, w, row_bytes, n0, k0);
+            } else {
+                stage_direct_weights<DType>(tile_a, scale_a, w, row_bytes, n0, k0);
+            }
             stage_direct_activations<MaskRows>(tile_b, scale_b, xs, xds, n_in, m0, k0, rows);
         } else {
             stage_weights<DType>(tile_a, scale_a, w, row_bytes, n0, n_out, k0);
@@ -542,7 +581,8 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
         for (int pair = 0; pair < kPairsPerStep; ++pair) {
 #if defined(__gfx1151__)
             if constexpr (kUseDirect) {
-                static_assert(DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K);
+                static_assert(DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K ||
+                              DType == YUUKA_DTYPE_Q6_K);
                 using Operand = int32_t __attribute__((ext_vector_type(4)));
                 using Accum = int32_t __attribute__((ext_vector_type(8)));
                 const int slice_offset = pair * kPairBytes;
@@ -564,14 +604,24 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
                         tile_b + b_base[t] + slice_offset);
                     Accum accum = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
                         true, a0, true, b[0], Accum{}, true);
-                    accum = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
-                        true, a1, true, b[kPairBytes / (2 * sizeof(Operand))], accum, true);
                     const float2 dsb =
                         scale_b[pair * kDirectTileJ + col_base + t * 16 + (lane & 15)];
-                    #pragma unroll
-                    for (int e = 0; e < 8; ++e) {
-                        sum[t][e] = fmaf(wd[e] * dsb.x, static_cast<float>(accum[e]),
-                                         fmaf(wm[e], dsb.y, sum[t][e]));
+                    if constexpr (kScalePer16) {
+                        const Accum high = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                            true, a1, true, b[kPairBytes / (2 * sizeof(Operand))], Accum{}, true);
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            const float low = fmaf(wd[e] * dsb.x, static_cast<float>(accum[e]), sum[t][e]);
+                            sum[t][e] = fmaf(wm[e] * dsb.x, static_cast<float>(high[e]), low);
+                        }
+                    } else {
+                        accum = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                            true, a1, true, b[kPairBytes / (2 * sizeof(Operand))], accum, true);
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            sum[t][e] = fmaf(wd[e] * dsb.x, static_cast<float>(accum[e]),
+                                             fmaf(wm[e], dsb.y, sum[t][e]));
+                        }
                     }
                 }
                 continue;
@@ -691,6 +741,9 @@ bool measured_direct_shape(uint32_t dtype, int64_t n_in, int64_t n_out, int64_t 
         }
         return n_out == 2560 && (n_in == 4096 || n_in == 9216);
     }
+    if (dtype == YUUKA_DTYPE_Q6_K) {
+        return n_in == 9216 && n_out == 2560;
+    }
     return dtype == YUUKA_DTYPE_Q5_K &&
            ((n_in == 2560 && n_out == 8192) || (n_in == 4096 && n_out == 2560));
 }
@@ -783,6 +836,11 @@ void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
                                              on, m, row_bytes, stream);
             break;
         case YUUKA_DTYPE_Q6_K:
+            if (direct) {
+                launch_direct_mmq<YUUKA_DTYPE_Q6_K>(
+                    out, activations, scales, weights, in, on, m, row_bytes, stream);
+                break;
+            }
             launch_mmq_tile<YUUKA_DTYPE_Q6_K>(out, activations, scales, weights, in,
                                              on, m, row_bytes, stream);
             break;

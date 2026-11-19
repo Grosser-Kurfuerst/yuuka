@@ -507,7 +507,7 @@ int main(int argc, char ** argv) {
                     const auto run = direct ? run_direct_mmq : run_shape;
                     ok = run(device, stream, event, cell.dtype, cell.n_in, cell.n_out, m) && ok;
                 }
-            } else if (cell.dtype != YUUKA_DTYPE_Q6_K) {
+            } else {
                 for (int64_t m : {128, 129, 192, 511, 512, 1024, 2048, 4096}) {
                     ok = run_direct_mmq(device, stream, event, cell.dtype, cell.n_in,
                                         cell.n_out, m) && ok;
