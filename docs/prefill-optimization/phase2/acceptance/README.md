@@ -11,3 +11,4 @@
 - [Stage 3A Direct Q6_K FFN down](07a-direct-q6k-ffn.md) — Packed staging, per-16 scales, CPU tensor parity, and FFN down timing.
 - [Stage 3B Direct Q6_K attention V](07b-direct-q6k-attention.md) — V projection dispatch, alignment controls, and cumulative model timing.
 - [Stage 4a F16 attention LDS padding](08a-f16-lds-padding.md) — K/V stride trial, numerical parity, attention timing, and bank-conflict measurements.
+- [Stage 4b F16 split-key cells](08b-f16-split-cells.md) — Isolated direct and split timings, long-prompt numerics, and accepted dispatch ranges.

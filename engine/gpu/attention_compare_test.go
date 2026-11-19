@@ -3,6 +3,7 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"strings"
@@ -132,27 +133,52 @@ func TestGPULongSplitAttentionMatchesDirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 1200))
-	if err != nil {
-		t.Fatal(err)
+	type splitCase struct{ length, chunk int }
+	cases := []splitCase{
+		{8192, 2048},
 	}
-	const length = 8192
-	if len(ids) < length {
-		t.Fatalf("prompt has %d tokens, want %d", len(ids), length)
+	prompts := []string{"The quick brown fox jumps over the lazy dog. "}
+	capacity := 8192 + 16
+	if os.Getenv("YUUKA_TEST_ATTENTION_LONG") == "1" {
+		cases = append(cases, splitCase{7744, 512}, splitCase{14849, 1024}, splitCase{16384, 2048})
+		prompts = append(prompts, "The only global variable sets the program's default concurrency limit. A second workload starts on Tuesday at six o'clock. ")
+		capacity = 16384 + 16
 	}
-	rt, err := NewWithKVType(reader, model, length+16, tensor.F16)
+	rt, err := NewWithKVType(reader, model, capacity, tensor.F16)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rt.Close()
-	if err := rt.SetPrefillChunk(2048); err != nil {
-		t.Fatal(err)
+	for i, text := range prompts {
+		ids, err := tok.Encode(strings.Repeat(text, 2000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("prompt%d/length%d/chunk%d", i, tc.length, tc.chunk), func(t *testing.T) {
+				if len(ids) < tc.length {
+					t.Fatalf("prompt has %d tokens, want %d", len(ids), tc.length)
+				}
+				if err := rt.SetPrefillChunk(tc.chunk); err != nil {
+					t.Fatal(err)
+				}
+				checkGPULongSplitAttention(t, rt, ids[:tc.length])
+			})
+		}
 	}
+}
+
+func checkGPULongSplitAttention(t *testing.T, rt *Runtime, ids []int32) {
+	t.Helper()
 	m := rt.model
 	scratch := m.prefill.attentionSplit
 	if scratch == nil {
 		t.Skip("model or device does not select the gfx1151 split route")
 	}
+	defer func() {
+		m.prefill.attentionSplit = scratch
+		m.prefillGen++
+	}()
 	run := func(split bool) [][]float32 {
 		t.Helper()
 		if err := rt.session.Reset(); err != nil {
@@ -163,7 +189,7 @@ func TestGPULongSplitAttentionMatchesDirect(t *testing.T) {
 			m.prefill.attentionSplit = scratch
 		}
 		m.prefillGen++
-		logits, err := rt.session.Prefill(ids[:length], true)
+		logits, err := rt.session.Prefill(ids, true)
 		if err != nil {
 			t.Fatal(err)
 		}

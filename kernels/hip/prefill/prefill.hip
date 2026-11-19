@@ -900,8 +900,10 @@ hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
     }
     if (partial != nullptr) {
         const bool measured_rows = rows == 512 || rows == 1024 || rows == 2048;
-        const int measured_splits = measured_rows && position >= 6144 &&
-            position + rows <= 8192 ? 4 : 0;
+        const bool measured_tail = (rows == 64 || rows == 513) &&
+            position >= 7680;
+        const int measured_splits = (measured_rows || measured_tail) &&
+            position >= 6144 && position <= 14336 ? 4 : 0;
         const int splits = forced_splits != 0 ? forced_splits : measured_splits;
         if (splits != 0) {
             return launch_attention_prefill_paged_split_f16(

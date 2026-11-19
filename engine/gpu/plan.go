@@ -773,7 +773,8 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 			s.capacity, m.blockSize, scale, displacement); err != nil {
 			return err
 		}
-	} else if p.attentionSplit != nil && queryRows >= 512 {
+	} else if p.attentionSplit != nil && (queryRows == 64 ||
+		queryRows == 512 || queryRows == 513 || queryRows == 1024 || queryRows == 2048) {
 		if err := plan.AddAttentionPrefillPagedSplitFormatAt(p.q, m.poolK[layerIndex],
 			m.poolV[layerIndex], p.attn, s.tableBuf, p.attentionSplit,
 			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),

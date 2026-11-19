@@ -1845,13 +1845,13 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
 
 bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
                                   yuuka_event * event, std::mt19937 & rng,
-                                  int position) {
-    constexpr int rows = 17, heads = 16, kv_heads = 4, head_dim = 256;
+                                  int position, int rows = 17, int auto_splits = -1) {
+    constexpr int heads = 16, kv_heads = 4, head_dim = 256;
     constexpr int kv_dim = kv_heads * head_dim, block_size = 16;
     const int capacity = position + rows;
     const int blocks = (capacity + block_size - 1) / block_size;
-    constexpr size_t outputs = rows * heads * head_dim;
-    constexpr size_t scratch_bytes = rows * heads * (4 * (head_dim + 2) + 1) * sizeof(float);
+    const size_t outputs = rows * heads * head_dim;
+    const size_t scratch_bytes = rows * heads * (4 * (head_dim + 2) + 1) * sizeof(float);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> query(2 * outputs);
     for (float & x : query) x = dist(rng);
@@ -1870,7 +1870,7 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
               alloc(device, short_scratch, scratch_bytes - 1) &&
               upload_vec(qb, query) && upload_vec(kb, key) && upload_vec(vb, value) &&
               upload_vec(tb, table);
-    const auto run = [&](uint32_t flag, std::vector<float> & out) {
+    const auto run = [&](uint32_t flag, std::vector<float> & out, bool bind_auto = false) {
         yuuka_plan * plan = nullptr;
         if (!check(yuuka_plan_create(device, &plan), "split attention plan")) return false;
         yuuka_op op{};
@@ -1899,6 +1899,8 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
             op.off[6] = 1;
             success = success && yuuka_plan_add(plan, &op) == YUUKA_ERR_INVALID_ARGUMENT;
             op.off[6] = 0;
+        } else if (bind_auto) {
+            op.buf[6] = sb.buf;
         }
         success = success && check(yuuka_plan_add(plan, &op), "add split attention") &&
             execute(plan, stream, event, position) && download_vec(ob, out);
@@ -1911,22 +1913,30 @@ bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
         yuuka_plan_destroy(plan);
         return success;
     };
-    std::vector<float> control(outputs), got(outputs), repeated(outputs);
-    ok = ok && run(0, control);
-    int splits = 1;
-    for (uint32_t flag : {YUUKA_OP_FLAG_PREFILL_SPLIT_1, YUUKA_OP_FLAG_PREFILL_SPLIT_2,
-                          YUUKA_OP_FLAG_PREFILL_SPLIT_4}) {
-        if (!ok) break;
-        ok = run(flag, got) && run(flag, repeated) && got == repeated;
-        double max_abs = 0.0;
-        for (size_t i = 0; i < outputs && ok; ++i) {
-            const double diff = std::fabs(double(got[i]) - control[i]);
-            ok = std::isfinite(diff) && diff <= 5e-3 * (1.0 + std::fabs(control[i]));
-            max_abs = std::max(diff, max_abs);
+    std::vector<float> control(outputs), got(outputs);
+    if (auto_splits >= 0) {
+        const uint32_t forced = auto_splits == 4 ? YUUKA_OP_FLAG_PREFILL_SPLIT_4 : 0;
+        ok = ok && run(forced, control) && run(0, got, true) && got == control;
+        std::printf("auto split attention rows=%d position=%d splits=%d: %s\n",
+                    rows, position, auto_splits, ok ? "ok" : "FAILED");
+    } else {
+        std::vector<float> repeated(outputs);
+        ok = ok && run(0, control);
+        int splits = 1;
+        for (uint32_t flag : {YUUKA_OP_FLAG_PREFILL_SPLIT_1, YUUKA_OP_FLAG_PREFILL_SPLIT_2,
+                              YUUKA_OP_FLAG_PREFILL_SPLIT_4}) {
+            if (!ok) break;
+            ok = run(flag, got) && run(flag, repeated) && got == repeated;
+            double max_abs = 0.0;
+            for (size_t i = 0; i < outputs && ok; ++i) {
+                const double diff = std::fabs(double(got[i]) - control[i]);
+                ok = std::isfinite(diff) && diff <= 5e-3 * (1.0 + std::fabs(control[i]));
+                max_abs = std::max(diff, max_abs);
+            }
+            std::printf("split attention position=%d splits=%d: %s (max abs %.3g)\n",
+                        position, splits, ok ? "ok" : "FAILED", max_abs);
+            splits *= 2;
         }
-        std::printf("split attention position=%d splits=%d: %s (max abs %.3g)\n",
-                    position, splits, ok ? "ok" : "FAILED", max_abs);
-        splits *= 2;
     }
     for (Buffer * buf : {&qb, &kb, &vb, &ob, &tb, &sb, &short_scratch}) release(*buf);
     return ok;
@@ -2369,6 +2379,15 @@ int main() {
     ok = test_attention_prefill_mma(device, stream, event, rng) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 0) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 270) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 6143, 512, 0) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 6144, 512, 4) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 14336, 512, 4) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 14337, 512, 0) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 7679, 64, 0) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 7680, 64, 4) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 14336, 511, 0) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 7679, 513, 0) && ok;
+    ok = test_attention_prefill_split(device, stream, event, rng, 7680, 513, 4) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::PerToken) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::Chunkwise) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 64, RecurrentPath::PerToken) && ok;

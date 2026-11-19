@@ -950,10 +950,13 @@ same prompt), which is the accuracy regime the current route runs in.
 #### Split-key F16 prefill
 
 On gfx1151 the gated F16 path with 256-wide heads and four query heads per
-KV head supports a four-way key split for 512, 1024 and 2048 query rows in
-the measured window from position 6144 through token 8191. The executor
-uses the current position with the cached plan. Short prefixes and the
-single-query output tail use direct attention.
+KV head supports a four-way key split for 512, 1024 and 2048 query rows
+starting at positions 6144 through 14336, inclusive. The 64- and 513-row
+tails use the split route for start positions 7680 through 14336 when
+the configured chunk has reserved split scratch. The executor uses the
+current query position with the cached plan. Short prefixes, other row
+counts and the single-query output tail use direct attention.
+[Phase 2 split cells](prefill-optimization/phase2/acceptance/08b-f16-split-cells.md)
 
 A score-only pass over the leading 512 keys supplies a starting maximum
 for the later ranges. Each range keeps its own online FP32 maximum, sum
