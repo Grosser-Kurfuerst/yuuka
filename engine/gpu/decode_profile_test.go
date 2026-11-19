@@ -73,11 +73,16 @@ func TestGPUProfileDecode(t *testing.T) {
 	// YUUKA_TEST_DECODE_KV selects the KV pool format, so the same attribution and
 	// the same attention gate run for F32, F16, and Q8_0.
 	switch kv := os.Getenv("YUUKA_TEST_DECODE_KV"); kv {
-	case "", "f32":
+	case "":
+	case "f32":
+		opts.KVType = tensor.F32
+		opts.KVTypeSet = true
 	case "f16":
 		opts.KVType = tensor.F16
+		opts.KVTypeSet = true
 	case "q8_0":
 		opts.KVType = tensor.Q8_0
+		opts.KVTypeSet = true
 	default:
 		t.Fatalf("YUUKA_TEST_DECODE_KV=%q is not f32, f16, or q8_0", kv)
 	}

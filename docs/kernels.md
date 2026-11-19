@@ -31,7 +31,7 @@ resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
 token and position from device memory, and a versioned C ABI for
 device-to-device block copies and HIP Graph capture/replay. KV pools support
-F32 (default), F16, and Q8_0; see section 7.3. Prefill attention runs on the
+F16 (default), F32, and Q8_0; see section 7.3. Prefill attention runs on the
 FP16 MMA kernel for F32 and F16 pools whose shape it covers, and on the scalar
 per-lane tiled kernel otherwise (section 7.5).
 Continuous batching is scheduler-level interleaving of per-request plans;
@@ -815,7 +815,8 @@ Dynamic shared memory is `2 * 16 * 32 * (vec + 1) * 4` bytes, or 36 KiB at
 `head_dim = 256`. The kernels report 49-53 VGPRs, 48-63 SGPRs, no spills, and
 16 waves/SIMD. F16 KV is still loaded and staged as FP32; with the staged-V
 kernel it measured slightly slower than F32 KV at position 7680 (657.5 ms
-versus 643.1 ms), so F32 remains the default and F16 stays a capacity option.
+versus 643.1 ms). F16 is the project default; F32 remains available for the
+reference path and for that long-context tradeoff.
 The measured position-7680 attention time is 643 ms with F32 KV, down from
 2030 ms before this change.
 

@@ -111,10 +111,10 @@ type Engine struct {
 	Sampler   *Sampler
 }
 
-// New creates a CPU reference engine with an F32 KV cache. capacity must not
-// exceed the model context length.
+// New creates a CPU reference engine with a KV cache in DefaultKVFormat.
+// capacity must not exceed the model context length.
 func New(model *qwen35.Model, tok *tokenizer.Tokenizer, capacity int, sampler *Sampler) (*Engine, error) {
-	return NewWithKVFormat(model, tok, capacity, sampler, qwen35.KVF32)
+	return NewWithKVFormat(model, tok, capacity, sampler, qwen35.DefaultKVFormat)
 }
 
 // NewWithKVFormat creates a CPU reference engine with an explicit KV cache

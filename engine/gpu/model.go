@@ -14,6 +14,10 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
+// DefaultKVType is the full-attention KV pool storage used when
+// Options.KVTypeSet is false.
+const DefaultKVType = tensor.F16
+
 type weight struct {
 	buf   *hip.Buffer
 	dtype tensor.DType
@@ -85,9 +89,12 @@ type Options struct {
 	// reduced decode plan.
 	EnableGraph   bool
 	GraphMinSteps int
-	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
-	// Q8_0 are opt-in Phase 5 formats.
+	// KVType selects the full-attention KV pool storage when KVTypeSet is true.
+	// An unset selector uses DefaultKVType; tensor.F32 is the zero value, so it
+	// must set KVTypeSet to request the reference format explicitly.
 	KVType tensor.DType
+	// KVTypeSet distinguishes an explicit KVType from an unset selector.
+	KVTypeSet bool
 	// LegacyBlasAttention selects the rocBLAS prefill attention path for F16 KV
 	// pools. It is off by default: the FP16 MMA kernel covers the shapes this
 	// path can stage and is measured faster at every chunk length it accepts
@@ -199,7 +206,11 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 	if err := validateModelSupport(model); err != nil {
 		return nil, err
 	}
-	kvRow, err := hip.KVRowBytes(opts.KVType, int64(model.Config.KVHeadCount*model.Config.HeadDim))
+	kvType := opts.KVType
+	if !opts.KVTypeSet {
+		kvType = DefaultKVType
+	}
+	kvRow, err := hip.KVRowBytes(kvType, int64(model.Config.KVHeadCount*model.Config.HeadDim))
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +233,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		_ = device.Close()
 		return nil, err
 	}
-	useBlasAttention := opts.KVType == tensor.F16 && opts.LegacyBlasAttention
+	useBlasAttention := kvType == tensor.F16 && opts.LegacyBlasAttention
 	m := &Model{
 		attentionBlasCapable: useBlasAttention,
 		attentionBlasEnabled: useBlasAttention,
@@ -242,7 +253,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		blockSize:            opts.BlockSize,
 		blocks:               opts.Blocks,
 		capacity:             opts.Blocks * opts.BlockSize,
-		kvType:               opts.KVType,
+		kvType:               kvType,
 		kvRow:                kvRow,
 		poolK:                make([]*hip.Buffer, model.Config.BlockCount),
 		poolV:                make([]*hip.Buffer, model.Config.BlockCount),

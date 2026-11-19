@@ -103,8 +103,8 @@ regime llama.cpp's K-quant prefill also runs in.
 
 ## Prefill: prompt length
 
-`yuuka bench --backend hip --decode-tokens 1 --chunk-size 512`, F32 KV unless
-stated, median of five repetitions:
+`yuuka bench --backend hip --decode-tokens 1 --chunk-size 512 --kv-type f32`,
+F32 KV unless stated, median of five repetitions:
 
 | Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -157,7 +157,7 @@ the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
 ## Decode: output length
 
 `yuuka bench --backend hip --chunk-size 512 --prompt-tokens 128
---decode-tokens 128|256`, F32 KV, greedy, warmup 2 and median of 3
+--decode-tokens 128|256 --kv-type f32`, F32 KV, greedy, warmup 2 and median of 3
 repetitions, 2026-11-19 on gfx1151 with `Qwen3.5-4B-Q4_K_M`:
 
 | Decode tokens | Context | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |

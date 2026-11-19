@@ -21,10 +21,10 @@ type KVPool struct {
 	v         [][]byte
 }
 
-// NewKVPool allocates a pool of fixed-size F32 blocks. Recurrent layers have no
-// KV storage and are left nil.
+// NewKVPool allocates a pool of fixed-size blocks in DefaultKVFormat. Recurrent
+// layers have no KV storage and are left nil.
 func NewKVPool(cfg *Config, blocks, blockSize int) (*KVPool, error) {
-	return NewKVPoolWithFormat(cfg, blocks, blockSize, KVF32)
+	return NewKVPoolWithFormat(cfg, blocks, blockSize, DefaultKVFormat)
 }
 
 // NewKVPoolWithFormat allocates a pool of fixed-size blocks in format.

@@ -93,6 +93,7 @@ func run(cfg config) (err error) {
 		BlockSize:    blockSize,
 		PrefillChunk: chunk,
 		KVType:       tensor.F16,
+		KVTypeSet:    true,
 	})
 	if err != nil {
 		return err

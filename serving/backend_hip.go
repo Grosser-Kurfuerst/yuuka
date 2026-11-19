@@ -22,7 +22,7 @@ type Qwen35GPUBackend struct {
 func NewQwen35GPUBackend(reader *gguf.Reader, model *qwen35.Model, key string,
 	blocks, blockSize, prefillChunk int, graph bool) (*Qwen35GPUBackend, error) {
 	return NewQwen35GPUBackendWithKV(reader, model, key, blocks, blockSize,
-		prefillChunk, graph, tensor.F32)
+		prefillChunk, graph, gpu.DefaultKVType)
 }
 
 // NewQwen35GPUBackendWithKV is NewQwen35GPUBackend with an explicit KV pool
@@ -36,6 +36,7 @@ func NewQwen35GPUBackendWithKV(reader *gguf.Reader, model *qwen35.Model, key str
 		EnableGraph:   graph,
 		GraphMinSteps: 1,
 		KVType:        kvType,
+		KVTypeSet:     true,
 	})
 	if err != nil {
 		return nil, err

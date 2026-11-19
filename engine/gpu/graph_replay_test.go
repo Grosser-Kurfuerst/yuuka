@@ -48,8 +48,8 @@ func TestGPUGraphReplayMatchesAndTimes(t *testing.T) {
 	// must agree with each other.
 	var reference []int32
 	for _, kvType := range []tensor.DType{tensor.F32, tensor.F16, tensor.Q8_0} {
-		plainTokens, plainMS := run(Options{KVType: kvType})
-		graphTokens, graphMS := run(Options{KVType: kvType, EnableGraph: true,
+		plainTokens, plainMS := run(Options{KVType: kvType, KVTypeSet: true})
+		graphTokens, graphMS := run(Options{KVType: kvType, KVTypeSet: true, EnableGraph: true,
 			GraphMinSteps: 2})
 		if len(plainTokens) != len(graphTokens) {
 			t.Fatalf("%s: plain path produced %d tokens, replayed path %d", kvType,
