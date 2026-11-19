@@ -122,6 +122,7 @@ func logPrefillProfile(t *testing.T, kvType tensor.DType, position uint32,
 		26: "kv_write_paged", 27: "attention_paged", 28: "kv_write_batch_paged",
 		29: "attention_prefill_paged",
 		34: "gemm_swiglu", 35: "dequant_f16", 36: "quant_q8_1", 37: "lm_head",
+		38: "silu_mul_quant_q8_1",
 	}
 	totals := make(map[uint32]uint64)
 	counts := make(map[uint32]int)

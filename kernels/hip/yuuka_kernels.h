@@ -95,6 +95,9 @@ void launch_cast_f16_to_f32(void * dst, const void * src, uint64_t n,
  * 256, which every K-quant row layout already requires. */
 void launch_quantize_q8_1(void * qs, void * ds, const float * x, uint64_t n,
                           uint64_t batch, hipStream_t stream);
+void launch_silu_mul_quantize_q8_1(void * qs, void * ds, const float * gate,
+                                  const float * up, uint64_t n, uint64_t batch,
+                                  hipStream_t stream);
 void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
                             const void * w, uint64_t n_in, uint64_t n_out,
                             uint64_t batch, uint32_t dtype, hipStream_t stream);

@@ -401,8 +401,9 @@ __device__ __forceinline__ void stage_direct_weights(
 // values, four values per lane. Each 32-value block keeps its amax-derived FP32
 // scale and the scaled integer sum, which is what the Q4_K/Q5_K minimum term
 // needs. n is a multiple of 128, so a warp never crosses a row.
+template <bool SwiGLU>
 __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
-                                     int64_t n, int64_t warps) {
+                                     const float * up, int64_t n, int64_t warps) {
     const int64_t warp =
         static_cast<int64_t>(blockIdx.x) * kWarps + threadIdx.x / 32;
     if (warp >= warps) {
@@ -412,7 +413,15 @@ __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
     const int64_t warps_per_row = n / 128;
     const int64_t row = warp / warps_per_row;
     const int64_t col0 = (warp % warps_per_row) * 128 + lane * 4;
-    const float4 value = *reinterpret_cast<const float4 *>(x + row * n + col0);
+    const int64_t index = row * n + col0;
+    float4 value = *reinterpret_cast<const float4 *>(x + index);
+    if constexpr (SwiGLU) {
+        const float4 u = *reinterpret_cast<const float4 *>(up + index);
+        value.x = (value.x / (1.0f + expf(-value.x))) * u.x;
+        value.y = (value.y / (1.0f + expf(-value.y))) * u.y;
+        value.z = (value.z / (1.0f + expf(-value.z))) * u.z;
+        value.w = (value.w / (1.0f + expf(-value.w))) * u.w;
+    }
     float amax = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
                        fmaxf(fabsf(value.z), fabsf(value.w)));
     #pragma unroll
@@ -425,7 +434,7 @@ __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
     const int q1 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, rintf(value.y * inv))));
     const int q2 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, rintf(value.z * inv))));
     const int q3 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, rintf(value.w * inv))));
-    *reinterpret_cast<int32_t *>(qs + row * n + col0) = pack4(q0, q1, q2, q3);
+    *reinterpret_cast<int32_t *>(qs + index) = pack4(q0, q1, q2, q3);
     float sum = static_cast<float>(q0 + q1 + q2 + q3);
     #pragma unroll
     for (int offset = 1; offset < 8; offset <<= 1) {
@@ -687,8 +696,18 @@ void launch_quantize_q8_1(void * qs, void * ds, const float * x, uint64_t n,
     }
     const int64_t warps = static_cast<int64_t>((n * batch) / 128);
     const int64_t blocks = (warps + kWarps - 1) / kWarps;
-    quantize_q8_1_kernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
-        static_cast<int8_t *>(qs), static_cast<float2 *>(ds), x,
+    quantize_q8_1_kernel<false><<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+        static_cast<int8_t *>(qs), static_cast<float2 *>(ds), x, nullptr,
+        static_cast<int64_t>(n), warps);
+}
+
+void launch_silu_mul_quantize_q8_1(void * qs, void * ds, const float * gate,
+                                  const float * up, uint64_t n, uint64_t batch,
+                                  hipStream_t stream) {
+    const int64_t warps = static_cast<int64_t>((n * batch) / 128);
+    const int64_t blocks = (warps + kWarps - 1) / kWarps;
+    quantize_q8_1_kernel<true><<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+        static_cast<int8_t *>(qs), static_cast<float2 *>(ds), gate, up,
         static_cast<int64_t>(n), warps);
 }
 

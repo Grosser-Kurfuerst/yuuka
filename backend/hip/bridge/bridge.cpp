@@ -213,6 +213,34 @@ yuuka_status validate_quantize_plan_op(const yuuka_op & op) {
                                   op.off[1], op.buf[2], op.off[2]);
 }
 
+yuuka_status validate_silu_mul_quantize_plan_op(const yuuka_op & op) {
+    const uint64_t n = op.n[0];
+    const uint64_t rows = op.n[1];
+    const yuuka_status status = validate_q8_1_quantize(
+        n, rows, op.buf[0], op.off[0], op.buf[2], op.off[2], op.buf[3], op.off[3]);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    const uint64_t elements = n * rows;
+    const uint64_t bytes[] = {elements * 4, elements * 4, elements, elements / 4};
+    if (!buffer_range_ok(op.buf[1], op.off[1], bytes[1])) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "silu q8_1 up buffer is too small");
+    }
+    if (op.off[0] % 16 != 0 || op.off[1] % 16 != 0 ||
+        op.off[2] % 4 != 0 || op.off[3] % 8 != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "silu q8_1 buffer offset is unaligned");
+    }
+    for (int dst = 2; dst < 4; ++dst) {
+        for (int src = 0; src < dst; ++src) {
+            if (op.buf[src] == op.buf[dst] && op.off[src] < op.off[dst] + bytes[dst] &&
+                op.off[dst] < op.off[src] + bytes[src]) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "silu q8_1 output overlaps buffer %d", src);
+            }
+        }
+    }
+    return YUUKA_OK;
+}
+
 // validate_gemv_plan_op checks a GEMV or GEMV_BATCH operation before it enters
 // the plan. Unsupported dtypes and block-misaligned widths are capability
 // failures; invalid dimensions and undersized buffers are argument failures.
@@ -1799,6 +1827,12 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                                         stream);
             break;
         }
+        case YUUKA_OP_SILU_MUL_QUANT_Q8_1: {
+            yuuka::launch_silu_mul_quantize_q8_1(
+                op_ptr<void>(op, 2), op_ptr<void>(op, 3), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), op.n[0], op.n[1], stream);
+            break;
+        }
         case YUUKA_OP_RMSNORM: {
             auto * dst = op_ptr<float>(op, 2);
             const auto * src = op_ptr<const float>(op, 0);
@@ -3110,7 +3144,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_LM_HEAD) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_SILU_MUL_QUANT_Q8_1) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3159,6 +3193,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_QUANT_Q8_1:
                 status = validate_quantize_plan_op(*op);
+                break;
+            case YUUKA_OP_SILU_MUL_QUANT_Q8_1:
+                status = validate_silu_mul_quantize_plan_op(*op);
                 break;
             case YUUKA_OP_LM_HEAD:
                 status = validate_lm_head_plan_op(*op);

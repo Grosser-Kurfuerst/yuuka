@@ -126,6 +126,8 @@ The [MMQ shape expansion](prefill-optimization/acceptance/04a-mmq-shapes.md)
 records projection shape medians and the short- and long-prompt A/B.
 The [prepared GDN comparison](prefill-optimization/acceptance/04b-gdn.md)
 records the recurrence timings and the model-state comparison by lane mapping.
+The [FFN fusion comparison](prefill-optimization/acceptance/05-ffn-fusion.md)
+records the isolated quantizer check, complete FFN time and prompt rates.
 
 ## Decode: output length
 

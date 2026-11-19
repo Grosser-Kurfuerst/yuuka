@@ -438,7 +438,15 @@ warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
 The q/k/v and qkv/gate groups read the same normalized tile, so the plan
 quantizes it once per group instead of once per projection
 (`prefillProjections` in `engine/gpu/plan.go`); a 512-row chunk runs 128
-`quant_q8_1` operations instead of 168.
+`quant_q8_1` operations instead of 168 before FFN activation fusion.
+
+When gate, up and down all select MMQ, the FFN uses the same Q8_1 inputs
+for gate and up, then reuses those buffers for down on the same stream.
+The ABI 6 `SILU_MUL_QUANT_Q8_1` operation reads the FP32 gate and up
+projections, applies SwiGLU and writes Q8_1 digits and block scales. It
+uses the plain quantizer's scale, rounding and sum rules and skips
+materializing the activated FP32 tensor. The compact final FFN uses
+its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/acceptance/05-ffn-fusion.md)
 
 #### gfx1151 direct MMQ specialization
 

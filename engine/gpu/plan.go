@@ -710,6 +710,7 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 	// epilogue, so neither intermediate is written.
 	gatePath := hip.SelectPrefillPath(gate.dtype, dispatchRows, hidden, ffn)
 	upPath := hip.SelectPrefillPath(up.dtype, dispatchRows, hidden, ffn)
+	downPath := hip.SelectPrefillPath(down.dtype, dispatchRows, ffn, hidden)
 	fused := gate.dtype == up.dtype && gatePath == hip.PrefillWMMA
 	if fused {
 		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, p.norm, 0,
@@ -728,6 +729,17 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 		if err := plan.AddGemmMmqAt(up.buf, 0, p.xQ8, p.xDS, p.ffnUp, 0, hidden, ffn, rows, up.dtype); err != nil {
 			return err
 		}
+		if downPath == hip.PrefillMMQ {
+			// Both projections have consumed the normalized input. Reuse its
+			// Q8_1 scratch for the down projection on the same stream.
+			if err := plan.AddSiluMulQuantQ8_1At(p.ffnGate, 0, p.ffnUp, 0, p.xQ8, 0, p.xDS, 0, ffn, rows); err != nil {
+				return err
+			}
+			if err := plan.AddGemmMmqAt(down.buf, 0, p.xQ8, p.xDS, p.tmp, 0, ffn, hidden, rows, down.dtype); err != nil {
+				return err
+			}
+			return plan.Add(p.x, p.tmp, rows*hidden)
+		}
 	} else {
 		if err := m.prefillMatmulPath(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows, gatePath); err != nil {
 			return err
@@ -741,7 +753,6 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 			return err
 		}
 	}
-	downPath := hip.SelectPrefillPath(down.dtype, dispatchRows, ffn, hidden)
 	if err := m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath); err != nil {
 		return err
 	}

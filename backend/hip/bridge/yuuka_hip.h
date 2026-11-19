@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 5
+#define YUUKA_HIP_ABI_VERSION 6
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -138,7 +138,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_GEMM_SWIGLU = 34,
     YUUKA_OP_DEQUANT_F16 = 35,
     YUUKA_OP_QUANT_Q8_1 = 36,
-    YUUKA_OP_LM_HEAD = 37
+    YUUKA_OP_LM_HEAD = 37,
+    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 38
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -152,9 +153,8 @@ typedef enum yuuka_op_code {
  * weights, an FP16 x, and an FP16 scratch buffer that receives the FP32-accumulated
  * product before it is cast to the FP32 result. WMMA is the custom rocWMMA
  * kernel, which accepts FP32 x and every supported weight dtype. MMQ is the
- * int8 route: Q4_K/Q5_K/Q6_K weights, Q8_1 activations produced by
- * YUUKA_OP_QUANT_Q8_1 in buf[1], their float2 block scales in buf[3], and FP32
- * output. */
+ * int8 route: Q4_K/Q5_K/Q6_K weights, Q8_1 activations in buf[1], their
+ * float2 block scales in buf[3], and FP32 output. */
 #define YUUKA_GEMM_PATH_AUTO 0u
 #define YUUKA_GEMM_PATH_BLAS 1u
 #define YUUKA_GEMM_PATH_WMMA 2u
@@ -303,7 +303,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
  * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, CAST_F16,
- * DEQUANT_F16, and QUANT_Q8_1. Unsupported
+ * DEQUANT_F16, QUANT_Q8_1, and SILU_MUL_QUANT_Q8_1. Unsupported
  * dtypes and widths that violate the quantization block layout fail with
  * YUUKA_ERR_UNSUPPORTED; invalid dimensions, batch sizes, and undersized
  * buffers fail with YUUKA_ERR_INVALID_ARGUMENT. A rejected operation is not
@@ -341,6 +341,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                        n[0]=n_in, n[1]=n_out, u[0]=dtype
  *   QUANT_Q8_1:          buf0 FP32 src, buf1 int8 dst, buf2 float2 block
  *                        scales; n={n, batch}; n must be a multiple of 128
+ *   SILU_MUL_QUANT_Q8_1: buf0 FP32 gate, buf1 FP32 up, buf2 int8 dst,
+ *                        buf3 float2 block scales; n={width,rows}; offsets
+ *                        must be aligned to 16, 16, 4 and 8 bytes
  *   GEMM with path MMQ:  buf0 packed weights, buf1 Q8_1 int8 activations,
  *                        buf2 FP32 out, buf3 float2 block scales;
  *                        n={n_in,n_out,rows}; u[0]=Q4_K/Q5_K/Q6_K;

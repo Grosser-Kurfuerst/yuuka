@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 5
+const RequiredABI = 6
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -886,6 +886,25 @@ func (p *Plan) AddQuantizeQ8_1At(x *Buffer, xOff uint64, qs, ds *Buffer, nIn, ba
 	op.buf[2] = ds.ptr
 	op.n[0] = C.uint64_t(nIn)
 	op.n[1] = C.uint64_t(batch)
+	return p.add(op)
+}
+
+// AddSiluMulQuantQ8_1At writes the Q8_1 digits and scale/sum pairs for
+// SiLU(gate)*up. The four offsets are byte offsets into the respective buffers.
+func (p *Plan) AddSiluMulQuantQ8_1At(gate *Buffer, gateOff uint64, up *Buffer, upOff uint64,
+	qs *Buffer, qsOff uint64, ds *Buffer, dsOff uint64, width, rows int64) error {
+	if width <= 0 || rows <= 0 {
+		return errors.New("hip: SwiGLU Q8_1 dimensions must be positive")
+	}
+	if err := p.check(gate, up, qs, ds); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_SILU_MUL_QUANT_Q8_1}
+	op.buf[0], op.off[0] = gate.ptr, C.uint64_t(gateOff)
+	op.buf[1], op.off[1] = up.ptr, C.uint64_t(upOff)
+	op.buf[2], op.off[2] = qs.ptr, C.uint64_t(qsOff)
+	op.buf[3], op.off[3] = ds.ptr, C.uint64_t(dsOff)
+	op.n[0], op.n[1] = C.uint64_t(width), C.uint64_t(rows)
 	return p.add(op)
 }
 

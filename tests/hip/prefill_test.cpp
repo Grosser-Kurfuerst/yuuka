@@ -583,6 +583,96 @@ bool test_gemm_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * e
     return ok;
 }
 
+bool test_silu_mul_quant_q8_1(yuuka_device * device, yuuka_stream * stream,
+                             yuuka_event * event, std::mt19937 & rng) {
+    constexpr uint64_t width = 256, rows = 17, channels = 65, offset = 16;
+    constexpr uint64_t count = width * rows;
+    constexpr uint64_t float_prefix = offset / sizeof(float);
+    std::vector<float> gate(count + float_prefix), up(count + float_prefix);
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    for (uint64_t i = 32; i < count; ++i) {
+        gate[i + float_prefix] = dist(rng);
+        up[i + float_prefix] = dist(rng);
+    }
+    // The first block is zero. The second has an exact amax of 127 and
+    // positive and negative halfway values to exercise nearest-even rounding.
+    for (uint64_t i = 32; i < 64; ++i) {
+        gate[i + float_prefix] = 32.0f;
+        up[i + float_prefix] = (i == 32 ? 127.0f : i % 2 ? -1.5f : 0.5f) / 32.0f;
+    }
+    const auto weights = pack_weights(YUUKA_DTYPE_Q4_K, rng, width, channels);
+    Buffer gb, ub, ab, qb, sb, wb, ob;
+    bool ok = alloc(device, gb, gate.size() * sizeof(float)) &&
+              alloc(device, ub, up.size() * sizeof(float)) &&
+              alloc(device, ab, count * sizeof(float)) &&
+              alloc(device, qb, count + offset) &&
+              alloc(device, sb, count / 4 + offset) &&
+              alloc(device, wb, weights.size()) &&
+              alloc(device, ob, rows * channels * sizeof(float)) &&
+              upload_vec(gb, gate) && upload_vec(ub, up) && upload_vec(wb, weights);
+    const auto run = [&](bool fused) {
+        yuuka_plan * plan = nullptr;
+        if (!check(yuuka_plan_create(device, &plan), "SwiGLU Q8_1 plan")) return false;
+        yuuka_op quantize{};
+        quantize.n[0] = width;
+        quantize.n[1] = rows;
+        bool success = true;
+        if (fused) {
+            quantize.code = YUUKA_OP_SILU_MUL_QUANT_Q8_1;
+            quantize.buf[0] = gb.buf;
+            quantize.buf[1] = ub.buf;
+            quantize.buf[2] = qb.buf;
+            quantize.buf[3] = sb.buf;
+            for (int i = 0; i < 4; ++i) quantize.off[i] = offset;
+        } else {
+            yuuka_op silu{};
+            silu.code = YUUKA_OP_SILU_MUL;
+            silu.n[0] = count;
+            silu.buf[0] = gb.buf;
+            silu.buf[1] = ub.buf;
+            silu.buf[2] = ab.buf;
+            silu.off[0] = silu.off[1] = offset;
+            success = check(yuuka_plan_add(plan, &silu), "add separate SwiGLU");
+            quantize.code = YUUKA_OP_QUANT_Q8_1;
+            quantize.buf[0] = ab.buf;
+            quantize.buf[1] = qb.buf;
+            quantize.buf[2] = sb.buf;
+        }
+        yuuka_op down{};
+        down.code = YUUKA_OP_GEMM;
+        down.buf[0] = wb.buf;
+        down.buf[1] = qb.buf;
+        down.buf[2] = ob.buf;
+        down.buf[3] = sb.buf;
+        down.off[1] = down.off[3] = fused ? offset : 0;
+        down.n[0] = width;
+        down.n[1] = channels;
+        down.n[2] = rows;
+        down.u[0] = YUUKA_DTYPE_Q4_K;
+        down.u[1] = YUUKA_GEMM_PATH_MMQ;
+        success = success && check(yuuka_plan_add(plan, &quantize), "add SwiGLU Q8_1 quantizer") &&
+            check(yuuka_plan_add(plan, &down), "add down MMQ") && execute(plan, stream, event, 0);
+        yuuka_plan_destroy(plan);
+        return success;
+    };
+    std::vector<int8_t> want_q(count), got_q(count);
+    std::vector<float> want_scales(count / 16), got_scales(count / 16);
+    std::vector<float> activated(count), want_out(rows * channels), got_out(rows * channels);
+    ok = ok && run(false) && download_vec(ab, activated) && download_vec(qb, want_q) &&
+        download_vec(sb, want_scales) && download_vec(ob, want_out) &&
+        check_q8_1("SwiGLU Q8_1", activated, want_q, want_scales, width, rows);
+    for (int rep = 0; ok && rep < 2; ++rep) {
+        ok = run(true) &&
+            check(yuuka_memcpy_d2h_at(got_q.data(), qb.buf, offset, count), "SwiGLU digits") &&
+            check(yuuka_memcpy_d2h_at(got_scales.data(), sb.buf, offset, count / 4), "SwiGLU scales") &&
+            download_vec(ob, got_out) && got_q == want_q && got_scales == want_scales &&
+            got_out == want_out;
+    }
+    for (Buffer * buf : {&gb, &ub, &ab, &qb, &sb, &wb, &ob}) release(*buf);
+    std::printf("SwiGLU Q8_1 and down MMQ: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
 bool test_gemm_swiglu(yuuka_device * device, yuuka_stream * stream,
                       yuuka_event * event, yuuka_dtype dtype, const char * name,
                       int64_t n_in, int64_t n_out, int64_t rows,
@@ -1818,6 +1908,7 @@ int main() {
         }
     }
     ok = test_lm_head(device, stream, event, rng) && ok;
+    ok = test_silu_mul_quant_q8_1(device, stream, event, rng) && ok;
     ok = test_norm_and_rope(device, stream, event, rng) && ok;
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
