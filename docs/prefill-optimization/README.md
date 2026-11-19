@@ -13,6 +13,14 @@ tail chunks, and serving TTFT).
 - [Stage 5a/5b: Prefix snapshot off the first-token path](phase2/stage5ab-snapshot-critical-path.md) — Server prefix-capture gating and post-emission ordering plan (landed in `6e267d7`, `c09cd06`).
 - [Stage 1b/1c: Sub-128-row projections and GDN preparation](phase2/stage1bc-sub128-rows.md) — Prepared GDN crossover (`260094f`) and sub-128 projection routes (currently blocked on `1b` numerical gates).
 
+- [Stage 1d — CLI chunk policy](phase2/stage1d-cli-chunk-policy.md) — Chunk-size sweep, memory costs, CLI overrides and boundary-prompt TTFT gates.
+- [Stage 2 — Narrow Q8_0 projections](phase2/stage2-narrow-q8-projections.md) — FP32 and Q8_1 paired gate projections, recurrent-state comparison and upstream timing gates.
+- [Stage 3 — Direct Q6_K MMQ](phase2/stage3-q6k-direct-mmq.md) — Per-16-value scaling, model-shape dispatch and independent kernel and prompt benchmarks.
+- [Stage 4 — Long-context attention](phase2/stage4-long-context-attention.md) — F16 LDS layout, long-prefix split dispatch and Q8_0/F32 format coverage.
+- [Stage 5c — Contiguous GDN state](phase2/stage5c-contiguous-gdn-state.md) — Session layout, offset binding, snapshot compatibility and lifecycle latency.
+- [Stage 6 — Compact tail and norm fusion](phase2/stage6-compact-tail-and-norm.md) — Cropped Q8_1 matvecs, residual normalization and mixed-consumer plan validation.
+- [Stage 7 — Direct MMQ workgroup swizzle](phase2/stage7-direct-mmq-swizzle.md) — Wide-tile workgroup mapping, coverage tests and UMA timing comparisons.
+
 ## Phase 1: Upstream benchmark optimization (completed)
 
 - [Phase 1 implementation plan](phase1/README.md) — Target margins, family time budgets, and 8-step delivery order against upstream `llama.cpp v1.0.0`.
