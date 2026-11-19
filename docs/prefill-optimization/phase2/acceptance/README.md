@@ -14,3 +14,4 @@
 - [Stage 4b F16 split-key cells](08b-f16-split-cells.md) — Isolated direct and split timings, long-prompt numerics, and accepted dispatch ranges.
 - [Stage 4c Q8_0 unsplit WMMA](08c-q8-kv-wmma.md) — Packed reader, measured tiled-prefix cutoff, numerical checks, and paired throughput.
 - [Stage 4d Cross-format split-key](08d-cross-format-split.md) — Typed seed and partials, validation, and independently measured F32 and Q8_0 route windows.
+- [Stage 5c Contiguous GDN state](09-contiguous-gdn-state.md) — Snapshot compatibility, lifecycle timings, HIP call reduction, and the latency gate decision.
