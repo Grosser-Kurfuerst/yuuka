@@ -35,6 +35,7 @@ type benchBackendConfig struct {
 	Graph        bool
 	ModelKey     string
 	Backend      string
+	KVFormat     qwen35.KVFormat
 }
 
 type sample struct {
@@ -60,11 +61,17 @@ func main() {
 	warmup := flag.Int("warmup", 1, "warmup requests")
 	prefillChunk := flag.Int("prefill-chunk", 512, "prompt chunk size")
 	prefixCache := flag.Bool("prefix-cache", false, "enable prefix cache")
+	uniquePrompts := flag.Bool("unique-prompts", false, "use a distinct first token for each warmup and measured request")
+	kvType := flag.String("kv-type", "f32", "KV cache format: f32, f16, or q8_0")
 	graph := flag.Bool("graph", false, "enable HIP Graph replay")
 	flag.Parse()
 
 	if *modelPath == "" {
 		log.Fatal("--model is required")
+	}
+	kvFormat, err := qwen35.ParseKVFormat(*kvType)
+	if err != nil {
+		log.Fatal(err)
 	}
 	reader, err := gguf.Open(*modelPath)
 	if err != nil {
@@ -74,6 +81,10 @@ func main() {
 	tok, err := tokenizer.NewFromGGUF(reader)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *uniquePrompts && (*promptTokens <= 0 || *warmup < 0 || *requests <= 0 ||
+		*warmup > tok.VocabSize() || *requests > tok.VocabSize()-*warmup) {
+		log.Fatal("unique prompts require positive prompt and request counts and no more requests including warmups than vocabulary tokens")
 	}
 	model, err := qwen35.Load(reader)
 	if err != nil {
@@ -92,8 +103,9 @@ func main() {
 		BlockSize:    *blockSize,
 		PrefillChunk: *prefillChunk,
 		Graph:        *graph,
-		ModelKey:     key,
+		ModelKey:     key + ":kv=" + kvFormat.String(),
 		Backend:      *backendName,
+		KVFormat:     kvFormat,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -125,7 +137,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	run := func(count int) []sample {
+	run := func(firstID, count int) []sample {
 		results := make([]sample, count)
 		sem := make(chan struct{}, *concurrency)
 		var wg sync.WaitGroup
@@ -135,10 +147,16 @@ func main() {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
+				id := firstID + index
+				requestPrompt := prompt
+				if *uniquePrompts {
+					requestPrompt = append([]int32(nil), prompt...)
+					requestPrompt[0] = int32(id)
+				}
 				start := time.Now()
 				result, err := manager.Generate(context.Background(), serving.Request{
-					ID:        fmt.Sprintf("bench-%d", index),
-					Prompt:    prompt,
+					ID:        fmt.Sprintf("bench-%d", id),
+					Prompt:    requestPrompt,
 					MaxTokens: *decodeTokens,
 					Sampler:   sampler,
 					IgnoreEOS: true,
@@ -161,9 +179,9 @@ func main() {
 		wg.Wait()
 		return results
 	}
-	run(*warmup)
+	run(0, *warmup)
 	start := time.Now()
-	results := run(*requests)
+	results := run(*warmup, *requests)
 	wall := time.Since(start)
 
 	var totalTokens int
@@ -181,9 +199,9 @@ func main() {
 		stats := manager.Metrics().Prefix
 		fmt.Printf("prefix hits=%d misses=%d entries=%d\n", stats.Hits, stats.Misses, stats.Entries)
 	}
-	fmt.Printf("model=%s size=%d sha256=%s backend=%s context=%d block=%d blocks=%d concurrency=%d requests=%d prompt=%d decode=%d prefix_cache=%v graph=%v\n",
+	fmt.Printf("model=%s size=%d sha256=%s backend=%s context=%d block=%d blocks=%d concurrency=%d requests=%d prompt=%d decode=%d prefix_cache=%v graph=%v kv_type=%s unique_prompts=%v\n",
 		*modelPath, size, key, *backendName, *contextSize, *blockSize, *kvBlocks,
-		*concurrency, *requests, *promptTokens, *decodeTokens, *prefixCache, *graph)
+		*concurrency, *requests, *promptTokens, *decodeTokens, *prefixCache, *graph, kvFormat, *uniquePrompts)
 	fmt.Printf("metadata commit=%s go=%s host_cpu=%q kernel=%s rocm_hip=%s power=%s sampling=greedy warmup=%d requests=%d concurrency=%d\n",
 		buildRevision(), runtime.Version(), hostCPU(), hostKernel(), rocmVersion(), powerProfile(),
 		*warmup, *requests, *concurrency)
