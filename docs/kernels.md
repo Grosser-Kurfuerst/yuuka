@@ -240,6 +240,13 @@ identical tokens, and `tests/hip/gemv_test.cpp` checks every dtype against the
 host dot product at 2e-3 relative and against the per-row kernel at 2.4e-4
 absolute.
 
+**Narrow pair.** The recurrent `beta` and `alpha` projections (Q8_0, 2560 -> 32)
+are below the streaming crossover on their own, but they read the same
+normalized row and share one `GEMV_PAIR` launch through the remapped pair
+kernel, which halves the launch count of the pair. `decodeMatmulPair` allows that
+one narrow case explicitly; every other below-threshold shape keeps the per-row
+kernel.
+
 ### 5.4 Remapped one-row matvec
 
 `gemv_row_kernel` in `kernels/hip/gemv/gemv_row.hip` is the selected decode

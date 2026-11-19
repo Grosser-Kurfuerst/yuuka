@@ -100,10 +100,18 @@ func (m *Model) decodeMatmulPair(plan *hip.Plan, a, b weight, x, outA, outB *hip
 	// The pair kernel decodes both matrices with one instantiation, so it needs
 	// one weight dtype; a mixed pair keeps the two matvecs. That is a plan-build
 	// decision, not a silent route change.
+	streaming := hip.SelectDecodeGemvPath(a.dtype, nIn, nOutA, false) ==
+		hip.DecodeGemvStreaming &&
+		hip.SelectDecodeGemvPath(b.dtype, nIn, nOutB, false) == hip.DecodeGemvStreaming
+	// A narrow equal-shape pair (the recurrent beta/alpha rank projection) takes
+	// the same fused launch even though each matrix alone is below the streaming
+	// crossover: one launch over both rows is what pays, and the pair kernel
+	// covers the shape when the K step is a multiple of 512.
+	narrow := epilogue == hip.PairWriteBoth && nOutA == nOutB && nIn%512 == 0 &&
+		a.dtype == b.dtype && (a.dtype == tensor.Q4_K || a.dtype == tensor.Q5_K ||
+		a.dtype == tensor.Q6_K || a.dtype == tensor.Q8_0)
 	usable := !m.noPairFusion && !m.forceDecodeGemv && !m.int8Matvec &&
-		a.dtype == b.dtype &&
-		hip.SelectDecodeGemvPath(a.dtype, nIn, nOutA, false) == hip.DecodeGemvStreaming &&
-		hip.SelectDecodeGemvPath(b.dtype, nIn, nOutB, false) == hip.DecodeGemvStreaming &&
+		a.dtype == b.dtype && (streaming || narrow) &&
 		(epilogue != hip.PairSwiglu || nOutA == nOutB)
 	if usable {
 		// The SwiGLU epilogue consumes the second row inside the kernel, so the
@@ -452,10 +460,12 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	if err := m.decodeMatmul(plan, gate, m.act.norm, m.act.z, hidden, inner); err != nil {
 		return err
 	}
-	if err := m.decodeMatmul(plan, beta, m.act.norm, m.act.beta, hidden, rank); err != nil {
-		return err
-	}
-	if err := m.decodeMatmul(plan, alpha, m.act.norm, m.act.alpha, hidden, rank); err != nil {
+	// beta and alpha are the same narrow shape over the same row. One launch
+	// reads the activation once for both instead of once per matrix; the pair
+	// form is the same kernel the gate/up projection uses, and the two per-row
+	// launches stay for a shape it does not cover.
+	if err := m.decodeMatmulPair(plan, beta, alpha, m.act.norm, m.act.beta, m.act.alpha,
+		hidden, rank, rank, hip.PairWriteBoth); err != nil {
 		return err
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))

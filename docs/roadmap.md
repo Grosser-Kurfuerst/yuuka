@@ -7,15 +7,15 @@ or more at a 128-token prompt and 55 tokens/s or more at a 2048-token prompt**
 with greedy sampling on one request, which is parity with the reference
 measured below.
 
-**Status.** Steps 1-5 have landed. Decode attention is split over the key range,
+**Status.** Steps 1-6 have landed. Decode attention is split over the key range,
 so the rate is flat in context, and the decode matvec is remapped to one wave per
-output row: `pp128/tg128` 60.16 t/s (ratio 0.97), `pp512/tg128` 59.74, and
-`pp2048/tg32` 58.16, so both target context points (60 and 55 t/s) are met. The
+output row: `pp128/tg128` 60.70 t/s (ratio 0.98), `pp512/tg128` 60.41, and
+`pp2048/tg32` 58.60, so both target context points (60 and 55 t/s) are met. The
 per-shape bandwidth target is not: the wide shapes reach 179-230 GB/s but the
-1024- and 4096-input projections stay at 93-158, and the step is 17.3 ms against
+1024- and 4096-input projections stay at 93-158, and the step is 17.1 ms against
 the 15.5 ms row. Step 5 re-evaluated the int8 route on the new mapping and it is
-still slower end to end, so the FP32 route stays selected. Step 6 is open and
-step 7 closes the record. This file is a plan, not a record: when a step lands, its
+still slower end to end, so the FP32 route stays selected. Step 6 cut 0.25 ms
+from the tail against its 0.5 ms row. Step 7 closes the record. This file is a plan, not a record: when a step lands, its
 measured result goes into [benchmarks.md](benchmarks.md) and the row in
 [implementation order](#implementation-order) is updated here.
 
@@ -257,6 +257,7 @@ Steps 1–3 close the context-dependent gap; steps 4–5 close the flat gap; ste
 | | *Landed (step 3).* F32/F16/Q8_0 and the captured graph take the same kernel: 0.0335/0.0353/0.0318 ms per layer at 512 tokens, replayed tokens identical, and 0.096/0.071/0.061 ms at 2048. The 0.06 ms row at 2048 holds for Q8_0; see the step note for the F32/F16 byte floor. | | |
 | | *Landed (step 4).* One wave per output row, sixteen K values per lane, no barrier inside K: matvec 130.3 -> 176.6 GB/s effective, step 23.4 -> 17.3 ms, `pp128/tg128` 38.8 -> 60.16 t/s, `pp2048/tg32` 17.4 -> 58.16. Per-shape 190 GB/s and the 15.5 ms step are not met; see the step note. | | |
 | | *Landed (step 5).* The Q8_1 int8 route on the remapped mapping measures 175.3 GB/s in step against 176.6 and 0.67 ms slower per step, so the gate fails and the FP32 route stays selected. The negative result and the per-shape cells are recorded. | | |
+| | *Landed (step 6).* Norm kernels reduce with wave shuffles and the beta/alpha projections share one launch: the step drops 17.31 -> 17.10 ms profiled and `pp128/tg128` 60.16 -> 60.70 t/s, short of the 0.5 ms row because the remaining tail is launch bound. | | |
 | 2 | [Parallel decode attention over the key range](#step-2-parallelize-decode-attention-over-the-key-range) | 512-token context: ≤ 0.05 ms per layer, top-1 token and logits within the documented tolerance, `pp2048` ≥ 30 t/s | 4–8 files |
 | 3 | [Cover every KV format and the graph path](#step-3-cover-every-kv-format-and-the-graph-path) | All three pool formats and the captured graph produce the same tokens, ≤ 0.06 ms per layer from 0 to 2048 tokens | 3–6 files |
 | 4 | [Remap the decode matvec](#step-4-remap-the-decode-matvec) | ≥ 190 GB/s for every `N` ≥ 1024, step ≤ 15.5 ms, `pp128` ≥ 50 t/s | 4–8 files |
@@ -483,6 +484,24 @@ the step-4 route over eight steps. If the gate fails, keep step 4's kernel
 selected and record the negative result.
 
 ### Step 6: shrink the norm and narrow-projection tail
+
+Landed:
+
+- `rmsnorm_f32_kernel` reduces with one wave shuffle tree per wave and one
+  cross-wave add instead of the eight-barrier tree, and vectorizes the two passes
+  over four values when the width is a multiple of four.
+- `rmsnorm_heads_f32_kernel` runs one wave per head and needs no barrier.
+- `beta` and `alpha` share one `GEMV_PAIR` launch over the same normalized row.
+
+Result: `rmsnorm` 1.08 -> 0.59 ms and `rmsnorm_heads` 0.14 -> 0.10 ms per step,
+379 -> 355 operations, step 17.31 -> 17.10 ms, `pp128/tg128` 60.16 -> 60.70 t/s.
+The −0.5 ms row is missed by half. The remaining tail is launch bound: 65 norm
+launches cost 9 us each against the reference's 5.7 us, and the only remaining
+merge (q and k RoPE plus the two head norms) removes eight launches of each and
+is worth under 0.1 ms. Fusing norms across layers is a plan-shape change that
+this step does not take.
+
+The original design note follows.
 
 * `rmsnorm` (12 µs per 2560-value row, 81 launches per token): one warp per row
   with a warp shuffle reduction, `rows` rows per block, no shared-memory tree.

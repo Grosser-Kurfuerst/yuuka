@@ -19,14 +19,15 @@ import (
 // decode kernel lands, because each change moves them by design: 97.6 ms before
 // the streaming matvec family, 89.4 ms after the streaming LM head, 31.6 ms
 // after the matvec family moved to the streaming kernel, 24.3 ms after the fused
-// gated delta-net, 23.4 ms after the residual and gate/up fusions, and the
-// values below after decode attention was split over the key range and the
-// matvec was remapped to one wave per row. The measured history stays in
-// docs/benchmarks.md.
+// gated delta-net, 23.4 ms after the residual and gate/up fusions, 17.3 ms after
+// decode attention was split over the key range and the matvec was remapped to
+// one wave per row, and 17.1 ms after the norms were rewritten around a wave
+// reduction and the beta/alpha projections were merged. The measured history
+// stays in docs/benchmarks.md.
 const (
-	decodeBaselineOps     = 379
-	decodeBaselineTotalMS = 17.300
-	decodeBaselineGemvMS  = 15.440
+	decodeBaselineOps     = 355
+	decodeBaselineTotalMS = 17.070
+	decodeBaselineGemvMS  = 15.400
 )
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated

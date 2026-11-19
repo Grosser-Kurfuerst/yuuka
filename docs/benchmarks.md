@@ -851,6 +851,39 @@ memory-system effect. The kernel mapping behind it is described in
 [kernels.md](kernels.md#4-operator-family-map) and the fix in
 [roadmap.md](roadmap.md#root-causes).
 
+### Decode tail
+
+Landed in [roadmap.md](roadmap.md) step 6. Measured 2026-11-19 in the same
+sessions as the remap, `yuuka bench --kv-type f32 --chunk-size 512`, greedy,
+warmup 2 and 3 repetitions:
+
+| Test | before step 6 | after step 6 |
+| --- | ---: | ---: |
+| pp128/tg128 | 60.16 | 60.70 |
+| pp512/tg128 | 59.74 | 60.41 |
+| pp2048/tg32 | 58.16 | 58.60 |
+
+`TestGPUProfileDecode` falls from 17.31 to 17.10 ms and from 379 to 355
+operations. The two changes are the norm kernels and the merged narrow
+projection:
+
+- `rmsnorm_f32_kernel` reduces with one wave shuffle tree per wave plus one
+  cross-wave add instead of the eight-barrier tree, and reads
+  `float4`/`float4`/`float4` when the width is a multiple of four.
+  `rmsnorm_heads_f32_kernel` runs one wave per head with no barrier at all. The
+  `rmsnorm` family drops from 1.08 to 0.59 ms per step and `rmsnorm_heads` from
+  0.14 to 0.10 ms.
+- The recurrent `beta` and `alpha` projections (Q8_0, 2560 -> 32 each) now share
+  one `GEMV_PAIR` launch over the same normalized row: 48 per-row launches at
+  8.8 us become 24 paired launches at 13.8 us, so the pair family absorbs them
+  and the plan loses 24 operations.
+
+Both save about 0.15 ms per step end to end, short of the 0.5 ms target. The
+remaining tail is launch bound rather than arithmetic bound: 65 norm launches
+cost 9 us each against 5.7 us for the reference's `rms_norm_f32` on the same
+step, and the only remaining merge, q and k RoPE plus the two head norms, is
+worth under 0.1 ms because it removes eight of each.
+
 ### Remapped decode matvec
 
 Landed in [roadmap.md](roadmap.md) step 4. Measured 2026-11-19 on the same
