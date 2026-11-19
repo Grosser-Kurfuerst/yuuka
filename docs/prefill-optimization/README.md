@@ -8,6 +8,7 @@ tail chunks, and serving TTFT).
 ## Phase 2: Real-world prefill optimization
 
 - [Phase 2 priority roadmap](phase2/roadmap.md) — Diagnostic `rocprofv3` attribution, real-world length cliffs, P1–P7 priority ranking, and phased implementation plan.
+- [Stage 1a: Direct MMQ for arbitrary row counts](phase2/stage1a-direct-rows.md) — Design, change points, staged steps, acceptance gates, and expected gains for extending Direct MMQ to every `rows >= 128`.
 
 ## Phase 1: Upstream benchmark optimization (completed)
 

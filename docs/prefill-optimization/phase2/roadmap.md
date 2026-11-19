@@ -150,17 +150,22 @@ Because `128 -> 129` isolates the MMQ allowlist/padding cliff while `127 -> 128`
 both projection and GDN thresholds simultaneously, Stage 1 is split into four separately
 verified steps:
 
-- **Step 1a — Arbitrary-row Direct MMQ for `rows >= 128`**:
-  - *Changes*: In [mmq_gemm.hip](../../../kernels/hip/gemm/mmq_gemm.hip), add `row < rows`
-    bounds masking in `stage_direct_activations` and the Direct writeback epilogue; map
-    Direct workgroups at native `kDirectTileJ = 64`-row granularity instead of rounding
-    `grid.y` to `128`; remove `rows != 128 && rows != 512 && rows != 2048` in
-    `measured_direct_shape` (keep `FixedShape = true` scoped to exact `M=512, K=2560, N=9216`).
-    Add `129`, `140`, `192`, `256`, `511`, and `1024` checks to [prefill_test.cpp](../../../tests/hip/prefill_test.cpp).
-  - *Acceptance*: Same-chunking output vs prior MMQ matches bitwise or within `2e-4`
-    tensor tolerance (zero VGPR spills); `pp129` drops from `~115.3 ms` to `<= 78 ms`,
-    `pp511` approaches `pp512` (`<= 225 ms`), and `chunk=1024` matches `chunk=512/2048`
-    without regressing `pp128`, `pp512`, `pp2048`, or `pp8192`.
+- **Step 1a — Arbitrary-row Direct MMQ for `rows >= 128`**
+  ([implementation plan](stage1a-direct-rows.md)):
+  - *Changes*: In [mmq_gemm.hip](../../../kernels/hip/gemm/mmq_gemm.hip), keep the host
+    grid, return early from Direct workgroups whose 64-token half starts at or beyond
+    `rows`, mask absent token rows in `stage_direct_activations` and the Direct store
+    epilogue, and replace the `rows != 128 && rows != 512 && rows != 2048` allowlist in
+    `measured_direct_shape` with `rows < 128` (keep `FixedShape = true` scoped to exact
+    `M=512, K=2560, N=9216`). Add partial-tile Direct cells and a row-tail mask test to
+    [prefill_test.cpp](../../../tests/hip/prefill_test.cpp).
+  - *Acceptance*: Same-chunking logits vs control are expected to be bitwise identical;
+    every tested non-allowlisted length `>= 128` improves repeatably over control
+    (estimated `pp129` about `87–95 ms` from `~115.3 ms`, `pp511` about `220–224 ms`),
+    `chunk=1024` is no more than 3% slower than `chunk=512`, the ~140-token server SSE
+    first-content latency drops by at least 10 ms, and `pp128`, `pp512`, `pp2048`, and
+    `pp8192` stay within `±1%`. Step 1a alone cannot reach `pp129 <= 78 ms` because Q6_K
+    stays on generic MMQ padded to 256 rows until Stage 3.
 - **Step 1b — Sub-128 projection crossover (`rows < 128`, GDN held fixed)**:
   - *Changes*: Benchmark masked `64`-row Direct MMQ, `wmma_k32`, `gemv_batch`, and the
     multi-row streaming kernel ([lm_head.hip](../../../kernels/hip/gemm/lm_head.hip), `1..16` rows)
