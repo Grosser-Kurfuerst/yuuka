@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 6
+const RequiredABI = 7
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -1101,6 +1101,12 @@ func (p *Plan) AddRMSNormHeadsBatchAt(src *Buffer, srcOff uint64, weight *Buffer
 // AddRoPEBatchAt appends RoPE to a [rows, heads, stride] chunk starting at the
 // dynamic position supplied to Execute.
 func (p *Plan) AddRoPEBatchAt(data *Buffer, dataOff uint64, rows, heads, stride, headDim, rotDim int, base float32, rowStride int64) error {
+	return p.AddRoPEBatchOffsetAt(data, dataOff, rows, heads, stride, headDim, rotDim, base, rowStride, 0)
+}
+
+// AddRoPEBatchOffsetAt rotates the first row at the execution position plus
+// displacement tokens. The remaining rows use consecutive positions.
+func (p *Plan) AddRoPEBatchOffsetAt(data *Buffer, dataOff uint64, rows, heads, stride, headDim, rotDim int, base float32, rowStride int64, displacement uint32) error {
 	if rows <= 0 || heads <= 0 || rotDim <= 0 || rotDim%2 != 0 || rotDim > headDim || stride < headDim || rowStride < int64(heads*stride) {
 		return errors.New("hip: invalid batch RoPE dimensions")
 	}
@@ -1116,6 +1122,7 @@ func (p *Plan) AddRoPEBatchAt(data *Buffer, dataOff uint64, rows, heads, stride,
 	op.n[3] = C.uint64_t(rotDim)
 	op.n[4] = C.uint64_t(rows)
 	op.n[5] = C.uint64_t(rowStride)
+	op.u[0] = C.uint32_t(displacement)
 	op.f[0] = C.float(base)
 	return p.add(op)
 }
@@ -1417,8 +1424,15 @@ func (p *Plan) AddAttentionPrefillPagedAt(q *Buffer, qOff uint64, kPool, vPool, 
 
 // AddAttentionPrefillPagedBlasFormatAt selects the experimental FP16 KV
 // matrix-multiplication attention path. It uses the ordinary plan validator,
-// with buf[5] carrying the scratch and flags bit 0 requesting rocBLAS.
+// with buf[5] carrying the scratch and the BLAS flag requesting rocBLAS.
 func (p *Plan) AddAttentionPrefillPagedBlasFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, scratch *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	return p.AddAttentionPrefillPagedBlasOffsetFormatAt(q, qOff, kPool, vPool, out, outOff, table, scratch,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, 0)
+}
+
+// AddAttentionPrefillPagedBlasOffsetFormatAt selects the experimental FP16 KV
+// attention path starting at the execution position plus displacement tokens.
+func (p *Plan) AddAttentionPrefillPagedBlasOffsetFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table, scratch *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, displacement uint32) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 ||
 		heads%kvHeads != 0 || kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity || headDim > 256 {
@@ -1440,6 +1454,7 @@ func (p *Plan) AddAttentionPrefillPagedBlasFormatAt(q *Buffer, qOff uint64, kPoo
 	op.off[0], op.off[3] = C.uint64_t(qOff), C.uint64_t(outOff)
 	op.n[0], op.n[1], op.n[2], op.n[3], op.n[4] =
 		C.uint64_t(kvHeads), C.uint64_t(heads), C.uint64_t(headDim), C.uint64_t(kvDim), C.uint64_t(rows)
+	op.n[5] = C.uint64_t(displacement)
 	op.u[0], op.u[1], op.u[2] = C.uint32_t(blockSize), C.uint32_t(capacity), C.uint32_t(tensor.F16)
 	op.f[0] = C.float(scale)
 	return p.add(op)
@@ -1464,16 +1479,24 @@ func (p *Plan) AddAttentionPrefillPagedDenseFormatAt(q *Buffer, qOff uint64, kPo
 // with the FP16 MMA kernel forced off, so a test can compare the two kernels on
 // the same plan input.
 func (p *Plan) AddAttentionPrefillPagedTiledFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {
+	return p.AddAttentionPrefillPagedOffsetFormatAt(q, qOff, kPool, vPool, out, outOff, table,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, 0, true)
+}
+
+// AddAttentionPrefillPagedOffsetFormatAt appends gated attention starting at
+// execution position plus displacement. It preserves dispatch for the parent
+// chunk of displacement+rows and can force the scalar tiled implementation.
+func (p *Plan) AddAttentionPrefillPagedOffsetFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, tiled bool) error {
 	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
-		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, false, true)
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, displacement, false, tiled)
 }
 
 func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
 	return p.addAttentionPrefillPagedFlag(q, qOff, kPool, vPool, out, outOff, table,
-		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, dense, false)
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, 0, dense, false)
 }
 
-func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense, tiled bool) error {
+func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, displacement uint32, dense, tiled bool) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
 		kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity {
@@ -1501,6 +1524,7 @@ func (p *Plan) addAttentionPrefillPagedFlag(q *Buffer, qOff uint64, kPool, vPool
 	op.n[2] = C.uint64_t(headDim)
 	op.n[3] = C.uint64_t(kvDim)
 	op.n[4] = C.uint64_t(rows)
+	op.n[5] = C.uint64_t(displacement)
 	op.u[0] = C.uint32_t(blockSize)
 	op.u[1] = C.uint32_t(capacity)
 	op.u[2] = C.uint32_t(dtype)

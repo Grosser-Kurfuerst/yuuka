@@ -128,6 +128,8 @@ The [prepared GDN comparison](prefill-optimization/acceptance/04b-gdn.md)
 records the recurrence timings and the model-state comparison by lane mapping.
 The [FFN fusion comparison](prefill-optimization/acceptance/05-ffn-fusion.md)
 records the isolated quantizer check, complete FFN time and prompt rates.
+The [final query crop comparison](prefill-optimization/acceptance/06-final-query.md)
+records K/V equivalence, output work per chunk and the resulting prompt rates.
 
 ## Decode: output length
 

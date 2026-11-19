@@ -101,10 +101,11 @@ the currently unused `u[0]` of `ROPE_BATCH` and `n[5]` of
 native executor. Default zero preserves the full-row call. Before narrowing
 to the native launcher's `int`, check the adjusted first and last positions
 in wide arithmetic, and require `first + queryRows <= capacity` for paged
-attention. Use the adjusted first position in the attention dispatch and
-launch. K RoPE and the K/V write receive zero displacement. Version this
-descriptor change in the C ABI and Go's `RequiredABI` together. The old
-library accepts these opcodes and would ignore the new displacement.
+attention. Launch at the adjusted first position. Preserve the parent's
+query-count preference and terminal prefix length when selecting the
+attention kernel to keep its arithmetic consistent. K RoPE and the K/V
+write receive zero displacement. Version this descriptor change in the
+C ABI and Go's `RequiredABI` together.
 [ABI compatibility check](../../backend/hip/hip.go#L51)
 [Batch descriptor layouts](../../backend/hip/bridge/yuuka_hip.h#L312) · [RoPE execution](../../backend/hip/bridge/bridge.cpp#L1708) · [Paged attention execution](../../backend/hip/bridge/bridge.cpp#L1960)
 

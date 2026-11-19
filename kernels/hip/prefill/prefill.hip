@@ -892,12 +892,12 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        int force_tiled, hipStream_t stream) {
+                                        bool prefer_wmma, hipStream_t stream) {
     if (rows <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
         block_size <= 0) {
         return;
     }
-    if (!force_tiled && attention_wmma_preferred(rows, position) &&
+    if (prefer_wmma &&
         attention_wmma_supported(heads, kv_heads, head_dim, block_size, dtype)) {
         launch_attention_prefill_paged_wmma_f32(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,

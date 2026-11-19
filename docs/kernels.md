@@ -534,12 +534,14 @@ per-workstream status are in [roadmap2.md](roadmap2.md).
 ### 6.5 Streaming LM head
 
 For ordinary prefill ending in a full-attention layer, the plan puts that
-layer's FFN in the output tail. The cache update and attention still run
-over every chunk row. A final chunk compacts its last residual into row
-zero and runs one FFN row with the parent chunk's projection routes.
-An intermediate chunk ends after the attention residual. Speculative
-verification computes every candidate row through the FFN.
-[Validation and timings](prefill-optimization/acceptance/03-final-ffn.md)
+layer's query, attention output and FFN in the output tail. All chunk
+rows still write K/V. The final chunk compacts its last residual into
+row zero and evaluates one query and FFN row using the parent chunk's
+projection and attention routes. RoPE and paged attention use the
+last prompt position via the ABI 7 token displacement. An intermediate
+chunk ends after the final K/V write. Speculative verification computes
+every requested row through attention and FFN.
+[Validation and timings](prefill-optimization/acceptance/06-final-query.md)
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the prefill tail
 projection:

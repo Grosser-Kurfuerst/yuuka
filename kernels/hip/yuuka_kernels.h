@@ -234,7 +234,7 @@ void launch_attention_prefill_paged_f32(float * out, const float * q,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
                                         float scale, uint32_t dtype, int dense,
-                                        int force_tiled, hipStream_t stream);
+                                        bool prefer_wmma, hipStream_t stream);
 // Experimental GEMM-based attention with gathered FP16 KV, batched QK/PV
 // matrix multiplication, causal softmax, and gated final FP32 output.
 int launch_attention_prefill_paged_blas_f16(

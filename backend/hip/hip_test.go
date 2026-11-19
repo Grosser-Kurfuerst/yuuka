@@ -295,6 +295,54 @@ func TestPlanCopyAt(t *testing.T) {
 	}
 }
 
+func TestRoPEBatchDisplacement(t *testing.T) {
+	dev := openTestDevice(t)
+	stream, err := dev.NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	event, err := dev.NewEvent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer event.Close()
+	plan, err := dev.NewPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	buf, err := dev.Alloc(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.Close()
+	if err := dev.UploadFloats(buf, []float32{1, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.AddRoPEBatchOffsetAt(buf, 0, 1, 1, 4, 4, 4, 10000, 4, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Execute(stream, 0, math.MaxInt32, true, event); err == nil {
+		t.Fatal("accepted RoPE position outside int32")
+	}
+	if err := plan.Execute(stream, 0, 3, true, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := event.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]float32, 4)
+	if err := dev.DownloadFloats(got, buf); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []float64{math.Cos(5), 0, math.Sin(5), 0} {
+		if diff := math.Abs(float64(got[i]) - want); math.IsNaN(diff) || diff > 1e-6 {
+			t.Fatalf("component %d at position 5: got %v want %v", i, got[i], want)
+		}
+	}
+}
+
 func TestPlanOffsets(t *testing.T) {
 	dev := openTestDevice(t)
 	stream, err := dev.NewStream()

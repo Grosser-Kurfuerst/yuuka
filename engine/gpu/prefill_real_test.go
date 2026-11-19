@@ -84,7 +84,7 @@ func TestGPUChunkedPrefillLongContext(t *testing.T) {
 	}
 }
 
-func TestGPUFinalPrefillFFNMatchesFullRows(t *testing.T) {
+func TestGPUFinalPrefillMatchesFullRows(t *testing.T) {
 	path := os.Getenv("YUUKA_TEST_MODEL")
 	if path == "" {
 		t.Skip("YUUKA_TEST_MODEL is not set")
@@ -131,8 +131,10 @@ func TestGPUFinalPrefillFFNMatchesFullRows(t *testing.T) {
 		n, split int
 	}{
 		{"single", 1, 0},
+		{"short_chunk", 128, 0},
 		{"full_chunk", chunk, 0},
 		{"short_tail", chunk + 1, 0},
+		{"displaced_tail", chunk + 3, 0},
 		{"two_chunks", 2 * chunk, 0},
 		{"separate_prefix", 2 * chunk, chunk},
 	} {

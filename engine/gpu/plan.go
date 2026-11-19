@@ -400,25 +400,18 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, outputMode prefillOutput)
 		if err != nil {
 			return nil, err
 		}
+		cropLayer := crop && i == cfg.BlockCount-1
 		if cfg.IsRecurrent(i) {
 			if err := m.addPrefillRecurrent(plan, s, i, attnNorm, rows64); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := m.addPrefillFullAttention(plan, s, i, attnNorm, rows64); err != nil {
+			if err := m.addPrefillFullAttention(plan, s, i, attnNorm, rows64, cropLayer); err != nil {
 				return nil, err
 			}
 		}
 		ffnRows := rows64
-		if crop && i == cfg.BlockCount-1 {
-			// Full attention has already written all K/V rows. The final
-			// FFN's only consumer is the requested last prompt logit.
-			plan.MarkTail()
-			if rows > 1 {
-				if err := plan.AddCopyAt(p.x, 0, p.x, lastOff, int64(cfg.HiddenSize)); err != nil {
-					return nil, err
-				}
-			}
+		if cropLayer {
 			ffnRows, lastOff = 1, 0
 		}
 		// Preserve the parent chunk's projection arithmetic for the compact row.
@@ -490,7 +483,7 @@ func (m *Model) buildPrefillPlan(s *Session, rows int, outputMode prefillOutput)
 	return plan, nil
 }
 
-func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight, rows int64) error {
+func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight, rows int64, cropQuery bool) error {
 	cfg := m.config
 	p := &m.prefill
 	prefix := fmt.Sprintf("blk.%d.", layerIndex)
@@ -527,23 +520,20 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillProjections(plan, p.norm, hidden, rows, []prefillProjection{
+	projections := [...]prefillProjection{
 		{w: q, out: p.q, nOut: qDim},
 		{w: k, out: p.k, nOut: kvDim},
 		{w: v, out: p.v, nOut: kvDim},
-	}); err != nil {
-		return err
 	}
-	if err := plan.AddRMSNormHeadsBatchAt(p.q, 0, qNorm.buf, p.q, 0,
-		rows, int64(cfg.HeadCount), headDim, 2*headDim, cfg.RMSNormEps); err != nil {
+	firstProjection := 0
+	if cropQuery {
+		firstProjection = 1
+	}
+	if err := m.prefillProjections(plan, p.norm, hidden, rows, projections[firstProjection:]); err != nil {
 		return err
 	}
 	if err := plan.AddRMSNormHeadsBatchAt(p.k, 0, kNorm.buf, p.k, 0,
 		rows, int64(cfg.KVHeadCount), headDim, headDim, cfg.RMSNormEps); err != nil {
-		return err
-	}
-	if err := plan.AddRoPEBatchAt(p.q, 0, int(rows), cfg.HeadCount, int(2*headDim),
-		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), int64(cfg.HeadCount*2*cfg.HeadDim)); err != nil {
 		return err
 	}
 	if err := plan.AddRoPEBatchAt(p.k, 0, int(rows), cfg.KVHeadCount, int(headDim),
@@ -554,36 +544,57 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		m.poolV[layerIndex], s.tableBuf, kvDim, rows, int64(s.capacity), m.blockSize, m.kvType); err != nil {
 		return err
 	}
+	queryRows := rows
+	var displacement uint32
+	if cropQuery {
+		// All K/V rows are ready for subsequent chunks and decode. The
+		// remaining operations only produce the requested final output.
+		plan.MarkTail()
+		queryRows = 1
+		displacement = uint32(rows - 1)
+		lastOff := uint64(rows-1) * uint64(hidden) * 4
+		if rows > 1 {
+			if err := plan.AddCopyAt(p.x, 0, p.x, lastOff, hidden); err != nil {
+				return err
+			}
+		}
+		qPath := hip.SelectPrefillPath(q.dtype, rows, hidden, qDim)
+		if err := m.prefillMatmulPath(plan, q, p.norm, lastOff, p.q, 0, hidden, qDim, queryRows, qPath); err != nil {
+			return err
+		}
+	}
+	if err := plan.AddRMSNormHeadsBatchAt(p.q, 0, qNorm.buf, p.q, 0,
+		queryRows, int64(cfg.HeadCount), headDim, 2*headDim, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := plan.AddRoPEBatchOffsetAt(p.q, 0, int(queryRows), cfg.HeadCount, int(2*headDim),
+		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), qDim, displacement); err != nil {
+		return err
+	}
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 	// The rocBLAS path only runs where the FP16 MMA kernel does not cover the
 	// shape, so F16 KV never selects the slower kernel by default.
 	useBlas := m.attentionBlasEnabled && !m.forceTiledAttention &&
 		!hip.PrefillAttentionMMA(cfg.HeadCount, cfg.KVHeadCount, int(headDim),
 			int(rows), s.position, m.kvType)
-	if m.forceTiledAttention {
-		if err := plan.AddAttentionPrefillPagedTiledFormatAt(p.q, 0, m.poolK[layerIndex],
-			m.poolV[layerIndex], p.attn, 0, s.tableBuf,
-			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
-			s.capacity, m.blockSize, scale, m.kvType); err != nil {
-			return err
-		}
-	} else if useBlas {
-		if err := plan.AddAttentionPrefillPagedBlasFormatAt(p.q, 0, m.poolK[layerIndex],
+	if useBlas {
+		if err := plan.AddAttentionPrefillPagedBlasOffsetFormatAt(p.q, 0, m.poolK[layerIndex],
 			m.poolV[layerIndex], p.attn, 0, s.tableBuf, p.attentionBlas,
-			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
-			s.capacity, m.blockSize, scale); err != nil {
+			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),
+			s.capacity, m.blockSize, scale, displacement); err != nil {
 			return err
 		}
-	} else if err := plan.AddAttentionPrefillPagedFormatAt(p.q, 0, m.poolK[layerIndex],
+	} else if err := plan.AddAttentionPrefillPagedOffsetFormatAt(p.q, 0, m.poolK[layerIndex],
 		m.poolV[layerIndex], p.attn, 0, s.tableBuf,
-		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
-		s.capacity, m.blockSize, scale, m.kvType); err != nil {
+		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),
+		s.capacity, m.blockSize, scale, m.kvType, displacement, m.forceTiledAttention); err != nil {
 		return err
 	}
-	if err := m.prefillMatmul(plan, o, p.attn, 0, p.tmp, 0, oDim, hidden, rows); err != nil {
+	oPath := hip.SelectPrefillPath(o.dtype, rows, oDim, hidden)
+	if err := m.prefillMatmulPath(plan, o, p.attn, 0, p.tmp, 0, oDim, hidden, queryRows, oPath); err != nil {
 		return err
 	}
-	return plan.Add(p.x, p.tmp, rows*hidden)
+	return plan.Add(p.x, p.tmp, queryRows*hidden)
 }
 
 func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNorm weight, rows int64) error {

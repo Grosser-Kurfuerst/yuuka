@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 6
+#define YUUKA_HIP_ABI_VERSION 7
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -311,8 +311,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *
  * Dynamic positions: ROPE_BATCH, KV_WRITE_BATCH, ATTENTION_PREFILL, and the
  * legacy single-token operators consume the position passed to
- * yuuka_plan_execute. Prefill plans pass the chunk start. ATTENTION_PREFILL and
- * KV_WRITE_BATCH additionally reject position+rows beyond their capacity.
+ * yuuka_plan_execute. Prefill plans pass the chunk start. ROPE_BATCH and
+ * ATTENTION_PREFILL_PAGED add their descriptor's token displacement.
+ * Attention and KV write batches reject ranges beyond their capacity.
  *
  * Buffer layouts for the prefill family:
  *   RMSNORM_BATCH:       buf0 src, buf1 weight, buf2 dst; n={cols,rows,
@@ -320,7 +321,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   RMSNORM_HEADS_BATCH: buf0 src, buf1 weight, buf2 dst; n={size,heads,
  *                        stride,rows}; rows are contiguous [rows,heads,stride]
  *   ROPE_BATCH:          buf0 data; n={heads,stride,head_dim,rot_dim,rows,
- *                        row_stride}
+ *                        row_stride}; u[0]=token displacement
  *   KV_WRITE_BATCH:      buf0 k, buf1 v, buf2 k_cache, buf3 v_cache;
  *                        n={kv_dim,rows}; u[0]=capacity
  *   ATTENTION_PREFILL:   buf0 q, buf1 k_cache, buf2 v_cache, buf3 out;
@@ -375,7 +376,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 block table; flags bit 1 enables experimental
  *                           BLAS F16 KV path with buf5 FP16 scratch;
- *                           n={kv_heads,heads,head_dim,kv_dim,rows};
+ *                           n={kv_heads,heads,head_dim,kv_dim,rows,displacement};
+ *                           first query position is execute position plus
+ *                           displacement tokens;
  *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype;
  *                           u[3]=1 selects the dense query layout (no output
  *                           gate), u[3]=0 selects the gated Qwen3.5 layout

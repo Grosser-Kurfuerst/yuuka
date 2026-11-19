@@ -569,7 +569,8 @@ yuuka_status validate_rope_batch_plan_op(const yuuka_op & op) {
     const uint64_t rows = op.n[4];
     const uint64_t row_stride = op.n[5];
     if (heads == 0 || rows == 0 || rot_dim == 0 || rot_dim % 2 != 0 ||
-        rot_dim > head_dim || stride < head_dim || row_stride < heads * stride) {
+        rot_dim > head_dim || stride < head_dim || row_stride < heads * stride ||
+        rows > INT32_MAX || op.u[0] > INT32_MAX || rows - 1 > uint64_t(INT32_MAX) - op.u[0]) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch RoPE dimensions");
     }
     if (rot_dim / 2 > 1024) {
@@ -1010,7 +1011,8 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
     const uint64_t capacity = op.u[1];
     const uint32_t dtype = op.u[2];
     if (kv_heads == 0 || heads == 0 || head_dim == 0 || rows == 0 ||
-        heads % kv_heads != 0 || kv_dim != kv_heads * head_dim || capacity < rows) {
+        heads % kv_heads != 0 || kv_dim != kv_heads * head_dim || capacity < rows ||
+        capacity > INT32_MAX || op.n[5] > capacity - rows) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged prefill attention dimensions");
     }
     if (!kv_dtype_ok(dtype)) {
@@ -1753,9 +1755,13 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             break;
         }
         case YUUKA_OP_ROPE_BATCH: {
+            const uint64_t first = uint64_t(position) + op.u[0];
+            if (first + op.n[4] - 1 > INT32_MAX) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch RoPE position exceeds int32");
+            }
             yuuka::launch_rope_batch_f32(
                 op_ptr<float>(op, 0), int(op.n[4]), int(op.n[0]), int(op.n[1]),
-                int(op.n[2]), int(op.n[3]), int(position), op.f[0], int(op.n[5]),
+                int(op.n[2]), int(op.n[3]), int(first), op.f[0], int(op.n[5]),
                 stream);
             break;
         }
@@ -2013,29 +2019,33 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
         case YUUKA_OP_ATTENTION_PREFILL_PAGED: {
             const uint64_t rows = op.n[4];
             const uint64_t capacity = op.u[1];
-            if (uint64_t(position) + rows > capacity) {
+            const uint64_t first = uint64_t(position) + op.n[5];
+            if (first + rows > capacity) {
                 return fail(YUUKA_ERR_INVALID_ARGUMENT,
-                            "paged prefill attention at %u with %llu rows exceeds capacity %llu",
-                            position, static_cast<unsigned long long>(rows),
+                            "paged prefill attention at %llu with %llu rows exceeds capacity %llu",
+                            static_cast<unsigned long long>(first),
+                            static_cast<unsigned long long>(rows),
                             static_cast<unsigned long long>(capacity));
             }
-            if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0 && uint64_t(position) + rows >= 2048) {
+            if ((op.flags & YUUKA_OP_FLAG_PREFILL_BLAS) != 0 && first + rows >= 2048) {
                 const int rc = yuuka::launch_attention_prefill_paged_blas_f16(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
                     op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
-                    int(op.n[1]), int(op.n[2]), int(rows), int(position),
+                    int(op.n[1]), int(op.n[2]), int(rows), int(first),
                     op.f[0], op_ptr<void>(op, 5), stream);
                 if (rc != 0) return fail(YUUKA_ERR_DEVICE, "BLAS attention failed: %d", rc);
             } else {
+                // The displacement omits leading query rows without changing
+                // the parent chunk's WMMA preference.
+                const bool prefer_wmma = (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) == 0 &&
+                    yuuka::attention_wmma_preferred(int(rows + op.n[5]), int(position));
                 yuuka::launch_attention_prefill_paged_f32(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
                     op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
                     int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
-                    int(position), op.f[0], op.u[2], int(op.u[3]),
-                    (op.flags & YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED) != 0,
-                    stream);
+                    int(first), op.f[0], op.u[2], int(op.u[3]), prefer_wmma, stream);
             }
             break;
         }
