@@ -8,7 +8,7 @@ import (
 	"github.com/yuuka-ai/yuuka/backend/hip"
 )
 
-// TestGPUFusedDeltaNetMatchesLegacy compares the two ways roadmap4 D4 can build
+// TestGPUFusedDeltaNetMatchesLegacy compares the two ways the decode plan can build
 // a recurrent layer on the real model: the fused CONV_L2NORM and
 // RECURRENT_TOKEN pair, which is the default, and the five separate operators it
 // replaced (CONV1D, two L2NORM, GDN, GATED_RMSNORM). Both sessions run the same
@@ -74,7 +74,7 @@ func TestGPUFusedDeltaNetMatchesLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Prefill runs the chunked path, which D4 does not change, so it must agree
+	// Prefill runs the chunked path, which the fusion does not change, so it must agree
 	// exactly up to the plan-independent arithmetic.
 	prefillDiff, _ := logitDiff(fusedLogits, legacyLogits)
 	t.Logf("prefill tail: max abs logit diff %.8g", prefillDiff)

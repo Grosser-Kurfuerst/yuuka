@@ -424,7 +424,7 @@ bool run_batch_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * 
 }
 
 // run_stream_case checks the streaming channel-parallel matvec, which the
-// decode graph selects for every shape the dispatch rule covers (roadmap4 D2).
+// decode graph selects for every shape the dispatch rule covers.
 // It compares one row block against the host dot product and against the
 // per-row GEMV on the same weights, so a change of summation order is the only
 // source of difference.
@@ -531,7 +531,7 @@ bool run_stream_case(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
-// run_int8_case checks the int8 decode matvec introduced for roadmap4 D3. It
+// run_int8_case checks the int8 decode matvec. It
 // quantizes the activation with YUUKA_OP_QUANT_Q8_1 and compares the int8 result
 // against the FP32 streaming kernel on the same weights, which isolates the
 // arithmetic against an independent reference: the test downloads the Q8_1

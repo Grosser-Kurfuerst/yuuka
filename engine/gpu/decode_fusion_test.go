@@ -8,8 +8,8 @@ import (
 	"github.com/yuuka-ai/yuuka/backend/hip"
 )
 
-// TestGPUDecodeFusionsMatchUnfused builds the decode plan twice: with the two D5
-// fusions (the residual epilogue on the projection that ends a sub-layer and the
+// TestGPUDecodeFusionsMatchUnfused builds the decode plan twice: with the two
+// matvec fusions (the residual epilogue on the projection that ends a sub-layer and the
 // gate/up pair that forms both dots and their SwiGLU product in one launch), and
 // with Options{NoResidualFusion, NoPairFusion} which keeps the separate ADD and
 // SILU_MUL. Both forms perform the same arithmetic in the same order, so the

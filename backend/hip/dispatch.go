@@ -192,14 +192,14 @@ func (p DecodeGemvPath) String() string {
 // route is implemented and reachable through int8Matvec, and it is measured
 // slower end to end on gfx1151: the decode step reads one row of weights per
 // matvec and is not instruction bound, so the ALU saving does not pay for the
-// activation quantization the route needs (docs/benchmarks.md, roadmap4 6.5).
+// activation quantization the route needs (docs/benchmarks.md).
 // It stays available so that measurement is reproducible and so a device or a
 // later fusion can be re-evaluated against it.
 //
 // The narrow recurrent projections (ssm_alpha and ssm_beta, 32 outputs) stay on
 // the per-row form because the streaming kernel needs 32 blocks to fill the
 // device: at 32 outputs it runs one block and measures 3.7 GB/s against 9.5.
-// Merging those launches is a launch-count change, owned by roadmap4 D5.
+// Merging those launches is a launch-count change that is not implemented.
 func SelectDecodeGemvPath(dtype tensor.DType, nIn, nOut int64, int8Matvec bool) DecodeGemvPath {
 	if !SelectLMHeadPath(dtype, 1, nIn, nOut) {
 		return DecodeGemvPerRow

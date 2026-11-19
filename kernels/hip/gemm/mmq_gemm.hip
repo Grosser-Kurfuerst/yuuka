@@ -29,7 +29,7 @@
 //   - the epilogue writes the accumulators straight to global memory instead
 //     of transposing through a 33 KiB LDS tile, which would break the two-block
 //     residency for a store pattern that is already two 64-byte runs per warp.
-// See docs/kernels.md for the contract and docs/roadmap3.md for the attribution.
+// See docs/kernels.md for the contract and docs/benchmarks.md for the attribution.
 
 namespace {
 

@@ -387,7 +387,7 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                        u[2]=epilogue. Both matrices are walked over the same
  *                        activation row in one launch, which is the decode
  *                        counterpart of GEMM_SWIGLU and the projection merge of
- *                        roadmap4 section 8.2. Epilogue 0 writes both rows;
+ *                        the decode plan. Epilogue 0 writes both rows;
  *                        epilogue 1 requires n_out_a == n_out_b and writes
  *                        silu(A x) * (B x) into out A with buf4 unused. u[1] must
  *                        equal u[0]: a mixed-dtype pair is rejected, because a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reduce rocprofv3 databases to the per-MMA prefill table in roadmap3 section 2.4.
+"""Reduce rocprofv3 databases to the per-MMA prefill table of docs/benchmarks.md.
 
 The reduction pairs ``gemm_mmq`` dispatches with ``yuuka_prefill_sweep`` cells in
 submission order. The sweep submits every cell seven times (two warmups plus
@@ -12,7 +12,7 @@ Denominator, recorded here because every later stage is judged on it:
 
 * a gfx1151 int8 WMMA is 16 x 16 x 16, that is 4096 multiply-accumulate values;
 * ``n_in * n_out * rows / 4096`` is the useful MMA count of a cell, the
-  denominator roadmap3 section 3 records;
+  denominator the reduction uses;
 * the executed MMA count is
   ``blocks_x * blocks_y * (n_in / 16) * 32``, because ``gemm_mmq_kernel`` runs
   ``kTileI = 64`` output channels by ``kTileJ = 128`` tokens with eight waves
@@ -63,7 +63,7 @@ STALL_COUNTERS = (
 
 FOCUS = {"dtype": "Q4_K", "rows": 512, "n_out": 9216, "n_in": 2560}
 
-# Recorded 2026-11-18 attribution from docs/roadmap3.md section 2.4. These are
+# Recorded 2026-11-18 attribution from docs/benchmarks.md. These are
 # printed as a comparison column only; they are not gates.
 RECORDED_YUUKA = {
     "valu_per_mma": 24.8,
@@ -505,7 +505,7 @@ def focus_cell(cells, paired):
             return cell, group, blocks
     raise Fail(
         "the sweep log has no Q4_K M=512 N=9216 K=2560 cell; "
-        "roadmap3 section 2.4 cannot be reproduced from this run"
+        "the recorded attribution cannot be reproduced from this run"
     )
 
 
@@ -531,7 +531,7 @@ def print_table(label, rows, columns):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Reduce rocprofv3 databases to roadmap3 section 2.4 per-MMA counters.",
+        description="Reduce rocprofv3 databases to per-MMA prefill counters.",
     )
     parser.add_argument("--cells", required=True, help="yuuka_prefill_sweep stdout log")
     parser.add_argument(
@@ -654,8 +654,8 @@ def main(argv=None):
                     f"LDS/wave {format_value(reference_metrics.get('lds_per_wave'))})"
                 )
         print(
-            "\ndelta is against the 2026-11-18 attribution in docs/roadmap3.md "
-            "section 2.4; achieved TF/s also moves with clock state and code "
+            "\ndelta is against the 2026-11-18 attribution in docs/benchmarks.md; "
+            "achieved TF/s also moves with clock state and code "
             "revision, so only the counters are expected to match."
         )
 

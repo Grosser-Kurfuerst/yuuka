@@ -34,7 +34,7 @@ func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint
 // every shape the decode graph dispatches except the 32-output recurrent
 // projections, where the per-row GEMV stays; within that set the K-quants and
 // Q8_0 dot the Q8_1 activation with int8 v_dot4 and the other dtypes keep FP32
-// (docs/roadmap4.md section 6, docs/kernels.md section 5.3).
+// (docs/kernels.md section 5.3).
 //
 // The int8 route reads digits that decodeActGroup quantized for this group of
 // matvecs, so a matvec on a row that was not prepared is a planning error and
@@ -66,7 +66,7 @@ func (m *Model) decodeMatmul(plan *hip.Plan, w weight, x, out *hip.Buffer,
 
 // decodeMatmulResidual appends the decode matvec that ends a sub-layer together
 // with its residual add. out = W*x + res in one launch when the streaming kernel
-// is selected, which is the D5 fusion of roadmap4 section 8.2; the per-row route
+// is selected; the per-row route
 // keeps the two operations it has always had, because that kernel has no
 // epilogue and the choice is made here, at plan build time, not at run time.
 func (m *Model) decodeMatmulResidual(plan *hip.Plan, w weight, x, out, res *hip.Buffer,
@@ -329,7 +329,7 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	// q, k, and v are independent and read the same row, but only a pair of
 	// comparable widths pays for a merge: the q and k pair was measured 0.4 ms
 	// slower per step than two launches, because the grid follows the wider
-	// matrix and the narrow one then shares its staging (roadmap4 8.5). They keep
+	// matrix and the narrow one then shares its staging. They keep
 	// their own launches.
 	if err := m.decodeMatmul(plan, q, m.act.norm, m.act.q, hidden, qDim); err != nil {
 		return err
@@ -438,7 +438,7 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 	}
 	// The qkv projection and the delta-net gate read the same row, but their
 	// dtypes differ in this model (Q5_K against Q4_K) and their widths are 2:1, so
-	// they keep separate launches; see the measurement in roadmap4 8.5.
+	// they keep separate launches.
 	if err := m.decodeMatmul(plan, qkv, m.act.norm, m.act.qkv, hidden, convDim); err != nil {
 		return err
 	}

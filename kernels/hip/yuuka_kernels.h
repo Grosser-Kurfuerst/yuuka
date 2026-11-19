@@ -108,7 +108,7 @@ void launch_gemm_mmq_f32out(float * out, const void * qs, const void * ds,
  * supported. n_in must be a multiple of 256 and rows must be at most 16; an
  * out-of-range shape or an unknown dtype launches nothing. */
 // launch_lm_head_residual_f32out is the streaming single-row-block matvec with
-// the residual epilogue of roadmap4 D5: out = W x + res, where res may alias out.
+// the residual epilogue: out = W x + res, where res may alias out.
 // Passing a null res gives the plain form.
 void launch_lm_head_residual_f32out(float * out, const float * x, const void * w,
                                     const float * res, uint64_t n_in, uint64_t n_out,
@@ -120,7 +120,7 @@ void launch_lm_head_residual_f32out(float * out, const float * x, const void * w
 // swiglu
 // the two dots are combined as silu(a) * b into out0 and out1 is unused;
 // otherwise both rows are written. It is the decode counterpart of GEMM_SWIGLU
-// and the narrow-projection merge of roadmap4 section 8.2.
+// and the narrow-projection merge of the decode plan.
 void launch_lm_head_pair_f32out(float * out0, float * out1, const float * x,
                                 const void * w0, const void * w1, uint64_t n_in,
                                 uint64_t n_out0, uint64_t n_out1, uint32_t dtype,

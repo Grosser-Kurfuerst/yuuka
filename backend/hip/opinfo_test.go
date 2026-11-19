@@ -30,7 +30,7 @@ func TestOpNameAndRolesCoverABI(t *testing.T) {
 			t.Errorf("op code %d (%s) has no recorded first-slot role", code, name)
 		}
 	}
-	// The decode attribution in docs/roadmap4.md names these codes; pin the
+	// The decode attribution in docs/benchmarks.md names these codes; pin the
 	// spelling the documents use.
 	for code, want := range map[uint32]string{
 		OpGemv:           "gemv",

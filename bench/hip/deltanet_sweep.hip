@@ -1,5 +1,5 @@
-// deltanet_sweep measures the gated delta-net per-token kernels of roadmap4
-// D4 at the exact shape one Qwen3.5-4B Q4_K_M recurrent layer dispatches
+// deltanet_sweep measures the gated delta-net per-token kernels at the exact
+// shape one Qwen3.5-4B Q4_K_M recurrent layer dispatches
 // (32 heads, 16 groups, 128-wide state), so the choice between the register
 // resident and shared-memory resident forms is made on measured time and not on
 // the layout argument alone.
@@ -60,7 +60,7 @@ __device__ __forceinline__ void stage_decay(float decay, float beta, float * hdr
     hdr[1] = beta;
 }
 
-// legacy_kernel is the five-pass kernel the decode plan uses before D4.
+// legacy_kernel is the five-pass kernel the decode plan used before the fusion.
 __global__ void legacy_kernel(float * state, const float * q, const float * k,
                               const float * v, const float * alpha, const float * beta_raw,
                               const float * dt, const float * a, float * out,

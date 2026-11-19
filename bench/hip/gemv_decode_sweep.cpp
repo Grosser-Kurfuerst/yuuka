@@ -1,6 +1,6 @@
 // gemv_decode_sweep measures the decode matvec family at the exact shapes one
 // Qwen3.5-4B Q4_K_M token dispatches, with the matrix resident, so the numbers
-// are the hot-matrix upper bound of docs/roadmap4.md section 2.4. It compares
+// are the hot-matrix upper bound of docs/benchmarks.md. It compares
 // the per-row GEMV the decode plan uses today with the batched form and the
 // streaming LM head kernel, and it is the native target for scripts/
 // decode_profile.sh because rocprofv3 cannot collect from a Go process.
@@ -15,14 +15,14 @@
 // is the measurement behind the lmHeadMinOutputs crossover. It prints its own
 // schema and is not traced.
 //
-// --int8 measures the int8 decode matvec of roadmap4 D3 against the FP32
+// --int8 measures the int8 decode matvec against the FP32
 // streaming kernel on the same matrix, both with a pre-quantized activation and
 // with the block-fused quantizer. It prints its own schema and is not traced.
 //
-// --recurrent is the isolated RECURRENT cell of roadmap4 section 7.3: the
+// --recurrent is the isolated RECURRENT cell of the decode attribution: the
 // delta-net unit of one recurrent layer at the exact decode shape, built from the
-// five separate operators against the fused pair, so the stage's time and state
-// bandwidth gates are reproducible from one command. It prints its own schema
+// five separate operators against the fused pair, so the time and state
+// bandwidth comparison is reproducible from one command. It prints its own schema
 // and is not traced.
 
 #include "yuuka_hip.h"
@@ -176,7 +176,7 @@ void fill_weights(std::vector<uint8_t> & weights, uint32_t dtype, int64_t n_in,
 
 // Shape is one decode projection: the name matches the tensor role the
 // attribution uses, so the CSV joins with the per-tensor table of
-// docs/roadmap4.md section 2.4.
+// docs/benchmarks.md.
 struct Shape {
     const char * name;
     int64_t n_in;
@@ -519,7 +519,7 @@ int main(int argc, char ** argv) {
                         "  --threshold  the rows = 1 output projection crossover per dtype\n"
                         "  --int8       the int8 decode matvec against the FP32 streaming kernel\n"
                         "  --recurrent  the delta-net unit of one recurrent layer, five separate\n"
-                        "               operators against the fused pair (roadmap4 7.3)\n",
+                        "               operators against the fused pair\n",
                         argv[0]);
             return 0;
         } else {
@@ -542,7 +542,7 @@ int main(int argc, char ** argv) {
     int status = 0;
 
     if (int8) {
-        // The int8 route of roadmap4 D3 at the twelve decode shapes: the FP32
+        // The int8 route at the twelve decode shapes: the FP32
         // streaming kernel, the same matvec over a pre-quantized activation, and
         // the fused variant that quantizes inside the block.
         const Shape shapes[] = {

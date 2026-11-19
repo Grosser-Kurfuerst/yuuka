@@ -16,11 +16,11 @@ import (
 // The recorded decode attribution the gates below compare against, measured on
 // one gfx1151 device with Qwen3.5-4B-Q4_K_M. The operation count is structural
 // and exact; the timings track the current tree and are re-recorded when a
-// roadmap4 stage lands, because each stage moves them by design: 97.6 ms in the
-// D0 record, 89.4 ms after D1 (section 4.5), 31.6 ms after D2 (section 5.5), the
-// D4 values of section 7.5, and the values below after D5 (section 8.5), which
-// folded the residual add and the gate/up pair into the matvec. The per-stage
-// history stays in docs/roadmap4.md.
+// decode kernel lands, because each change moves them by design: 97.6 ms before
+// the streaming matvec family, 89.4 ms after the streaming LM head, 31.6 ms
+// after the matvec family moved to the streaming kernel, 24.3 ms after the fused
+// gated delta-net, and the values below after the residual and gate/up fusions.
+// The measured history stays in docs/benchmarks.md.
 const (
 	decodeBaselineOps     = 379
 	decodeBaselineTotalMS = 23.400
@@ -29,7 +29,7 @@ const (
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated
 // loosely; the operation count is structural and exact, and the GEMV share is
-// the invariant the later stages of roadmap4 are built on.
+// the invariant the decode kernel work is built on.
 const (
 	decodeTotalLowRatio  = 0.5
 	decodeTotalHighRatio = 2.0
@@ -37,21 +37,20 @@ const (
 )
 
 // TestGPUProfileDecode attributes one decode step per planned operation and per
-// tensor. It reproduces the tables of docs/roadmap4.md sections 2.3 and 2.4 and
-// gates the result against the recorded attribution. Event instrumentation adds
+// tensor. It reproduces the attribution tables of docs/benchmarks.md and gates
+// the result against the recorded attribution. Event instrumentation adds
 // a submission gap per operation, so the absolute numbers are a diagnosis, not
 // a release measurement; see docs/testing.md section 6.3.
 func TestGPUProfileDecode(t *testing.T) {
 	reader, _, model, prompt := goldenPrompt(t)
-	// YUUKA_TEST_DECODE_INT8 selects the int8 decode matvec of roadmap4 D3 so the
+	// YUUKA_TEST_DECODE_INT8 selects the int8 decode matvec so the
 	// same attribution can be produced for each variant: "fused" quantizes inside
 	// the matvec block, "prequantized" submits one quantization operation per
 	// activation group. Unset keeps the default FP32 streaming route.
 	opts := Options{}
 	route := "fp32 streaming"
-	// YUUKA_TEST_DECODE_UNFUSED=1 builds the plan without the D5 residual
-	// epilogue and gate/up pair, which is how the same-session A/B of roadmap4
-	// section 8.5 measured the fusions.
+	// YUUKA_TEST_DECODE_UNFUSED=1 builds the plan without the residual epilogue
+	// and gate/up pair, which is how the same-session A/B measured the fusions.
 	if os.Getenv("YUUKA_TEST_DECODE_UNFUSED") != "" {
 		opts.NoResidualFusion = true
 		opts.NoPairFusion = true
@@ -119,7 +118,7 @@ type decodeSample struct {
 	ms       float64
 	// moved is the bytes the operation is expected to move; the GEMV family
 	// reads its packed weights once, and the delta-net forms read and write the
-	// recurrent state once (docs/roadmap4.md section 7).
+	// recurrent state once.
 	moved  uint64
 	matmul bool
 	// stateful marks the operations whose traffic is recurrent or convolutional
@@ -282,7 +281,7 @@ func operationTraffic(info hip.OpInfo) (moved uint64, matmul bool, rows int64) {
 		return 5 * state, false, 1
 	case hip.OpRecurrentToken:
 		// The fused per-token operator reads the head state into registers once
-		// and writes it back once (docs/roadmap4.md section 7).
+		// and writes it back once.
 		state := uint64(info.N[1]) * uint64(info.N[2]) * uint64(info.N[2]) * 4
 		return 2 * state, false, 1
 	case hip.OpConvL2Norm:
@@ -325,8 +324,8 @@ type decodeDTypeRow struct {
 	rows  int64
 }
 
-// decodeCodeRow aggregates by operation code, which is the table of
-// docs/roadmap4.md section 2.3.
+// decodeCodeRow aggregates by operation code, which is the per-operation table
+// of docs/benchmarks.md.
 type decodeCodeRow struct {
 	code uint32
 	ops  int
@@ -490,22 +489,22 @@ func checkDecodeGates(t *testing.T, r *decodeReport) {
 	t.Helper()
 	if got := len(r.samples); got != decodeBaselineOps {
 		t.Fatalf("the decode step runs %d operations, the recorded attribution is %d;"+
-			" update docs/roadmap4.md section 2.3 before changing the plan shape", got,
+			" update the attribution in docs/benchmarks.md before changing the plan shape", got,
 			decodeBaselineOps)
 	}
 	if r.total < decodeTotalLowRatio*decodeBaselineTotalMS ||
 		r.total > decodeTotalHighRatio*decodeBaselineTotalMS {
 		t.Fatalf("profiled decode step is %.3f ms, which is outside the recorded"+
 			" %.1fx..%.1fx band of %.3f ms; re-record the attribution in"+
-			" docs/roadmap4.md section 2.3 for this device", r.total,
+			" docs/benchmarks.md for this device", r.total,
 			decodeTotalLowRatio, decodeTotalHighRatio, decodeBaselineTotalMS)
 	}
 	share := r.matmul / r.total
 	baselineShare := decodeBaselineGemvMS / decodeBaselineTotalMS
 	if share < baselineShare-decodeShareTolerance || share > baselineShare+decodeShareTolerance {
 		t.Fatalf("the GEMV family is %.1f%% of the decode step, the recorded attribution"+
-			" is %.1f%%; a change moved the bottleneck, so update docs/roadmap4.md"+
-			" section 2.3 and the stage gates", 100*share, 100*baselineShare)
+			" is %.1f%%; a change moved the bottleneck, so update docs/benchmarks.md"+
+			" and the gate bands", 100*share, 100*baselineShare)
 	}
 	t.Logf("gate: %d operations (recorded %d), total %.3f ms (recorded %.3f ms),"+
 		" GEMV share %.1f%% (recorded %.1f%%)", len(r.samples), decodeBaselineOps,

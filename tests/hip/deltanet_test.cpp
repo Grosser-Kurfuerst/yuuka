@@ -1,4 +1,4 @@
-// Compares the fused gated delta-net operators of roadmap4 D4 against the
+// Compares the fused gated delta-net operators against the
 // separate operators they replace and against a host reference, on the geometry
 // one Qwen3.5-4B recurrent layer dispatches: 8192 qkv channels, a 4-tap
 // convolution, 16 groups of a 128-wide state, and 32 heads.

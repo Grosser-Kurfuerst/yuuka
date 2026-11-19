@@ -707,7 +707,7 @@ func (p *Plan) AddConvL2Norm(convState, weights, qkv, out *Buffer, channels, ker
 	return p.add(op)
 }
 
-// AddGemvResidualAt appends the streaming matvec of roadmap4 D5 with the
+// AddGemvResidualAt appends the streaming matvec with the
 // residual epilogue: out = W*x + residual. out may alias residual, which is how
 // the decode plan ends a sub-layer in one launch instead of a matvec plus an ADD.
 // The shape and dtype rules are those of AddLMHeadAt, and rows must be 1..16.
@@ -741,7 +741,7 @@ const (
 )
 
 // AddGemvPairAt appends two single-row matvecs over one activation row as a
-// single launch (roadmap4 D5). The two matrices may differ in packed dtype and
+// single launch. The two matrices may differ in packed dtype and
 // width, which is what lets the plan merge projections that are independent but
 // share their input row. With PairSwiglu the second output is unused and nil is
 // allowed; with PairWriteBoth both outputs are written.

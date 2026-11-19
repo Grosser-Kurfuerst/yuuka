@@ -8,7 +8,7 @@ import (
 )
 
 // TestGPUGraphReplayMatchesAndTimes measures the opt-in HIP Graph replay of the
-// decode plan that roadmap4 D5 re-evaluated: with four hundred dependent
+// decode plan that the residual and gate/up fusions re-evaluated: with four hundred dependent
 // operations the submission side could still be a gap, and a captured plan
 // removes every per-operation host submission. The test requires the replayed
 // session to produce the same greedy tokens as the plain submission path and

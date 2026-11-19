@@ -37,7 +37,7 @@ decode, KV-format, attention, isolated GEMM, batched GEMV, MoE, gated delta-net,
 serving, server, and llama.cpp comparison tables were measured at `161fbba` and
 were not repeated: the LM head change is confined to the prefill tail and does
 not touch the decode dispatch. `scripts/prefill_counters.sh` was rerun and still
-reproduces the recorded S1 instruction counters.
+reproduces the recorded MMQ GEMM instruction counters.
 
 Protocol:
 
@@ -55,13 +55,13 @@ Protocol:
   both sides (`--prefix-cache=false`, `"cache_prompt": false`).
 - `scripts/prefill_counters.sh` reproduces the per-MMA prefill counters
   (instruction mix, bank conflicts, occupancy) recorded in
-  [roadmap3.md](roadmap3.md#2-baseline-attribution-2026-11-18). It profiles the
+  [kernels.md](kernels.md#63-int8-mmq-gemm). It profiles the
   native sweep binary only: `rocprofv3` cannot write its database for a Go
   process, as recorded in [testing.md](testing.md#63-what-to-measure-separately).
 - `scripts/decode_profile.sh` reproduces the [decode matvec](#decode-matvec)
   table in one command: it runs `build/yuuka_gemv_decode_sweep` unprofiled and
   under `rocprofv3`, runs its `--threshold` and `--int8` modes for the output
-  projection crossover and the [int8 comparison](#int8-decode-matvec-d3), then
+  projection crossover and the [int8 comparison](#int8-decode-matvec), then
   runs `TestGPUProfileDecode` for the per-operation attribution of one real
   decode step. The sweep keeps every matrix resident, so its GB/s figures are the
   hot-matrix upper bound of the real step.
@@ -145,25 +145,20 @@ token between the two figures is the host side of the loop: the sampler reads
 248,320 logits and the row is copied device-to-host once per token.
 
 The decode rows measure the selected route, which is the FP32 streaming matvec
-(the int8 route of roadmap4 D3 is measured slower and stays opt-in; see
-[int8 decode matvec](#int8-decode-matvec-d3)).
+(the int8 route is measured slower and stays opt-in; see
+[int8 decode matvec](#int8-decode-matvec)).
 
 The table was re-measured four times: when the decode output projection moved to
-the streaming LM head kernel
-([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)), when the rest of the
-decode matvec family followed it
-([roadmap4.md](roadmap4.md#55-implementation-2026-11-18)), when the gated
-delta-net moved to the fused per-token pair
-([roadmap4.md](roadmap4.md#75-implementation-2026-11-18)), and when the residual
-add and the gate/up pair were folded into the matvec
-([roadmap4.md](roadmap4.md#85-implementation-2026-11-18)). Same flags, same
+the streaming LM head kernel, when the rest of the decode matvec family followed
+it, when the gated delta-net moved to the fused per-token pair, and when the
+residual add and the gate/up pair were folded into the matvec. Same flags, same
 session, 128 decode tokens: 13.241 s, then 12.079 s, then 4.245 s, 3.341 s, then
 3.280 s. The profiled step went 97.4, 89.4, 31.6, 24.3, 23.4 ms with the matvec
 family at 87.6, 79.2, 21.6, 21.5, 21.1 ms, so the matvec share rose from 68% to
 90% as everything else left the critical path. Prefill is unaffected across all
 five: 0.085-0.088 s.
 
-### Decode fusion (D5)
+### Decode fusion
 
 `TestGPUProfileDecode` with and without `YUUKA_TEST_DECODE_UNFUSED=1`, same
 session, same plan input, one decode step after a real forward pass:
@@ -182,18 +177,18 @@ bit-identical logits over eight greedy steps
 plain submission path against 22.385 ms with the plan captured into a HIP Graph,
 a ratio of 0.999 with identical tokens. Replay removes every per-operation host
 submission, so the inter-operation gap is below the resolution of that comparison,
-which is what the D5 gap gate asked for.
+which is what the matvec fusion targeted.
 
-Variants measured and rejected in the same stage:
+Variants measured and rejected for the same kernel:
 
 | Variant | Step | Matvec | Verdict |
 | --- | ---: | ---: | --- |
-| D4 tree (before the stage) | 24.26 ms | 21.45 ms | - |
+| fused delta-net tree (before the fusion) | 24.26 ms | 21.45 ms | - |
 | eight output channels per wave | 25.9 ms | 21.8 ms | 28% slower, spills |
 | `kStepK` 512 | 24.2 ms | 21.8 ms | 7% slower, staging outweighs barriers |
 | pair with a run-time dtype switch | 26.2 ms | 23.9 ms | 40% slower than the templated pair |
 
-### Gated delta-net (D4)
+### Gated delta-net
 
 `build/yuuka_deltanet_sweep`: one recurrent layer at the decode geometry (32
 heads, 16 groups, 128-wide state), each candidate kernel timed with HIP events
@@ -242,11 +237,11 @@ decay of about 0.75; the worst difference is 3e-8, and the two device paths agre
 with each other to 7e-9. On the real model the two plans produce identical greedy
 tokens over eight steps with a 9.5e-6 maximum logit difference.
 
-### Int8 decode matvec (D3)
+### Int8 decode matvec
 
 `build/yuuka_gemv_decode_sweep --int8`, the same protocol as the decode matvec
-table, one row per submission with the matrix resident. The int8 forms run the
-roadmap4 D3 route: the pre-quantized form reads the Q8_1 digits of the activation
+table, one row per submission with the matrix resident. The int8 forms are the
+int8 route: the pre-quantized form reads the Q8_1 digits of the activation
 (`YUUKA_OP_QUANT_Q8_1`), the fused form quantizes the row inside the matvec block.
 
 | Shape | dtype | FP32 stream | int8 pre-quantized | int8 fused |
@@ -277,8 +272,8 @@ prompt:
 The int8 arithmetic is 6% faster in step, the quantization pass costs 5% back,
 and the fused form costs more than the launch it removes. Decode stays on the
 FP32 streaming kernel: the step reads 2,726 MB of weights at 127 GB/s against a
-244 GB/s read ceiling, so it is not instruction bound, and the roadmap4 D3 gate
-of 31 tokens/s is missed. Numerics: identical tokens over eight greedy steps with
+244 GB/s read ceiling, so it is not instruction bound, and the 31 tokens/s
+target is missed. Numerics: identical tokens over eight greedy steps with
 0.2656 maximum logit difference against the FP32 route, and 5.7e-4 relative
 against the quantized host reference in `tests/hip/gemv_test.cpp`.
 
@@ -351,7 +346,7 @@ one `ATTENTION_PREFILL_PAGED` op, no other work in the plan.
 The dispatch rule follows the table: the MMA kernel is selected from 64 rows or
 from a 256-token prefix. Over the eight full-attention layers of a 512-token
 chunk that is 4.1 ms of attention at position 0 and 117.6 ms at position 7680,
-against 19.7 ms and 562 ms for the tiled kernel (the roadmap gates are 6 ms and
+against 19.7 ms and 562 ms for the tiled kernel (the design targets are 6 ms and
 150 ms).
 
 Numerics, same harness: the MMA output differs from the FP32 reference by
@@ -475,8 +470,8 @@ warmups and twenty-five timed submissions of one plan operation; the value is
 the median submission, timed on the host around the submit and the wait. The
 traced run of the same binary supplies the kernel time and the instruction
 counts. `scripts/decode_profile.sh` reproduces this table, and
-[roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18) holds the
-attribution it feeds.
+[testing.md](testing.md#63-what-to-measure-separately) describes the
+per-operation attribution it feeds.
 
 `GEMV` is the per-row kernel the decode plan uses today, `batch 4` the batched
 form, and `LM head` the streaming kernel that the prefill tail already uses.
@@ -532,8 +527,8 @@ Findings:
   per-submission cost is worse. Decode at batch 1 gains nothing from it.
 - Wall time minus kernel time is the per-submission launch cost: 20-30
   microseconds for the small cells. The instrumented decode step pays that 579
-  times, which is the 6.2% submission gap recorded in
-  [roadmap4.md](roadmap4.md#23-per-operation-attribution).
+  times, which is the 6.2% submission gap of the profiled decode step
+  ([decode fusion](#decode-fusion)).
 - Two consecutive runs of `scripts/decode_profile.sh` agree within 9% on every
   cell and within 0.3% on the profiled decode step, so the table is stable
   enough to judge a kernel change against.
@@ -574,8 +569,7 @@ against the in-step value of the profiled cell:
 
 Every matrix below the cache size reads 1.3-1.6x faster in the sweep, and the
 one matrix far above it agrees within 1%. Use the sweep for the kernel's own
-ceiling and the step column for what a token costs; roadmap4 section 3.4 records
-the criterion this replaces.
+ceiling and the step column for what a token costs.
 
 ### Grouped MoE pipeline
 
@@ -677,8 +671,8 @@ off, greedy:
 | | Per-request decode tok/s | 39.17 | 2.41 |
 | | TTFT median | 371 ms | 690 ms |
 
-The yuuka decode column of this table was measured before roadmap4 D1-D4 and is
-kept as the recorded server comparison; the CLI rows above are the current decode
+The yuuka decode column of this table was measured before the streaming matvec
+and gated delta-net work and is kept as the recorded server comparison; the CLI rows above are the current decode
 rate, and the server path has not been re-measured against llama.cpp since.
 
 Both servers tokenize the benchmark prompt to the same length (140, 530, 2051),
@@ -692,8 +686,7 @@ server scheduling, so CLI and server numbers are not interchangeable.
 Per recurrent layer of a 512-row chunk, one `RECURRENT_CHUNK` op in a plan,
 20 repetitions after 3 warmups, 24 layers reported as the total. The per-token
 path is the selected one; the chunkwise form is measured for
-[kernels.md](kernels.md#91-chunkwise-form) and
-[roadmap3.md](roadmap3.md#51-implementation-2026-11-18).
+[kernels.md](kernels.md#91-chunkwise-form).
 
 | Path / kernel | Per layer | 24 layers |
 | --- | ---: | ---: |
@@ -706,7 +699,7 @@ path is the selected one; the chunkwise form is measured for
 The convolution, gated RMSNorm, and preparation kernels are shared by both
 paths. The chunkwise scan moves 2x the arithmetic of the per-token kernel
 through the FP32 FMA pipe and is LDS-latency bound, so it does not pay for the
-extra work; see the attribution in roadmap3.
+extra work; see [kernels.md](kernels.md#91-chunkwise-form).
 
 ## llama.cpp comparison
 
@@ -730,8 +723,8 @@ The remaining gaps, in order of size:
    channel-parallel kernel ([decode matvec](#decode-matvec)). What remains is 90%
    matvec at 129.7 GB/s against a 244 GB/s read ceiling, plus 0.79 ms of gated
    delta-net and 1.6 ms of other operations in a 23.4 ms step; the delta-net and
-   the submission gaps left the critical path in D4 and D5
-   ([gated delta-net](#gated-delta-net-d4), [decode fusion](#decode-fusion-d5)).
+   the submission gaps left the critical path with those fusions
+   ([gated delta-net](#gated-delta-net), [decode fusion](#decode-fusion)).
    The matvec's remaining loss is a per-launch ramp of about 22 us on the 5-19 MB
    matrices, which only merges of same-dtype, comparable-width projections
    amortize.
@@ -762,7 +755,8 @@ Each of these is a measured decision that still holds in the current code:
   both operands in WMMA fragment order (0.0% bank conflicts from 35.9%),
   expands Q4_K/Q5_K digits with word-wide masks, and uses a 128-value K step so
   two blocks stay resident per CU: 13.8 -> 17.3-18.5 TFLOP/s on Q4_K
-  `2560 -> 9216` at M=512. Rejected against it, in [roadmap3.md](roadmap3.md#10-rejected-routes-and-open-questions):
+  `2560 -> 9216` at M=512. Rejected against it (see
+  [decisions and rejected routes](#decisions-and-rejected-routes)):
   a 60 KiB double-buffered 256-value stage (one block per CU, 14.6 TFLOP/s),
   register prefetch of the next step's weights (192 VGPRs, 161-195 spills,
   6.4 TFLOP/s), a 64-value K step (16.4 TFLOP/s), and rebuilding the rocWMMA

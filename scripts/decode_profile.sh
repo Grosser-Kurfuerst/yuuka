@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Reproduce the decode matvec attribution of docs/roadmap4.md section 2.4.
+# Reproduce the decode matvec attribution of docs/benchmarks.md.
 #
-# Stage D0 tooling, one command for both halves of the attribution:
+# One command for both halves of the attribution:
 #
 # 1. run build/yuuka_gemv_decode_sweep once unprofiled, then trace it with
 #    rocprofv3 kernel tracing and the instruction counters, and reduce both to
-#    the per-shape GB/s table of docs/roadmap4.md section 2.4 with the per-weight
+#    the per-shape GB/s table of docs/benchmarks.md with the per-weight
 #    instruction counts. The sweep keeps every matrix resident, so its numbers
 #    are the hot-matrix upper bound.
 # 2. run the rows = 1 output-projection crossover sweep, the measurement behind
-#    lmHeadMinOutputs (roadmap4 section 4.2), the int8 matvec comparison of
-#    section 6.5, and the isolated delta-net RECURRENT cell of section 7.3.
+#    lmHeadMinOutputs, the int8 matvec comparison, and the isolated delta-net
+#    RECURRENT cell.
 # 3. run TestGPUProfileDecode, which attributes one real decode step per planned
-#    operation and per tensor (section 2.3).
+#    operation and per tensor.
 #
 # Every step here is a diagnostic, not a release measurement; see
 # docs/testing.md section 6.3.
@@ -33,7 +33,7 @@ sweep="${build}/yuuka_gemv_decode_sweep"
 library="${build}/libyuuka_hip.so"
 reducer="${root}/scripts/decode_profile.py"
 
-# docs/roadmap4.md section 2.1: the attribution is only comparable against this
+# The attribution is only comparable against this
 # model and this device.
 recorded_model_sha256="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 expected_target="${YUUKA_GPU_TARGET:-gfx1151}"
@@ -48,7 +48,7 @@ usage() {
     cat <<'EOF'
 usage: decode_profile.sh [options]
 
-Collect and reduce the roadmap4 section 2.4 per-shape decode matvec table.
+Collect and reduce the per-shape decode matvec table.
 
   --model PATH   GGUF whose shape list the sweep reproduces. Its SHA-256 must
                  match the recorded attribution hash. Defaults to
@@ -243,7 +243,7 @@ if ! "$sweep" --int8; then
 fi
 
 echo
-echo "== delta-net unit of one recurrent layer (roadmap4 7.3 RECURRENT cell)"
+echo "== delta-net unit of one recurrent layer (RECURRENT cell)"
 if ! "$sweep" --recurrent; then
     die "$sweep --recurrent failed"
 fi

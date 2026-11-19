@@ -228,7 +228,7 @@ an undersized buffer, a mixed-dtype pair, a SwiGLU pair with unequal widths, and
 an input width that is not a multiple of 256 are each rejected at plan
 construction.
 
-`TestGPUDecodeFusionsMatchUnfused` is the same differential for the D5 matvec
+`TestGPUDecodeFusionsMatchUnfused` is the same differential for the matvec
 fusions: the default plan against `Options{NoResidualFusion, NoPairFusion}`, with
 the operation counts of both asserted (64 `GEMV_RESIDUAL` and 32 `GEMV_PAIR`
 against 64 `ADD` and 32 `SILU_MUL`) and eight greedy steps compared at 1e-3. The
@@ -236,10 +236,10 @@ fusions move work rather than arithmetic, so the two plans agree bit for bit.
 
 `TestGPUGraphReplayMatchesAndTimes` runs the same greedy loop on a plain session
 and on one with `Options.EnableGraph`, requires identical tokens, and reports both
-step times. It is the measurement behind the D5 gap gate: replay removes every
-per-operation host submission, so a ratio near one says there is no submission gap
-left to remove. It asserts correctness only, because a timing assertion on an
-unpinned clock is not a gate.
+step times. It is the measurement behind the submission-gap question: replay
+removes every per-operation host submission, so a ratio near one says there is
+no submission gap left to remove. It asserts correctness only, because a timing
+assertion on an unpinned clock is not a gate.
 
 `TestGPUFusedDeltaNetMatchesLegacy` is the full-model differential: it builds the
 default plan and the `Options.LegacyDeltaNet` plan, checks the operator counts of
@@ -380,7 +380,8 @@ Choose test inputs that make the mistake under test visible, and say so in the
 test. A kernel that is wrong by a factor of `decay` agrees with a correct kernel
 to 1.6e-5 when `decay` is 0.997 and differs by 2.6e-4 when it is 0.75, so a test
 written against the first input would have accepted a wrong gated delta-net
-kernel (roadmap4 7.5 records the case). The rules:
+kernel; the case is recorded in
+[benchmarks.md](benchmarks.md#gated-delta-net). The rules:
 
 - For every decay, gate, scale, or mask the kernel applies, pick at least one
   test value where applying it and not applying it differ by far more than the
@@ -411,8 +412,8 @@ Per-operation attribution is a diagnostic step, not a benchmark result.
 with HIP events around every plan operation. It is opt-in through
 `YUUKA_TEST_MODEL`, and `YUUKA_TEST_KV=f16` selects the F16 KV pool. Use it to
 rank work; confirm any accepted change with the protocol above and report it in
-[benchmarks.md](benchmarks.md). The current attribution is recorded in the
-prefill diagnostic of [roadmap3.md](roadmap3.md#2-baseline-attribution-2026-11-18).
+[benchmarks.md](benchmarks.md). The current attribution is the prefill
+diagnostic described below.
 
 `rocprofv3` cannot profile a Go process. It writes its result database from a
 glibc `atexit` handler, and the Go runtime exits without running those
@@ -429,8 +430,7 @@ fails when the device is not `gfx1151`, runs
 `build/yuuka_prefill_sweep` once unprofiled, then traces it with
 `SQ_INSTS_VALU SQ_INSTS_LDS SQ_WAVES` and with `LDSBankConflict ALUStalledByLDS
 LdsLatency OccupancyPercent`, optionally traces a llama.cpp reference run, and
-reduces the databases to the per-MMA table of
-[roadmap3.md](roadmap3.md#3-stage-s0-reproducible-counter-attribution). The
+reduces the databases to a per-MMA counter table. The
 reduction lives in `scripts/prefill_counters.py` and pairs `gemm_mmq`
 dispatches with sweep cells in submission order, seven submissions per cell;
 it fails when the launch geometry no longer matches a cell rather than
@@ -445,34 +445,35 @@ operation, resolves each operation to the model buffer it reads, and prints the
 per-operation, per-tensor, and per-dtype tables plus one line per plan index
 sorted by time. It is opt-in through `YUUKA_TEST_MODEL`, and it gates the result
 against the recorded attribution of
-[roadmap4.md](roadmap4.md#2-baseline-attribution-2026-11-18): the plan must hold
+[benchmarks.md](benchmarks.md#decode-matvec): the plan must hold
 the recorded 379 operations, the profiled total must stay inside a wide band
 around the recorded 23.400 ms, and the matvec share must stay within five points
 of the recorded share. The bands are wide because device clocks are not pinned,
-and the recorded constants are re-recorded when a roadmap4 stage lands, because
-each stage moves the total by design: 97.6 ms in the D0 record, 89.4 ms after D1,
-31.6 ms after D2, 24.3 ms after D4, and 23.4 ms after D5, in 579 operations until
-D4 folded the five delta-net operators of a recurrent layer into two (507) and D5
-folded the residual add and the gate/up pair into the matvec (379). The operation
-count is exact because it is structural, so a plan change is always visible, and a
-change that moves the attribution outside the bands has to re-record the constants
-and the document rather than pass silently. Sections 5.5, 7.5, and 8.5 of
-roadmap4 keep the per-stage history. Event instrumentation adds a
-submission gap per operation, so the totals exceed a release run and are a
-diagnosis, not a benchmark result.
+and the recorded constants are re-recorded when a decode fusion lands, because
+each change moves the total by design: 97.6 ms in the first record, 89.4 ms
+after the streaming LM head, 31.6 ms after the matvec family moved to the
+streaming kernel, 24.3 ms after the fused gated delta-net, and 23.4 ms after the
+residual and gate/up fusions, in 579 operations until the delta-net fusion
+folded the five recurrent operators of a layer into two (507) and the matvec
+fusion folded the residual add and the gate/up pair into the projection (379).
+The operation count is exact because it is structural, so a plan change is
+always visible, and a change that moves the attribution outside the bands has
+to re-record the constants and the document rather than pass silently. The
+per-fusion history is in [benchmarks.md](benchmarks.md#decode-fusion). Event
+instrumentation adds a submission gap per operation, so the totals exceed a
+release run and are a diagnosis, not a benchmark result.
 
-`YUUKA_TEST_DECODE_UNFUSED=1` builds the same plan without the D5 residual
-epilogue and gate/up pair, which is the same-session A/B of roadmap4 section 8.5:
-the two runs differ only in the fused operations, so the difference in the report
-is what the fusions are worth.
+`YUUKA_TEST_DECODE_UNFUSED=1` builds the same plan without the residual
+epilogue and gate/up pair, which is a same-session A/B: the two runs differ only
+in the fused operations, so the difference in the report is what the fusions are
+worth.
 
 `YUUKA_TEST_DECODE_INT8=fused` or `=prequantized` runs the same attribution with
 the opt-in int8 decode matvec instead of the FP32 streaming kernel, which is how
-roadmap4 D3 measured the two activation sources; the default is the selected
-route.
+the two activation sources were compared; the default is the selected route.
 
-`build/yuuka_gemv_decode_sweep --recurrent` is the RECURRENT cell of roadmap4
-section 7.3: it builds one recurrent layer from the five separate operators and
+`build/yuuka_gemv_decode_sweep --recurrent` is the RECURRENT cell of the decode
+matvec table: it builds one recurrent layer from the five separate operators and
 from the fused pair, and prints the per-layer and 24-layer submission times with
 the state bandwidth each form moves. `build/yuuka_deltanet_sweep` is the design
 sweep behind the fused kernel: it times five candidate state-kernel forms (the
@@ -495,7 +496,7 @@ instructions per packed weight. It then runs `TestGPUProfileDecode` and prints
 the same report `go test -run TestGPUProfileDecode -v` produces. The sweep keeps
 every matrix resident, so its GB/s figures are the hot-matrix upper bound of the
 real step; the wall time minus the traced kernel time is the per-submission
-launch cost, which is the quantity roadmap4 D5 targets.
+launch cost, which is the quantity the matvec fusions target.
 
 ## 7. Metric definitions
 
@@ -673,8 +674,8 @@ pass.
 
 ## 11. Milestone acceptance
 
-Each roadmap phase has explicit acceptance criteria in
-[roadmap.md](roadmap.md). This document defines how those criteria are measured:
-the correctness layers above, the benchmark protocol, and the reporting
-metadata. A phase is not complete because code merged; it is complete when its
-acceptance evidence is recorded and reproducible.
+This document defines how phase acceptance is measured: the correctness layers
+above, the benchmark protocol, and the reporting metadata. A phase is not
+complete because code merged; it is complete when its acceptance evidence is
+recorded and reproducible. The phase gates are listed in
+[AGENTS.md](../AGENTS.md) section 8.

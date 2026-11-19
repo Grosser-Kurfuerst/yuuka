@@ -192,7 +192,7 @@ selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
 family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
 recurrent projections are the only decode shapes that land on the fallback.
 
-**Epilogues and the two-matrix form (roadmap4 D5).** The same kernel carries two
+**Epilogues and the two-matrix form.** The same kernel carries two
 plan-selected extensions. `GEMV_RESIDUAL` adds a residual row to every output
 element in the epilogue, which folds the ADD that ends a sub-layer into the
 projection and lets the output alias the residual row. `GEMV_PAIR` walks a second
@@ -201,7 +201,8 @@ row, either writing both rows or forming `silu(A x) * (B x)`, which replaces
 `ffn_gate`, `ffn_up`, and `SILU_MUL` with one operation. Both are plan-build-time
 choices; the plain form stays for the int8 and per-row routes.
 
-Three shapes of this idea were measured and rejected (roadmap4 8.5): eight output
+Three shapes of this idea were measured and rejected
+([benchmarks.md](benchmarks.md#decode-fusion)): eight output
 channels per wave (28% slower, the wider wave spills), a 512-value K step (7%
 slower, the staging tile costs more than the barriers it removes), and a pair that
 dispatches the decoder at run time so the two matrices could mix dtypes (40%
@@ -219,8 +220,7 @@ kernel: 20.07 ms of matvec against 21.39 ms, plus 1.09 ms for the separate
 activation quantization, in a step where the fused variant costs 21.9 ms because
 every block re-quantizes the row. The decode step is not instruction bound at
 127 GB/s of a 244 GB/s read ceiling, so halving the arithmetic moves 6%. The
-arithmetic contract and tolerances are in roadmap4 6.5; the numbers are in
-[benchmarks.md](benchmarks.md#int8-decode-matvec-d3).
+numbers are in [benchmarks.md](benchmarks.md#int8-decode-matvec).
 
 Numerics. The per-row kernel sums a strided set of K values per thread and
 reduces over the block; the streaming kernel sums four neighbours per lane and
@@ -256,11 +256,11 @@ The three cells below 150 GB/s are the 1024-output attention projections: a
 32-block grid cannot fill a 40-compute-unit device, and one such submission costs
 16 microseconds, so the decode step spends 0.26 ms of its 33.4 ms on the sixteen
 of them. Closing that needs split-K or fewer channels per block, which is not
-taken yet (roadmap4 5.5).
+taken yet.
 
 Inside the decode step the same kernels run at 94-187 GB/s rather than the
 isolated figures, because a token rotates through 2.7 GB of weights and every
-matrix is cold in the 32 MB MALL (roadmap4 2.4).
+matrix is cold in the 32 MB MALL ([benchmarks.md](benchmarks.md#decode-matvec)).
 
 ### 5.4 Q4_0 and Q5_0
 
@@ -424,7 +424,7 @@ up, and `SILU_MUL` operations remain. Q/K/V, beta/alpha, and RMSNorm fusions are
 not implemented.
 
 Larger tiles, an int8 tensor-core path, and the remaining projection fusions
-remain candidates under [roadmap2.md](roadmap2.md); they are not implemented and
+remain candidates; they are not implemented and
 are not claimed in the benchmark results.
 
 ### 6.3 Int8 MMQ GEMM
@@ -521,8 +521,8 @@ Measured throughput at `M = 512` (sweep, five timed submissions after two
 warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
 12.4-14.4 TFLOP/s across the three shapes, against 13.5-14.1, 12.6-13.4, and
 11.0-11.6 TFLOP/s before the layout and occupancy change. The route is still
-1.2-1.3x below llama.cpp's MMQ kernel on the same device; the remaining
-attribution is in [roadmap3.md](roadmap3.md#4-stage-s1-mmq-gemm-highest-value-73-of-the-gap).
+1.2-1.3x below llama.cpp's MMQ kernel on the same device; the measured
+attribution is in [benchmarks.md](benchmarks.md#prefill-gemm).
 
 The q/k/v and qkv/gate groups read the same normalized tile, so the plan
 quantizes it once per group instead of once per projection
@@ -577,14 +577,14 @@ measures 1324 tok/s on the same GGUF and device, against llama.cpp HIP at
 2346 tok/s for the same 512-token prompt in the current reference build. The
 2026-11-16 split was matmul 293 ms, the gated delta-net chunk 50 ms, and
 prefill attention 19 ms at position 0 and 562 ms at position 7680; attention at
-position 7680 dropped from 2030 ms to 643 ms. The ordered optimization plan and
-per-workstream status are in [roadmap2.md](roadmap2.md).
+position 7680 dropped from 2030 ms to 643 ms. The per-workstream measured status
+is in [benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 ### 6.5 Streaming LM head
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
-projection of both graphs (the prefill tail and the decode tail) and, since
-roadmap4 D2, every decode matvec that `SelectDecodeGemvPath` covers:
+projection of both graphs (the prefill tail and the decode tail) and every
+decode matvec that `SelectDecodeGemvPath` covers:
 
 ```text
 out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16
@@ -636,14 +636,13 @@ timed submissions after two warmups) on the recorded gfx1151 device, `n_in`
 
 In the 512-row prefill plan of `TestGPUProfilePrefill` the tail costs 2.84-2.92 ms
 of a 287 ms chunk, against 11.3 ms for the single-row GEMV tail before this
-kernel ([roadmap3.md](roadmap3.md#7-stage-s4-prefill-lm-head)). The kernel is
+kernel. The kernel is
 bandwidth bound: the same 521 MB Q6_K matrix streams at 244 GB/s in a pure read
 loop on this device, so 2.90 ms is about 85% of that ceiling.
 
 The decode tail runs the same single-row instantiation. In the profiled decode
 step of `TestGPUProfileDecode` it costs 2.79 ms at 187 GB/s against 11.23 ms at
-46 GB/s for the per-row GEMV, which is 8.4 ms of a 97.4 ms step
-([roadmap4.md](roadmap4.md#45-implementation-2026-11-18)).
+46 GB/s for the per-row GEMV, which is 8.4 ms of a 97.4 ms step.
 
 Numerics. The per-element products are the same FP32 products the decode GEMV
 forms, including the K-quant scale-then-minimum order; only the summation order
@@ -996,8 +995,7 @@ it is LDS-latency bound, with 106-164 VGPRs and three 8-wave workgroups resident
 per CU against a 47-67 cycle LDS latency, and it issues 2.7M instructions per CU
 per layer. Every product is an FP32 FMA-pipe loop; the reference implementation
 instead runs its dense products on the FP16 WMMA path (`mmb_dense`), which is
-the step that would make this form competitive (see
-[roadmap3.md](roadmap3.md#51-implementation-2026-11-18)).
+the step that would make this form competitive.
 
 Correctness: `tests/hip/prefill_test.cpp` runs both paths against the same CPU
 reference (chunked maximum absolute difference `1.6e-7`, per-token `2.1e-7`) and
@@ -1007,7 +1005,7 @@ checks that a repeated execution reproduces the outputs bitwise.
 
 Decode runs one token at a time, so the chunkwise form does not apply and the
 recurrence is evaluated directly. Two operators replace the five the decode plan
-used before roadmap4 D4 (`CONV1D`, two `L2NORM`, `GDN`, `GATED_RMSNORM`):
+used before the fusion (`CONV1D`, two `L2NORM`, `GDN`, `GATED_RMSNORM`):
 
 - `conv_l2norm_f32_kernel` applies the short convolution to all 8192 channels,
   advancing its ring state, and then the L2 norm to the q and k groups with the q
@@ -1038,8 +1036,8 @@ far from one on purpose: with a decay of 0.997 a missing factor on `S^T k`
 produces a 1.6e-5 difference, and with 0.75 it produces 2.6e-4, which the 1e-5
 bound rejects.
 
-Measured design choice (roadmap4 7.5,
-[benchmarks.md](benchmarks.md#gated-delta-net-d4)): the register-resident form
+Measured design choice ([benchmarks.md](benchmarks.md#gated-delta-net)): the
+register-resident form
 reaches 375 GB/s of state traffic against 125 GB/s for a shared-memory-resident
 form of the same recurrence, because a 64 KB state fills the workgroup shared
 budget and leaves no room for the normalization; 512 threads beat 256 by 6% and
@@ -1047,8 +1045,8 @@ beat a plain read-and-write copy of the same bytes, which makes memory-level
 parallelism per lane the limiter rather than bandwidth.
 
 SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
-epilogue, together with fusing the gate/up GEMMs themselves, is a candidate
-under [roadmap2.md](roadmap2.md); no fused implementation is claimed. Every
+epilogue, together with fusing the gate/up GEMMs themselves, is a candidate;
+no fused implementation is claimed. Every
 fusion must be evaluated on all of:
 
 - kernel launch count;

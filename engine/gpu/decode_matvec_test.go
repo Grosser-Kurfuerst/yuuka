@@ -12,9 +12,9 @@ import (
 
 // TestGPUStreamingDecodeMatchesGemv compares the two decode matvec mappings on
 // the real model. Both sessions run FP32 arithmetic, so the measured difference
-// is the D2 mapping change alone: the channel-parallel streaming kernel with
+// is the mapping change alone: the channel-parallel streaming kernel with
 // DisableInt8Matvec against the per-row GEMV the original tree used. The int8
-// arithmetic of roadmap4 D3 is bounded separately by
+// arithmetic of the int8 route is bounded separately by
 // TestGPUInt8MatvecMatchesFp32.
 //
 // The tolerance is absolute because the comparison is over the logits of one
@@ -183,12 +183,12 @@ func logitDiff(a, b []float32) (float64, int) {
 // opDType returns the weight dtype an op carries in u[0].
 func opDType(op hip.OpInfo) tensor.DType { return tensor.DType(op.U[0]) }
 
-// TestGPUInt8MatvecMatchesFp32 isolates the arithmetic change of roadmap4 D3.
+// TestGPUInt8MatvecMatchesFp32 isolates the arithmetic change of the int8 route.
 // The int8 session dots the Q8_1 activation with the int8 digits of each packed
 // weight; the default session runs the FP32 streaming kernel on the same shape,
 // so both plans have the same operations in the same order and differ only in
 // how each product is formed. The int8 route is not the default because it is
-// measured slower end to end (roadmap4 6.5); this test is what pins its
+// measured slower end to end; this test is what pins its
 // arithmetic while it stays available for measurement.
 //
 // The recorded bound is wider than the FP32 route's own agreement because the

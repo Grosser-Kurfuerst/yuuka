@@ -79,8 +79,8 @@ type Options struct {
 	PrefillChunk int
 	// EnableGraph lets the session capture the decode plan into a HIP Graph
 	// after GraphMinSteps steps and replay it; serving.md owns the contract and
-	// the CLI and server leave it off. roadmap4 D5 re-measured the replay path
-	// on the reduced decode plan.
+	// the CLI and server leave it off. The replay path is measured on the
+	// reduced decode plan.
 	EnableGraph   bool
 	GraphMinSteps int
 	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
@@ -112,7 +112,7 @@ type Options struct {
 	PrequantizedInt8 bool
 	// NoResidualFusion keeps the decode matvec that ends a sub-layer and the
 	// separate residual ADD as two operations instead of letting the matvec add
-	// the residual in its epilogue, which is the default (roadmap4 8.2).
+	// the residual in its epilogue, which is the default.
 	NoResidualFusion bool
 	// NoPairFusion keeps two projections that share an activation row as two
 	// launches instead of the fused pair that forms both dots over one traversal,

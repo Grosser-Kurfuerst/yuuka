@@ -123,7 +123,7 @@ func (o OpInfo) Name() string { return OpName(o.Code) }
 func (o OpInfo) Tail() bool { return o.Flags&opFlagTail != 0 }
 
 // OpName returns the short ABI name of an op code. The names match the columns
-// of the attribution tables in docs/roadmap4.md and docs/benchmarks.md.
+// of the attribution tables in docs/benchmarks.md.
 func OpName(code uint32) string {
 	switch code {
 	case OpGemv:

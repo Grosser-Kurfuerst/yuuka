@@ -41,7 +41,7 @@ namespace {
 
 constexpr int kWarpsPerBlock = 8;
 // One wave owns four output channels. Eight was measured on gfx1151 and is 28%
-// slower in the decode step (roadmap4 D5): the wider lane block spills the
+// slower in the decode step: the wider lane block spills the
 // weight registers it has to keep live per K step, so the staging and barrier
 // cost that a wider wave would amortize is smaller than the cost of the spill.
 constexpr int kChansPerWarp = 4;

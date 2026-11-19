@@ -17,8 +17,8 @@ treated as format and correctness references only.
 > Q4_0/Q5_0 tensors, and a CPU reference path for `qwen35moe` with
 > IQ2_XXS/IQ2_S/IQ3_S tensor support. NPU support is a
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
-> and does not execute model operations. All first-release success criteria in
-> [roadmap.md](roadmap.md) are met, including the 128/256-token decode matrix in
+> and does not execute model operations. All first-release success criteria are
+> met, including the 128/256-token decode matrix in
 > [benchmarks.md](benchmarks.md). See the implementation status below,
 > [npu.md](npu.md), [hardware.md](hardware.md), and
 > [benchmarks.md](benchmarks.md).
@@ -87,10 +87,6 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
-| [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
-| [roadmap2.md](roadmap2.md) | Ordered prefill optimization plan: measured attribution, workstreams, gates, and references | Kernel and performance contributors |
-| [roadmap3.md](roadmap3.md) | Prefill gap closure plan against the llama.cpp reference: 2026-11-18 attribution, stages S0-S4, gates, and rejected routes | Kernel and performance contributors |
-| [roadmap4.md](roadmap4.md) | Decode gap closure plan against the llama.cpp reference: 2026-11-18 attribution, stages D0-D5, gates, and rejected routes | Kernel and performance contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
@@ -136,7 +132,7 @@ Implemented and tested:
   resident for the whole chunk. With the int8 MMQ prefill GEMM the 512-token
   prefill rate is 1324 tok/s, up from 313 tok/s before the delta-net and GEMM
   work, and position-7680 attention dropped from 2030 ms to 643 ms; the
-  measured status is in [roadmap2.md](roadmap2.md).
+  measured status is in [benchmarks.md](benchmarks.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm
@@ -208,16 +204,15 @@ Other architectures are rejected at load time.
 ## Reading paths
 
 - **New contributor:** [README](README.md) → [architecture](architecture.md) →
-  the document for your area → [roadmap](roadmap.md).
-- **Hardware bring-up:** [hardware](hardware.md) → [roadmap Phase 0](roadmap.md#3-phase-0--bootstrap-and-hardware-validation).
+  the document for your area → [testing](testing.md).
+- **Hardware bring-up:** [hardware](hardware.md) → [benchmarks](benchmarks.md) →
+  [testing](testing.md).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
-  [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode) →
-  [prefill optimization plan](roadmap2.md) →
-  [decode optimization plan](roadmap4.md).
+  [benchmarks](benchmarks.md).
 - **Runtime/service work:** [architecture](architecture.md) →
-  [serving](serving.md) → [roadmap Phase 4](roadmap.md#7-phase-4--multi-request-serving).
+  [serving](serving.md) → [benchmarks](benchmarks.md).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →
-  [roadmap Phase 1](roadmap.md#4-phase-1--minimal-inference-loop).
+  [architecture](architecture.md).
 
 ## Glossary
 
