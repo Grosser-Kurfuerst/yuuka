@@ -737,23 +737,55 @@ bool test_direct_q6_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_even
               alloc(device, ds, activation_scales.size() * sizeof(float)) &&
               upload_vec(ds, activation_scales) &&
               alloc(device, out, got.size() * sizeof(float));
-    for (int64_t rows : {128, 129, 192, 511, 512}) {
-        if (!ok) break;
+    const auto verify = [&](int64_t rows, const char * route, auto launch) {
         const size_t valid = rows * channels;
-        ok = check_gemm_partial_output(out, valid, got, [&]() {
+        bool match = check_gemm_partial_output(out, valid, got, launch);
+        double max_diff = 0;
+        for (size_t i = 0; i < valid && match; ++i) {
+            const double diff = std::fabs(double(got[i]) - double(expected[i]));
+            match = std::isfinite(diff) && diff <= 2e-4;
+            max_diff = std::max(max_diff, diff);
+        }
+        std::printf("Q6_K MMQ %lldx%lld M=%lld %s: %s (max abs %.3g)\n",
+                    static_cast<long long>(width), static_cast<long long>(channels),
+                    static_cast<long long>(rows), route, match ? "ok" : "FAILED", max_diff);
+        return match;
+    };
+    for (int64_t rows : {127, 128, 129, 192, 511, 512}) {
+        if (!ok) break;
+        ok = verify(rows, "aligned", [&]() {
             return check(yuuka_gemm_mmq(stream, out.buf, qs.buf, ds.buf, wb.buf, width,
                                         channels, rows, YUUKA_DTYPE_Q6_K, event), "Q6_K MMQ") &&
                    check(yuuka_event_wait(event), "Q6_K MMQ wait");
         });
-        double max_diff = 0;
-        for (size_t i = 0; i < valid && ok; ++i) {
-            const double diff = std::fabs(double(got[i]) - double(expected[i]));
-            ok = std::isfinite(diff) && diff <= 2e-4;
-            max_diff = std::max(max_diff, diff);
+    }
+    if (ok) {
+        // Q6_K blocks need only two-byte alignment. Starting this buffer at
+        // offset two exercises the generic path for an otherwise direct shape.
+        std::vector<uint8_t> shifted(2, 0);
+        shifted.insert(shifted.end(), packed.begin(), packed.end());
+        Buffer unaligned;
+        yuuka_plan * plan = nullptr;
+        ok = alloc(device, unaligned, shifted.size()) && upload_vec(unaligned, shifted) &&
+             check(yuuka_plan_create(device, &plan), "create Q6_K alignment plan");
+        if (ok) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_GEMM;
+            op.buf[0] = unaligned.buf;
+            op.buf[1] = qs.buf;
+            op.buf[2] = out.buf;
+            op.buf[3] = ds.buf;
+            op.off[0] = 2;
+            op.n[0] = width;
+            op.n[1] = channels;
+            op.n[2] = 129;
+            op.u[0] = YUUKA_DTYPE_Q6_K;
+            op.u[1] = YUUKA_GEMM_PATH_MMQ;
+            ok = check(yuuka_plan_add(plan, &op), "add Q6_K alignment op") &&
+                 verify(129, "weight offset 2", [&]() { return execute(plan, stream, event, 0); });
         }
-        std::printf("Q6_K MMQ %lldx%lld M=%lld: %s (max abs %.3g)\n",
-                    static_cast<long long>(width), static_cast<long long>(channels),
-                    static_cast<long long>(rows), ok ? "ok" : "FAILED", max_diff);
+        yuuka_plan_destroy(plan);
+        release(unaligned);
     }
     release(out);
     release(ds);
@@ -2290,6 +2322,7 @@ int main() {
     ok = test_gemm_mmq_row_tail(device, stream, event, tail_rng) && ok;
     std::mt19937 q6_rng(732);
     ok = test_direct_q6_mmq(device, stream, event, 9216, 2560, q6_rng) && ok;
+    ok = test_direct_q6_mmq(device, stream, event, 2560, 1024, q6_rng) && ok;
     ok = test_blas(device, stream, event, rng) && ok;
     const struct {
         yuuka_dtype dtype;

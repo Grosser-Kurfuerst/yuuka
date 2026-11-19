@@ -580,6 +580,7 @@ compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 | Q5_K | 2560 | 8192 |
 | Q5_K | 4096 | 2560 |
 | Q6_K | 9216 | 2560 |
+| Q6_K | 2560 | 1024 |
 
 The original Q4_K FFN cell `M=512, K=2560, N=9216` uses its compile-time
 dimensions. The other cells pass dimensions into the same tile algorithm.
@@ -607,7 +608,8 @@ For Q6_K, eight packed four-byte operations unpack each 32-value
 region using two-byte-aligned loads. Two independent signed WMMA
 results use the Q6_K scale of their respective 16-value slices.
 The FP32 epilogue applies them in the original low-to-high K order
-with the shared Q8_1 activation scale. [Q6_K FFN down validation](prefill-optimization/phase2/acceptance/07a-direct-q6k-ffn.md)
+with the shared Q8_1 activation scale. [FFN down validation](prefill-optimization/phase2/acceptance/07a-direct-q6k-ffn.md) ·
+[Attention V and full-prompt validation](prefill-optimization/phase2/acceptance/07b-direct-q6k-attention.md)
 
 ### 6.4 Dispatch
 

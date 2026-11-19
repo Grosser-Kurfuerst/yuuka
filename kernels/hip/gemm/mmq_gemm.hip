@@ -742,7 +742,7 @@ bool measured_direct_shape(uint32_t dtype, int64_t n_in, int64_t n_out, int64_t 
         return n_out == 2560 && (n_in == 4096 || n_in == 9216);
     }
     if (dtype == YUUKA_DTYPE_Q6_K) {
-        return n_in == 9216 && n_out == 2560;
+        return (n_in == 9216 && n_out == 2560) || (n_in == 2560 && n_out == 1024);
     }
     return dtype == YUUKA_DTYPE_Q5_K &&
            ((n_in == 2560 && n_out == 8192) || (n_in == 4096 && n_out == 2560));
