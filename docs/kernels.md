@@ -29,11 +29,17 @@ measured dispatch table described in section 9.
 Phase 4 adds the paged KV family: decode and prefill attention kernels that
 resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
-token and position from device memory, and a versioned C ABI for
-device-to-device block copies and HIP Graph capture/replay. KV pools support
-F32 (default), F16, and Q8_0; see section 7.3. Prefill attention runs on the
-FP16 MMA kernel for F32 and F16 pools whose shape it covers, and on the scalar
-per-lane tiled kernel otherwise (section 7.5).
+token and position from device memory, and a versioned C ABI (currently version
+10) for device-to-device block copies and HIP Graph capture/replay. KV pools
+support F32 (default), F16, and Q8_0; see section 7.3. Prefill attention runs on
+the FP16 MMA kernel (with split-key support for measured long-prefix windows)
+for F32, F16, and packed Q8_0 pools on covered shapes and position cutoffs, and
+on the scalar per-lane tiled kernel otherwise (section 7.5). On `gfx1151`,
+prefill projections additionally use arbitrary-row Direct int8 MMQ (`Q4_K`,
+`Q5_K`, `Q6_K`, `M >= 128`, with 8-tile workgroup swizzle on wide `Q4_K`/`Q5_K`
+shapes), fused gate/up `SILU_MUL_QUANT_Q8_1`, paired `Q8_0` WMMA for narrow
+recurrent gates, Direct FP16 WMMA and fused SwiGLU (`17 <= M <= 127`), FP32
+streaming (`1 <= M <= 16`), and prepared gated delta-net recurrence (`M >= 2`).
 Continuous batching is scheduler-level interleaving of per-request plans;
 mixed-shape prefill/decode kernel batches and split-KV decode are not
 implemented.
@@ -666,14 +672,15 @@ makes a 512-row chunk read every weight tile 16 times, and the 64-row tile
 halves that, but halving it again with the measured 128-row tile only bought
 6-26% on wide shapes and lost 0.5-15% elsewhere. The kernel is instruction-issue
 bound: 114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS.
-The 2026-11-15 measurements put a 512-token prompt at 516 tok/s, the
-2026-11-16 span-decoding build at 881 tok/s, and the int8 MMQ route now
-measures 1324 tok/s on the same GGUF and device, against llama.cpp HIP at
-2346 tok/s for the same 512-token prompt in the current reference build. The
-2026-11-16 split was matmul 293 ms, the gated delta-net chunk 50 ms, and
-prefill attention 19 ms at position 0 and 562 ms at position 7680; attention at
-position 7680 dropped from 2030 ms to 643 ms. The per-workstream measured status
-is in [benchmarks.md](benchmarks.md#prefill-prompt-length).
+The earlier 2026-11-16 measurements put a 512-token F32 KV prompt at 516 tok/s,
+the span-decoding build at 881 tok/s, and the initial generic int8 MMQ route at
+1324 tok/s (matmul 293 ms, gated delta-net 50 ms, attention 19 ms at pos 0 /
+643 ms at pos 7680). With the `gfx1151` Direct MMQ, Direct FP16 WMMA, prepared
+GDN, paired `Q8_0` WMMA, `Q6_K` Direct MMQ, and 8-tile workgroup swizzle
+additions (`9aaf432`), F16 KV prefill reaches `~2610–2624 tok/s` at 512 tokens
+and leads official `llama.cpp v1.0.0` by `+12.4%` to `+17.6%` across `128–8192`
+tokens. The recorded benchmark status is in
+[benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 ### 6.5 Streaming LM head
 
@@ -1191,10 +1198,12 @@ budget and leaves no room for the normalization; 512 threads beat 256 by 6% and
 beat a plain read-and-write copy of the same bytes, which makes memory-level
 parallelism per lane the limiter rather than bandwidth.
 
-SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
-epilogue, together with fusing the gate/up GEMMs themselves, is a candidate;
-no fused implementation is claimed. Every
-fusion must be evaluated on all of:
+Prefill FFN fusion is implemented on both active projection families:
+`gemm_wmma_swiglu_kernel` (and its `gfx1151` Direct FP16 variant at
+`17–127` rows) computes `gate`, `up`, and SwiGLU in one pass, and
+`SILU_MUL_QUANT_Q8_1` fuses SwiGLU with `Q8_1` quantization when gate, up, and
+down all select MMQ (section 6.2–6.3); Q/K/V and RMSNorm fusions remain out of
+the production path. Every fusion must be evaluated on all of:
 
 - kernel launch count;
 - VGPR usage and occupancy;

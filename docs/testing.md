@@ -128,13 +128,17 @@ batch sizes 1, 2, 3, 4, 8, and 16.
 
 Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
 
-- WMMA GEMM for `F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, and
-  `Q6_K` at `M` values 1, 7, 16, and 33 and non-tile-aligned `N`;
-- the int8 MMQ route for `Q4_K`, `Q5_K`, and `Q6_K` at `(K, N, M)` 512/64/128,
-  512/128/130, 768/70/129, and 2560/128/128. The Q8_1 quantizer is checked digit
+- WMMA GEMM and fused SwiGLU for `F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`,
+  `Q5_K`, and `Q6_K`, including `gfx1151` Direct FP16 WMMA/SwiGLU partial-row
+  and sentinel checks (`rows = 17..127`), non-tile-aligned `N`, and paired narrow
+  `Q8_0` (`[2560, 32]`) projections against an independent CPU oracle;
+- the int8 MMQ route for `Q4_K`, `Q5_K`, and `Q6_K` covering generic shapes,
+  Direct specialization (`>= 128` rows, arbitrary/masked partial tiles, 8-tile
+  workgroup swizzle on wide `Q4_K`/`Q5_K` shapes, and unaligned fallbacks). The Q8_1 quantizer is checked digit
   for digit against a host reimplementation of the same rule, including the
   block scale and block sum, and the GEMM is then compared with a CPU dot
-  product over those dequantized activations at the 2e-2 per-GEMM bound. Q8_1
+  product over those dequantized activations at the 2e-2 per-GEMM bound (`2e-4`
+  on full `Q6_K` shapes against the quantized CPU product). Q8_1
   activations are lossy by construction, so the FP32 dot product is not the
   reference for this path: the measured difference reaches 0.04-0.14 on these
   shapes, which is quantization noise, not kernel error;
@@ -152,8 +156,11 @@ Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
   batch KV writes;
 - legacy single-token embedding for Q4_0 and Q5_0, compared against the same
   packed-row reference as the batch path (`tests/hip/embedding_test.cpp`);
-- causal GQA Flash Attention with a non-zero chunk start position;
-- the fused convolution, L2 normalization, gated delta-net recurrence, and
+- causal GQA Flash Attention with a non-zero chunk start position, packed `Q8_0`
+  unsplit WMMA attention, and typed `F32`/`Q8_0` split-key attention over
+  permuted page tables;
+- the fused convolution, L2 normalization, gated delta-net recurrence (inline and
+  prepared split-register variants across offset recurrent state buffers), and
   gated RMSNorm chunk kernel at the model dimensions (128 rows, 16 groups,
   32 heads, state 128), including updated convolution and matrix state. The
   same operation is run twice from restored state and must be bitwise
@@ -197,10 +204,11 @@ Paged KV and graph replay have dedicated native coverage in
   heads per KV head, a permuted block table, and a 64-row chunk, matches the
   FP32 reference within 5e-3 relative, reproduces its output bitwise on a second
   run, and reports its difference against the tiled kernel on the same plan
-  input. The full-model differential test `TestGPUAttentionPathsAgree` compares
-  the default FP16 MMA dispatch against the tiled path selected by
-  `ForceTiledAttention` (and the opt-in rocBLAS path) and enforces the 0.05
-  logit gate at a 64-token prompt and 0.3 at 2048 tokens;
+  input. The full-model differential tests `TestGPUAttentionPathsAgree` and
+  `TestGPUQ8AttentionPathsAgree` compare default FP16 MMA dispatch against the
+  tiled path (`ForceTiledAttention`), and `TestGPULongSplitAttentionMatchesDirect`
+  checks 8K–16K split-key attention against unsplit execution across `F16`, `F32`,
+  and `Q8_0` KV pools;
 - device-to-device block copies used for private prefix blocks;
 - graph capture and replay with device-resident token/position updates across
   several positions;
@@ -223,10 +231,10 @@ Qwen3.5-4B recurrent layer:
   are rejected with `YUUKA_ERR_UNSUPPORTED`, so a plan builder that selected the
   fused pair for an unsupported geometry fails instead of running.
 
-`tests/hip/plan_validation_test.cpp` covers the two fused matvec forms as well:
-an undersized buffer, a mixed-dtype pair, a SwiGLU pair with unequal widths, and
-an input width that is not a multiple of 256 are each rejected at plan
-construction.
+`tests/hip/plan_validation_test.cpp` covers fused matvec forms, `SILU_MUL_QUANT_Q8_1`,
+`PREFILL_Q8_0_PAIR`, and typed split-key `ATTENTION_PREFILL_PAGED` validation:
+undersized buffers, aliasing/overlapping spans, unaligned offsets, unsupported
+dtypes or head widths, and missing scratch are rejected at plan construction.
 
 `TestGPUDecodeFusionsMatchUnfused` is the same differential for the matvec
 fusions: the default plan against `Options{NoResidualFusion, NoPairFusion}`, with
@@ -591,8 +599,10 @@ YUUKA_TEST_MOE_MODEL=/path/to/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
-reference, layer-by-layer hidden-state comparison, the paged HIP executor, KV
-formats, and speculative decoding against the plain greedy path. The
+reference (including `1–16` row FP32 streaming and `17–127` row Direct FP16
+checks in `engine/gpu/prefill_real_test.go`), layer-by-layer hidden-state
+comparison, the paged HIP executor, KV
+formats, long-context split-key attention, and speculative decoding against the plain greedy path. The
 `qwen35moe` CPU reference is validated on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf by
 greedy token comparison with llama.cpp; IQ block dequantization has separate
 reference tests for `IQ2_XXS`, `IQ2_S`, and `IQ3_S`. Synthetic coverage includes

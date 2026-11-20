@@ -78,7 +78,7 @@ Current tree, same commit:
 
 | Check | Result |
 | --- | --- |
-| `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE) | 9 / 9 pass |
+| `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE, deltanet, plan validation; 10 / 10 at `9aaf432`, 9 / 9 at `d56ad88`) | 10 / 10 pass |
 | `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
 | `TestGPUMatchesCPU` | first-step maximum logit difference `0.00004673` with [short-chunk FP32 streaming](prefill-optimization/phase2/acceptance/04a-streaming-short-tails.md), greedy tokens match |
 | `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.9e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
@@ -95,7 +95,31 @@ regime llama.cpp's K-quant prefill also runs in.
 
 ## Prefill: prompt length
 
-`yuuka bench --backend hip --decode-tokens 1 --chunk-size 512`, F32 KV unless
+### Current prefill status (commit `9aaf432`)
+
+After Phase 1 and Phase 2 prefill work (`9aaf432`, F16 KV, greedy, `power=auto`,
+`concurrency=1`, matched integer prompt tokens vs official `llama.cpp v1.0.0`
+`b1b770d90`, two interleaved reversed-order rounds, `2` warmups and `5` timed
+prefills per process, `3` at `8192`):
+
+| Prompt | Chunk (`yuuka` / `llama.cpp`) | Round 1 / 2 `yuuka` p50 (ms) | Round 1 / 2 `llama.cpp` p50 (ms) | Throughput gain | Top-1 |
+| ---: | :---: | ---: | ---: | ---: | :---: |
+| 128 | 128 / 128 | 59.081 / 59.499 | 68.533 / 67.957 | **+16.00% / +14.21%** | Match |
+| 512 | 512 / 512 | 195.141 / 196.271 | 228.578 / 230.809 | **+17.13% / +17.60%** | Match |
+| 2048 | 1024 / 512 | 808.156 / 811.868 | 937.983 / 939.982 | **+16.06% / +15.78%** | Match |
+| 8192 | 1024 / 256 | 3685.340 / 3703.992 | 4163.147 / 4163.955 | **+12.97% / +12.42%** | Match |
+
+Phase 2 also eliminated the non-power-of-two and short-chunk cliffs (`1..16` FP32
+streaming, `17..127` Direct FP16 WMMA, `>= 128` arbitrary-row Direct MMQ, `>= 2`
+prepared GDN), sped up `8192`-token `Q8_0` KV prefill from `1105 tok/s` to
+`2114–2122 tok/s` (unsplit WMMA + split-key), reduced `16384`-token `F32` KV
+prefill by `~6.3%` via split-key attention, and moved prefix-cache snapshots off
+the critical path of the first SSE token (`yuuka-server`). Detailed per-stage
+records live under [prefill-optimization/phase2/acceptance](prefill-optimization/phase2/acceptance/README.md).
+
+### Baseline prompt-length sweep (commit `d56ad88`)
+
+Historical pre-Phase-1/Phase-2 baseline, `yuuka bench --backend hip --decode-tokens 1 --chunk-size 512`, F32 KV unless
 stated, median of five repetitions:
 
 | Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
@@ -725,9 +749,14 @@ extra work; see [kernels.md](kernels.md#91-chunkwise-form).
 
 ## llama.cpp comparison
 
+The table below records the **historical `d56ad88` / `161fbba` baseline** against
+`strix-llama.cpp` (`c8912d7f5`) prior to the Phase 1/2 prefill optimizations; see
+[Current prefill status (`9aaf432`)](#current-prefill-status-commit-9aaf432)
+above for the current prefill comparison against official `llama.cpp v1.0.0`.
+
 `llama-bench -ngl 99 -b 512 -ub 512 -r 3`, F16 KV (llama.cpp's default; its
-`llama-bench` rejects an `f32` KV type), against the yuuka rows from
-[prefill](#prefill-prompt-length) and [decode](#decode-output-length):
+`llama-bench` rejects an `f32` KV type), against the historical `d56ad88` yuuka
+rows from [prefill](#prefill-prompt-length) and [decode](#decode-output-length):
 
 | Test | llama.cpp t/s | yuuka t/s | yuuka/llama |
 | --- | ---: | ---: | ---: |
