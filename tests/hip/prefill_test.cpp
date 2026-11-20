@@ -621,9 +621,9 @@ bool test_gemm_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * e
 }
 
 bool test_gemm_mmq_row_tail(yuuka_device * device, yuuka_stream * stream,
-                            yuuka_event * event, std::mt19937 & rng) {
-    constexpr auto dtype = YUUKA_DTYPE_Q4_K;
-    constexpr int64_t width = 2560, channels = 1024, full_rows = 256;
+                            yuuka_event * event, yuuka_dtype dtype, int64_t channels,
+                            int64_t full_rows, std::mt19937 & rng) {
+    constexpr int64_t width = 2560;
     constexpr float sentinel = -12345.0f;
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     std::vector<float> x(width * full_rows);
@@ -645,7 +645,13 @@ bool test_gemm_mmq_row_tail(yuuka_device * device, yuuka_stream * stream,
     ok = ok && check(yuuka_quantize_q8_1(stream, qs.buf, ds.buf, xb.buf, width,
                                         full_rows, event), "mmq tail quantize") &&
          check(yuuka_event_wait(event), "mmq tail quantize wait") && run(full_rows, reference);
-    for (int64_t rows : {129, 191, 255}) {
+    if (ok && !std::all_of(reference.begin(), reference.end(), [](float v) {
+            return std::isfinite(v) && v != sentinel;
+        })) {
+        std::fprintf(stderr, "MMQ full tile did not write all finite outputs\n");
+        ok = false;
+    }
+    for (int64_t rows : {int64_t{129}, full_rows - 65, full_rows - 1}) {
         if (!ok || !run(rows, got)) {
             ok = false;
             break;
@@ -2362,7 +2368,9 @@ int main() {
                        2560, 4096, 129, tail_rng) && ok;
     ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K, "mmq Q5_K partial SSM out",
                        4096, 2560, 140, tail_rng) && ok;
-    ok = test_gemm_mmq_row_tail(device, stream, event, tail_rng) && ok;
+    ok = test_gemm_mmq_row_tail(device, stream, event, YUUKA_DTYPE_Q4_K, 1024, 256, tail_rng) && ok;
+    ok = test_gemm_mmq_row_tail(device, stream, event, YUUKA_DTYPE_Q4_K, 9216, 512, tail_rng) && ok;
+    ok = test_gemm_mmq_row_tail(device, stream, event, YUUKA_DTYPE_Q5_K, 8192, 512, tail_rng) && ok;
     std::mt19937 q6_rng(732);
     ok = test_direct_q6_mmq(device, stream, event, 9216, 2560, q6_rng) && ok;
     ok = test_direct_q6_mmq(device, stream, event, 2560, 1024, q6_rng) && ok;

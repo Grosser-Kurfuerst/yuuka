@@ -17,3 +17,4 @@
 - [Stage 5c Contiguous GDN state](09-contiguous-gdn-state.md) — Snapshot compatibility, lifecycle timings, HIP call reduction, and the latency gate decision.
 - [Stage 6a Compact final-row GEMV](10a-compact-tail-gemv.md) — Five prepared projections, tail tile sweep, full-prefill timings, and the dispatch decision.
 - [Stage 6b Residual and RMSNorm fusion](10b-residual-norm.md) — Bitwise tensor and model checks, launch attribution, and the paired pp512 decision.
+- [Stage 7 Wide Direct MMQ workgroup mapping](11-direct-mmq-swizzle.md) — Group-size sweep, exact products, L2 counters and paired whole-prefill acceptance.

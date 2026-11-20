@@ -8,7 +8,7 @@ tail chunks, and serving TTFT).
 ## Phase 2: Real-world prefill optimization
 
 - [Phase 2 priority roadmap](phase2/roadmap.md) — Diagnostic `rocprofv3` attribution, P1–P7 priority ranking, execution order, phased plan, and current `260094f` benchmark progress.
-- [Phase 2 progress and acceptance](phase2/acceptance/README.md) — Validation records for landed steps (`1a`, `5a/5b`, `1c`) and the blocked `1b` trial.
+- [Phase 2 progress and acceptance](phase2/acceptance/README.md) — Per-stage correctness, performance measurements, reviews and dispatch decisions.
 - [Stage 1a: Direct MMQ for arbitrary row counts](phase2/stage1a-direct-rows.md) — Design, change points, and acceptance gates for `rows >= 128` Direct MMQ (landed in `3caea06`).
 - [Stage 5a/5b: Prefix snapshot off the first-token path](phase2/stage5ab-snapshot-critical-path.md) — Server prefix-capture gating and post-emission ordering plan (landed in `6e267d7`, `c09cd06`).
 - [Stage 1b/1c: Sub-128-row projections and GDN preparation](phase2/stage1bc-sub128-rows.md) — Prepared GDN crossover (`260094f`) and sub-128 projection routes (currently blocked on `1b` numerical gates).

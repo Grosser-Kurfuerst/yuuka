@@ -584,12 +584,18 @@ compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 
 The original Q4_K FFN cell `M=512, K=2560, N=9216` uses its compile-time
 dimensions. The other cells pass dimensions into the same tile algorithm.
-Each half of the generic grid's x range covers the same 128-channel
-tiles for a different 64-token half. A workgroup returns before the first
-barrier if its half has no valid tokens. A partial half zeros invalid
-activation digits and scales and suppresses stores for those rows. Batches
-whose row count is a multiple of 128 use variants compiled without mask code,
-including the fixed FFN. The shared-memory allocation is 30 KiB.
+In the linear mapping, each half of the grid's x range covers the same
+128-channel tiles for a different 64-token half. On gfx1151, the measured 8192-
+and 9216-output Direct Q4_K cells and the 8192-output Direct Q5_K cell
+use eight channel tiles per group for 128–4096 rows. Each group
+visits all token tiles before advancing to the next channel group.
+This mapping also covers the fixed FFN. The physical grid, K
+accumulation order and output layout stay the same.
+A workgroup returns before the first barrier if its half has no valid
+tokens. A partial half zeros invalid activation digits and scales and
+suppresses stores for those rows. Batches whose row count is a multiple
+of 128 use variants compiled without mask code. The shared-memory
+allocation is 30 KiB. [Workgroup mapping measurements](prefill-optimization/phase2/acceptance/11-direct-mmq-swizzle.md)
 
 Within each 512-byte operand region, the specialized LDS layout stores
 two contiguous 16-value slices per row. Both halves of each wave load the

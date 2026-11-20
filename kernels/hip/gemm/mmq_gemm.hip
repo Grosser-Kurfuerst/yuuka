@@ -487,6 +487,8 @@ __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
     }
 }
 
+constexpr unsigned kChannelGroup = 8;
+
 // Eight waves cover 64 channels by 128 tokens in the generic layout or 128
 // channels by 64 tokens in the direct layout. Each wave computes one 16-channel
 // weight fragment against four 16-token fragments. The int32
@@ -494,7 +496,8 @@ __global__ void quantize_q8_1_kernel(int8_t * qs, float2 * ds, const float * x,
 // lane l element e holds output row 2*e + l/16 of column l%16 inside the
 // 16x16 tile. Consequently one activation scale per lane (its column) and eight
 // weight scales per lane (its rows) are applied per block.
-template <uint32_t DType, bool Direct = false, bool FixedShape = Direct, bool MaskRows = false>
+template <uint32_t DType, bool Direct = false, bool FixedShape = Direct,
+          bool MaskRows = false, bool Swizzle = false>
 __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * xds,
                                 const uint8_t * w, int64_t n_in, int64_t n_out,
                                 int64_t rows, uint64_t row_bytes) {
@@ -523,10 +526,23 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     const int col_base = kUseDirect ? 0 : (warp / 4) * 64;
 
     const unsigned direct_blocks_i = FixedShape ? kDirectBlocksI : gridDim.x / 2;
-    const int64_t n0 = kUseDirect ? static_cast<int64_t>(blockIdx.x % direct_blocks_i) * kDirectTileI
-                                  : static_cast<int64_t>(blockIdx.x) * kTileI;
-    const int64_t m0 = static_cast<int64_t>(blockIdx.y) * kTileJ
-                       + (kUseDirect ? (blockIdx.x / direct_blocks_i) * kDirectTileJ : 0);
+    int64_t n0;
+    int64_t m0;
+    if constexpr (kUseDirect && Swizzle) {
+        // Revisit each group of eight channel tiles over all token tiles
+        // before the next group. The host selects shapes with full groups.
+        const unsigned id = blockIdx.y * gridDim.x + blockIdx.x;
+        const unsigned token_tiles = 2 * gridDim.y;
+        const unsigned band = id / kChannelGroup;
+        const unsigned channel = (band / token_tiles) * kChannelGroup + id % kChannelGroup;
+        n0 = static_cast<int64_t>(channel) * kDirectTileI;
+        m0 = static_cast<int64_t>(band % token_tiles) * kDirectTileJ;
+    } else {
+        n0 = kUseDirect ? static_cast<int64_t>(blockIdx.x % direct_blocks_i) * kDirectTileI
+                        : static_cast<int64_t>(blockIdx.x) * kTileI;
+        m0 = static_cast<int64_t>(blockIdx.y) * kTileJ
+             + (kUseDirect ? (blockIdx.x / direct_blocks_i) * kDirectTileJ : 0);
+    }
     if (kUseDirect && MaskRows && m0 >= rows) {
         return;
     }
@@ -713,19 +729,29 @@ __global__ void gemm_mmq_kernel(float * out, const int8_t * xs, const float2 * x
     }
 }
 
-template <uint32_t DType, bool Direct = false, bool FixedShape = Direct, bool MaskRows = false>
+template <uint32_t DType, bool Direct = false, bool FixedShape = Direct,
+          bool MaskRows = false, bool Swizzle = false>
 void launch_mmq_tile(float * out, const int8_t * xs, const float2 * xds,
                      const uint8_t * w, int64_t n_in, int64_t n_out, int64_t rows,
                      uint64_t row_bytes, hipStream_t stream) {
+    if constexpr (Direct && !Swizzle && (DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K)) {
+        // Direct admits only the measured K-quant shapes, already aligned to
+        // 128 channels. The swizzled wide cells must also fill each group.
+        if (n_out >= 8192 && n_out % (kChannelGroup * kDirectTileI) == 0 && rows <= 4096) {
+            launch_mmq_tile<DType, Direct, FixedShape, MaskRows, true>(
+                out, xs, xds, w, n_in, n_out, rows, row_bytes, stream);
+            return;
+        }
+    }
     static const hipError_t attribute = hipFuncSetAttribute(
-        reinterpret_cast<const void *>(&gemm_mmq_kernel<DType, Direct, FixedShape, MaskRows>),
+        reinterpret_cast<const void *>(&gemm_mmq_kernel<DType, Direct, FixedShape, MaskRows, Swizzle>),
         hipFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
     // A rejected attribute makes the launch below fail with a clear device
     // error through the caller's hipGetLastError check; nothing runs silently.
     (void)attribute;
     const dim3 grid(static_cast<unsigned>((n_out + kTileI - 1) / kTileI),
                     static_cast<unsigned>((rows + kTileJ - 1) / kTileJ));
-    gemm_mmq_kernel<DType, Direct, FixedShape, MaskRows><<<grid, kThreads, kSharedBytes, stream>>>(
+    gemm_mmq_kernel<DType, Direct, FixedShape, MaskRows, Swizzle><<<grid, kThreads, kSharedBytes, stream>>>(
         out, xs, xds, w, n_in, n_out, rows, row_bytes);
 }
 
