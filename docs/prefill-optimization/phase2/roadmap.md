@@ -148,15 +148,16 @@ next and isolates numerical changes:
 | :---: | --- | --- | --- | --- |
 | **1** | **Step 1a** (`rows >= 128` Direct MMQ) | [stage1a-direct-rows.md](stage1a-direct-rows.md) | **Landed** (`3caea06`, [01](acceptance/01-direct-rows.md)) | Removes the `{128, 512, 2048}` cliff (`128 -> 129` `+45.92 ms` projections) and adds the row-masking mechanism in Direct MMQ that Step 1b later reuses for `<128` rows. |
 | **2** | **Steps 5a & 5b** (prefix-cache `Snapshot` gating & ordering) | [stage5ab-snapshot-critical-path.md](stage5ab-snapshot-critical-path.md) | **Landed** (`6e267d7`, `c09cd06`, [02](acceptance/02-snapshot-critical-path.md)) | Pure Go `serving` change (`~22` production LoC, zero kernel/ABI/numerical risk) pulled ahead of `1c/1b` to eliminate dead/critical-path D2H + logit serialization before benchmarking server SSE TTFT on `1c/1b`. |
-| **3** | **Step 1c** (`rows < 128` GDN crossover) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#31-step-1c-prepared-gdn-below-128-rows) | **Landed** (`b833b4e`, `260094f`, [03](acceptance/03-sub128-gdn.md)) | ~5-line threshold change in `plan.go` (`gdnPreparedMinRows = 2`), byte-identical to control (per Phase 1 `04b-gdn.md`); landing it before `1b` fixes GDN while isolating `1b`'s projection arithmetic changes. |
-| **4** | **Step 1b** (short projection routing) | [Sub-128 projections](stage1bc-sub128-rows.md) | **Landed** ([1b-1](acceptance/04a-streaming-short-tails.md), [1b-2](acceptance/04b-direct-fp16-wmma.md)) | FP32 streaming handles eligible K-quants at 1–16 rows. Direct FP16 WMMA accelerates eligible projections at 17–127 rows. |
-| **5** | **Step 1d** (CLI default chunk re-sweep) | [Stage 1d — CLI chunk policy](stage1d-cli-chunk-policy.md) | **Landed** ([05](acceptance/05-cli-chunk-policy.md)) | The gfx1151 Qwen3.5-4B Q4_K_M CLI uses chunk 1024 for 1024–8192 input tokens with F16 KV when the flag is omitted. The 17-length sweep includes aligned and boundary prompts. |
-| **6** | **Stage 2** (`ssm_alpha`/`ssm_beta` `Q8_0`) | [Stage 2 — Narrow Q8_0 projections](stage2-narrow-q8-projections.md) | **Landed** ([06](acceptance/06-narrow-q8-projections.md)) | The equivalent WMMA pair keeps model logits and snapshots bitwise identical. Both upstream comparisons clear the 5% throughput gate at all four lengths. |
-| **7** | **Stage 3** (`Q6_K` Direct WMMA) | [Stage 3 — Direct Q6_K MMQ](stage3-q6k-direct-mmq.md) | **Landed** ([07a](acceptance/07a-direct-q6k-ffn.md), [07b](acceptance/07b-direct-q6k-attention.md)) | Direct MMQ covers the aligned FFN down and attention V shapes from 128 rows. Both repeated full-prompt pairs improved at all four lengths with bitwise logits. |
-| **8** | **Stage 4** (Long-context Attention) | [Stage 4 — Long-context attention](stage4-long-context-attention.md) | **Complete** ([4a](acceptance/08a-f16-lds-padding.md), [4b](acceptance/08b-f16-split-cells.md), [4c](acceptance/08c-q8-kv-wmma.md), [4d](acceptance/08d-cross-format-split.md)). | F16 split and Q8_0 WMMA land in measured ranges. Typed F32 and Q8_0 split use independently verified start positions. |
-| **9** | **Step 5c** (Contiguous GDN state) | [Stage 5c — Contiguous GDN state](stage5c-contiguous-gdn-state.md) | **Measured** ([09](acceptance/09-contiguous-gdn-state.md)). | A single allocation preserved snapshot bytes and reduced API calls. The snapshot and lifecycle medians exceeded 1.5 ms, so per-layer allocations remain in production. |
-| **10** | **Steps 6a & 6b** (`M=1` tail GEMV & norm fusion) | [Stage 6 — Compact tail and norm fusion](stage6-compact-tail-and-norm.md) | **Measured** ([6a](acceptance/10a-compact-tail-gemv.md), [6b](acceptance/10b-residual-norm.md)). | Compact GEMV and residual norm fusion each pass numerics in their equivalent variants. Neither repeatedly meets its full-prefill timing gate. |
-| **11** | **Stage 7** (2D L2 cache swizzling) | [Stage 7 — Direct MMQ workgroup swizzle](stage7-direct-mmq-swizzle.md) | **Landed** ([11](acceptance/11-direct-mmq-swizzle.md)) | Groups of eight channel tiles improve pp512 and pp2048 in both orders with bitwise logits and output guards. Dispatch is confined to the measured wide Direct Q4_K/Q5_K cells. |
+| **3** | **Step 1c** (`rows < 128` GDN crossover) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#2-step-1c-summary-landed-in-260094f) | **Landed** (`b833b4e`, `260094f`, [03](acceptance/03-sub128-gdn.md)) | ~5-line threshold change in `plan.go` (`gdnPreparedMinRows = 2`), byte-identical to control (per Phase 1 `04b-gdn.md`); landing it before `1b` fixes GDN while isolating `1b`'s projection arithmetic changes. |
+| **4a** | **Step 1b-1** (`1..16` rows FP32 `PrefillStreaming`) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#3-step-1b-1-fp32-prefillstreaming-for-116-rows) | **Landed** (`ac659b7`, [04a](acceptance/04a-streaming-short-tails.md)) | Routes `1..16` K-quant rows to `lm_head_kernel` with aligned 16-row `float4` activation staging under the `<= 2e-3` FP32 error bound; cuts `2`, `512+1`, `2048+2`, and cached `512+2` tails with all existing gates unmodified. |
+| **4b** | **Step 1b-2** (`17..127` rows Direct FP16 WMMA) | [stage1bc-sub128-rows.md](stage1bc-sub128-rows.md#4-step-1b-2-gfx1151-direct-fp16-wmma-for-17127-rows) | **Landed** (`c7dc298`, [04b](acceptance/04b-direct-fp16-wmma.md)) | Upgrades `wmma_gemm.hip` (128-channel GEMM + 64-channel fused SwiGLU, `K=64`, conflict-free LDS, register epilogue), cutting `127` rows to `66.30 ms` while keeping FP16 activation logits bitwise identical to control. |
+| **5** | **Step 1d** (CLI default chunk re-sweep) | [Stage 1d — CLI chunk policy](stage1d-cli-chunk-policy.md) | **Landed** (`ba37822`, [05](acceptance/05-cli-chunk-policy.md)) | The gfx1151 Qwen3.5-4B Q4_K_M CLI uses chunk 1024 for 1024–8192 input tokens with F16 KV when the flag is omitted. The 17-length sweep includes aligned and boundary prompts. |
+| **6** | **Stage 2** (`ssm_alpha`/`ssm_beta` `Q8_0`) | [Stage 2 — Narrow Q8_0 projections](stage2-narrow-q8-projections.md) | **Landed** (`2bfabbb`, [06](acceptance/06-narrow-q8-projections.md)) | The equivalent WMMA pair keeps model logits and snapshots bitwise identical. Both upstream comparisons clear the 5% throughput gate at all four lengths. |
+| **7** | **Stage 3** (`Q6_K` Direct WMMA) | [Stage 3 — Direct Q6_K MMQ](stage3-q6k-direct-mmq.md) | **Landed** (`bb56fec`, `704f211`, [07a](acceptance/07a-direct-q6k-ffn.md), [07b](acceptance/07b-direct-q6k-attention.md)) | Direct MMQ covers the aligned FFN down and attention V shapes from 128 rows. Both repeated full-prompt pairs improved at all four lengths with bitwise logits. |
+| **8** | **Stage 4** (Long-context Attention) | [Stage 4 — Long-context attention](stage4-long-context-attention.md) | **Complete** (`ab398ac`, `ccf2ea2`, `a7eca5d`, `e4cde6f`; [4a](acceptance/08a-f16-lds-padding.md), [4b](acceptance/08b-f16-split-cells.md), [4c](acceptance/08c-q8-kv-wmma.md), [4d](acceptance/08d-cross-format-split.md)) | Step 4a kept the 256-half LDS layout after inconclusive early-cell timing; 4b/4c/4d landed F16 split extension, `Q8_0` unsplit WMMA, and typed `F32`/`Q8_0` split-key in independently verified ranges. |
+| **9** | **Step 5c** (Contiguous GDN state) | [Stage 5c — Contiguous GDN state](stage5c-contiguous-gdn-state.md) | **Measured** (`8d50b1a`, [09](acceptance/09-contiguous-gdn-state.md)) | A single allocation preserved snapshot bytes and reduced API calls. The snapshot and lifecycle medians exceeded 1.5 ms, so per-layer allocations remain in production. |
+| **10** | **Steps 6a & 6b** (`M=1` tail GEMV & norm fusion) | [Stage 6 — Compact tail and norm fusion](stage6-compact-tail-and-norm.md) | **Measured** (`8762a72`, `e548993`; [6a](acceptance/10a-compact-tail-gemv.md), [6b](acceptance/10b-residual-norm.md)) | Compact GEMV and residual norm fusion each pass numerics in their equivalent variants. Neither repeatedly meets its full-prefill timing gate, so existing dispatch remains. |
+| **11** | **Stage 7** (2D L2 cache swizzling) | [Stage 7 — Direct MMQ workgroup swizzle](stage7-direct-mmq-swizzle.md) | **Landed** (`9aaf432`, [11](acceptance/11-direct-mmq-swizzle.md)) | Groups of eight channel tiles improve pp512 and pp2048 in both orders with bitwise logits and output guards. Dispatch is confined to the measured wide Direct Q4_K/Q5_K cells. |
 
 ---
 
@@ -191,24 +192,46 @@ verified steps:
     97.752 ms. At pp8192, chunk 1024 improved from 4517.265 to 3906.133 ms
     and chunk 4096 from 4514.581 to 3957.490 ms. Same-chunk logits matched
     bitwise in all 18 cells. [Stage 1a acceptance](acceptance/01-direct-rows.md)
-- **Step 1b — Sub-128 projection crossover (`rows < 128`, GDN held fixed)**
+- **Step 1b — Sub-128 projections split into two accuracy-preserving steps**
   ([implementation plan](stage1bc-sub128-rows.md), lands after Step 1c):
-  - *Changes*: Benchmark masked `64`-row Direct MMQ, `wmma_k32`, `gemv_batch`, and the
-    multi-row streaming kernel ([lm_head.hip](../../../kernels/hip/gemm/lm_head.hip), `1..16` rows)
-    across `rows = 1, 2, 4, 8, 16, 18, 32, 48, 64, 88, 96, 127` with GDN held constant.
-    Update [dispatch.go](../../../backend/hip/dispatch.go) and [plan.go](../../../engine/gpu/plan.go)
-    with the measured crossover rules.
-  - *Acceptance*: Numerical checks separate **same-chunking route comparisons** (streaming
-    FP32 matches FP32 reference within `2e-3`; `Q8_1` MMQ matches CPU `Q8_1` product within
-    existing MMQ bounds) from **cross-chunking comparisons** (`512+1` vs single-chunk `513`,
-    `512+18` vs `530`: verify identical greedy top-1 and 3-step continuation, and record
-    logit max-abs delta). Projection time on `127`, `512+1`, `512+18`, `600` (`512+88`),
-    and `2048+2` drops monotonically with row count.
-  - *Status*: FP32 streaming through 16 rows passed acceptance in Step 1b-1
-    ([record](acceptance/04a-streaming-short-tails.md)). The earlier short Q8_1
-    MMQ candidate remains rejected ([trial](acceptance/04-sub128-projections.md)).
-    Step 1b-2 landed Direct FP16 WMMA for 17–127 rows on gfx1151
-    ([record](acceptance/04b-direct-fp16-wmma.md)).
+  - *Background*: The initial `Q8_1` MMQ (`>= 17` rows) trial was rejected because
+    quantizing sub-128 activations to `Q8_1` moved `127`-row logits by `2.805252` and
+    broke `TestGPUAttentionPathsAgree` (`0.495347 > 0.05` at `64` rows; see
+    [Stage 1b trial record](acceptance/04-sub128-projections.md)). Step 1b therefore
+    keeps FP32/FP16 activations and splits into:
+  - **Step 1b-1 (`1..16` rows FP32 `PrefillStreaming`)**: Route eligible K-quant
+    projections in [dispatch.go](../../../backend/hip/dispatch.go) and
+    [plan.go](../../../engine/gpu/plan.go) to existing `AddLMHeadAt`
+    ([lm_head.hip](../../../kernels/hip/gemm/lm_head.hip)). Both shape
+    classes use the 16-row cap, with vectorized activation staging at 16 rows.
+    - *Acceptance*: Fixed `<= 2e-3` max absolute logit difference vs CPU FP32 (`1, 2, 5, 16`
+      tokens plus independent English/Chinese prompts) and vs same-chunk control (`513`,
+      `2050`), identical top-1 and 8-step greedy tokens, all existing real-model gates
+      unmodified; `2` rows `<= 35 ms`, `513` `<= 255 ms`, `2050` `<= 950 ms`, cached
+      `512+2` TTFT `<= 42 ms`.
+    - *Measured (`ac659b7`)*: **Landed.** `2` rows `84.81 -> 29.35 ms`, `16` rows
+      `54.91 -> 47.91 ms`, `513` `292.45 -> 238.69 ms`, `2050` `994.28 -> 936.83 ms`,
+      cached `512+2` TTFT `91.7 -> 35.8 ms`, and `~2050`-token SSE `996.53 -> 940.28 ms`;
+      16-token CPU max delta `0.000489` (F32 KV) / `0.001063` (F16 KV).
+      [Step 1b-1 acceptance](acceptance/04a-streaming-short-tails.md)
+  - **Step 1b-2 (`17..127` rows `gfx1151` Direct FP16 WMMA)**: Upgrade
+    [wmma_gemm.hip](../../../kernels/hip/gemm/wmma_gemm.hip) (`launch_gemm_wmma_f32out`
+    and `launch_gemm_wmma_swiglu_f32out`) with Direct 128-channel GEMM and 64-channel SwiGLU tiles,
+    vectorized `Q4_K`/`Q5_K`/`Q6_K` LDS decode, conflict-free staging, and direct
+    register epilogue — zero C ABI or Go planner changes.
+    - *Acceptance*: Native CTest `10/10` pass with partial-row sentinels, zero VGPR
+      spills, LDS `<= 30 KiB`, `LDSBankConflict < 5%`; unmodified
+      `TestGPUAttentionPathsAgree` (`<= 0.05` at 64 rows); `<= 0.05` max logit diff vs
+      Step 1b-1 control (`17..127`, `530`, `600`); `t(127) <= 82 ms`, monotonic
+      `t(18) <= t(64) <= t(96) <= t(127)`, cached `512+18` TTFT `<= 52 ms`, and `>= 128`
+      lengths within `±1%`.
+    - *Measured (`c7dc298`)*: **Landed.** Bitwise-identical logits to Step 1b-1 control
+      at `17..127`, `530`, and `600` tokens; `18` `58.22 -> 35.48 ms`, `64`
+      `80.71 -> 47.54 ms`, `96` `107.97 -> 60.08 ms`, `127` `117.92 -> 66.30 ms`, `530`
+      `275.37 -> 253.48 ms`, `600` `321.79 -> 274.99 ms`, cached `512+18` TTFT
+      `67.1 -> 43.2 ms`, and `~530`-token SSE `283.39 -> 258.91 ms`; `0.0%` bank
+      conflicts across 539 model sweep dispatches.
+      [Step 1b-2 acceptance](acceptance/04b-direct-fp16-wmma.md)
 - **Step 1c — Sub-128 GDN preparation crossover**
   ([implementation plan](stage1bc-sub128-rows.md), lands before Step 1b because it is
   expected to be byte-identical):
@@ -392,54 +415,71 @@ are currently hardcoded to `F16`, Stage 4 is executed as four incremental steps 
 
 ---
 
-## 5. Current progress snapshot (commit `260094f`)
+## 5. Final Phase 2 summary (commit `9aaf432`)
 
-Cumulative interleaved verification on the reference `gfx1151` host (`2026-11-19`,
-`Qwen3.5-4B-Q4_K_M`, SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`,
-`F16 KV`, `chunk=512`, `concurrency=1`, greedy, `power=auto`, temp `38 -> 63 °C`, CTest
-`10/10` pass):
+All 11 ordered execution slices (P1–P7) are complete on the reference `gfx1151`
+container (`Qwen3.5-4B-Q4_K_M`, SHA-256
+`00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`, ROCm `10.1.0`,
+HIP `7.16.26385`, Go `1.24.4`, `power=auto`, `concurrency=1`, Release CTest `10/10`
+and full HIP Go test suite passing).
 
-### 5.1 Upstream `llama.cpp v1.0.0` (`b1b770d90`) vs `HEAD` (`260094f`)
+### 5.1 Final comparison against official `llama.cpp v1.0.0` (`b1b770d90`)
 
-Using `bench/prefill-compare` in `yuuka-1, llama-1, llama-2, yuuka-2` order (`2` warmups,
-`5` reps per process, pooled `10` samples):
+Interleaved matched-input comparison at `9aaf432` using F16 KV, identical integer
+token IDs, and two reversed-start rounds (see
+[Stage 7 acceptance](acceptance/11-direct-mmq-swizzle.md#final-comparison-with-official-llamacpp-v100)
+for full sample ranges and protocol):
 
-| Prompt | `260094f` (`chunk=512`) | `llama.cpp v1.0.0` | Speedup | Top-1 | `260094f` (`chunk=1024`) |
-| ---: | ---: | ---: | ---: | :---: | ---: |
-| 127 | 116.10 ms (`1093.9 tok/s`) | 67.19 ms (`1890.1 tok/s`) | `-42.12%` | Match | — |
-| 128 | 67.70 ms (`1890.8 tok/s`) | 67.38 ms (`1899.7 tok/s`) | `-0.47%` | Match | — |
-| 129 | 86.82 ms (`1485.8 tok/s`) | 73.26 ms (`1760.9 tok/s`) | `-15.62%` | Match | — |
-| 140 | 88.02 ms (`1590.5 tok/s`) | 74.26 ms (`1885.3 tok/s`) | `-15.64%` | Match | — |
-| **511** | **219.43 ms** (`2328.7 tok/s`) | 234.52 ms (`2179.0 tok/s`) | **`+6.87%`** | Match | — |
-| **512** | **215.58 ms** (`2375.0 tok/s`) | 231.67 ms (`2210.0 tok/s`) | **`+7.46%`** | Match | — |
-| 513 (`512+1`) | 292.09 ms (`1756.3 tok/s`) | 245.96 ms (`2085.7 tok/s`) | `-15.79%` | Match | — |
-| 530 (`512+18`) | 273.36 ms (`1938.9 tok/s`) | 259.17 ms (`2045.0 tok/s`) | `-5.19%` | Match | — |
-| 600 (`512+88`) | 320.45 ms (`1872.4 tok/s`) | 286.40 ms (`2094.9 tok/s`) | `-10.62%` | Match | — |
-| 1024 | — | — | — | — | **425.71 ms (`2405.4 tok/s`)** |
-| **2048** | **899.37 ms** (`2277.2 tok/s`) | 948.31 ms (`2159.6 tok/s`) | **`+5.44%`** | Match | **862.68 ms (`2374.0 tok/s`)** |
-| 2050 (`2048+2`) | 987.76 ms (`2075.4 tok/s`) | 960.09 ms (`2135.2 tok/s`) | `-2.80%` | Match | — |
-| **8192** | **4122.63 ms** (`1987.1 tok/s`) | 4215.05 ms (`1943.5 tok/s`) | **`+2.24%`** | Match | **3911.58 ms (`2094.3 tok/s`)** |
+| Prompt | Yuuka / llama.cpp chunk | Round | `9aaf432` median (ms) | `llama.cpp v1.0.0` median (ms) | Throughput gain | Top-1 |
+| ---: | :---: | ---: | ---: | ---: | ---: | :---: |
+| 128 | 128 / 128 | 1 / 2 | 59.081 / 59.499 | 68.533 / 67.957 | **+16.00% / +14.21%** | Match |
+| 512 | 512 / 512 | 1 / 2 | 195.141 / 196.271 | 228.578 / 230.809 | **+17.13% / +17.60%** | Match |
+| 2048 | 1024 / 512 | 1 / 2 | 808.156 / 811.868 | 937.983 / 939.982 | **+16.06% / +15.78%** | Match |
+| 8192 | 1024 / 256 | 1 / 2 | 3685.340 / 3703.992 | 4163.147 / 4163.955 | **+12.97% / +12.42%** | Match |
 
-### 5.2 Cumulative pre-Phase-2 control (`846fc4f`) vs `260094f` (`1a + 5ab + 1c`)
+### 5.2 Key real-world outcomes and recorded negative trials
 
-All 18 lengths in `bench/prefill-compare` (`ctrl-1, cand-1, cand-2, ctrl-2`, `chunk=512`)
-remained **bitwise identical (`maxdiff = 0`)**:
-
-- **Non-power-of-two `>= 128` (Step 1a)**: `129` `114.94 -> 88.65 ms` (`-22.87%`), `140`
-  `116.57 -> 89.22 ms` (`-23.47%`), `256` `138.36 -> 117.78 ms` (`-14.88%`), `511`
-  `259.78 -> 223.59 ms` (`-13.93%`). Aligned `128`, `512`, `1024` (`442.79 ms` at `c=512`),
-  `2048`, and `8192` stayed within `-0.80%` to `+0.12%`.
-- **Sub-128 prepared GDN (Step 1c)**: `18` `60.24 -> 58.25 ms` (`-3.31%`), `64`
-  `84.62 -> 80.67 ms` (`-4.66%`), `96` `115.67 -> 108.83 ms` (`-5.91%`), `127`
-  `126.55 -> 119.04 ms` (`-5.93%`).
-- **`yuuka-server` SSE first-content TTFT (`ctrl-1, cand-1, cand-2, ctrl-2`, `14` samples)**:
-  - `--prefix-cache=false`: `~140` `127.63 -> 93.44 ms` (`-34.19 ms`), `~530`
-    `284.46 -> 278.86 ms` (`-5.60 ms`), `~2050` `916.84 -> 912.39 ms` (`-4.45 ms`).
-  - `--prefix-cache=true` (misses): `~140` `129.12 -> 93.45 ms` (`-35.67 ms`), `~530`
-    `287.39 -> 278.94 ms` (`-8.45 ms`), `~2050` `917.92 -> 915.20 ms` (`-2.72 ms`).
-- **Prefix-cache increment (`bench/serving` on `260094f`, 512-token prefix, `hits=11 misses=1`)**:
-  `append=2` TTFT `91.881 ms` (prefill `87.524 ms`); `append=18` TTFT `66.922 ms` (prefill
-  `62.688 ms`).
-- **Remaining gap**: Because Step 1b is blocked on numerical acceptance, `2`-row prefill
-  (`85.34 ms`), `127`-row prefill (`116.10–119.04 ms`), and `1–2` row tails (`513` at
-  `292.09 ms`, `+76.5 ms` over `512`) still use the pre-Phase-2 sub-128 projection paths.
+- **Boundary and short-chunk cliffs eliminated (Stage 1a, 1c, 1b-1, 1b-2, 1d)**:
+  - Arbitrary `>= 128` rows route into masked Direct MMQ (`pp129` `113.11 -> 86.93 ms`,
+    `pp511` `256.41 -> 217.65 ms`, `140`-token SSE `125.83 -> 97.75 ms`;
+    [01](acceptance/01-direct-rows.md)).
+  - Prepared GDN starts at `2` rows (`127`-row recurrence `12.60 -> 4.67 ms`, bitwise;
+    [03](acceptance/03-sub128-gdn.md)).
+  - `1..16` rows use FP32 streaming (`2` rows `84.81 -> 29.35 ms`, `513`
+    `292.45 -> 238.69 ms`, `2050` `994.28 -> 936.83 ms`, cached `512+2` TTFT
+    `91.7 -> 35.8 ms`, `2050`-token SSE `996.53 -> 940.28 ms`;
+    [04a](acceptance/04a-streaming-short-tails.md)).
+  - `17..127` rows use `gfx1151` Direct FP16 WMMA (`18/64/96/127` rows drop to
+    `35.48 / 47.54 / 60.08 / 66.30 ms`, `530` `275.37 -> 253.48 ms`, `600`
+    `321.79 -> 274.99 ms`, cached `512+18` TTFT `67.1 -> 43.2 ms`, `530`-token SSE
+    `283.39 -> 258.91 ms`, bitwise to Step 1b-1 control;
+    [04b](acceptance/04b-direct-fp16-wmma.md)).
+  - CLI omits `--chunk-size` -> automatically selects `1024` for `1024..8192` tokens on
+    the verified `gfx1151` F16 KV configuration (`3.18%–5.01%` faster across aligned and
+    `+1`/`+18` boundaries; [05](acceptance/05-cli-chunk-policy.md)).
+- **Core projection, attention, L2, and serving gains (Stages 2, 3, 4b–4d, 5a–5b, 7)**:
+  - Paired narrow `Q8_0` WMMA (`ssm_beta`/`ssm_alpha`) matched logits bitwise and
+    cleared the +5% upstream gate at all four benchmark lengths
+    ([06](acceptance/06-narrow-q8-projections.md)).
+  - Direct `Q6_K` MMQ landed for `ffn_down` and `attn_v` with bitwise parity and
+    cumulative improvements across all four benchmark lengths
+    ([07a](acceptance/07a-direct-q6k-ffn.md), [07b](acceptance/07b-direct-q6k-attention.md)).
+  - Long-context attention extended F16 split-key windows, added packed `Q8_0` unsplit
+    WMMA (`pp8192` `Q8_0` KV `1105 -> 2114–2122 tok/s`), and enabled typed `F32`/`Q8_0`
+    split-key in verified ranges ([08b](acceptance/08b-f16-split-cells.md),
+    [08c](acceptance/08c-q8-kv-wmma.md), [08d](acceptance/08d-cross-format-split.md)).
+  - Server prefix capture skips dead `Snapshot` when caching is off and emits the first
+    SSE token before capturing when caching is on
+    ([02](acceptance/02-snapshot-critical-path.md)).
+  - Wide Direct `Q4_K`/`Q5_K` 8-tile workgroup swizzle raised L2 hit rate from
+    `~36%–43%` to `~85%–88%`, cut fetch volume ~6–7×, and saved `7.1–8.7 ms` at `pp512`
+    and `24.6–33.7 ms` at `pp2048` bitwise ([11](acceptance/11-direct-mmq-swizzle.md)).
+- **Measured trials kept out of production (by acceptance gate)**:
+  - Original `<128` `Q8_1` MMQ trial rejected on numerical drift
+    ([04](acceptance/04-sub128-projections.md)).
+  - Step 4a (`F16` attention LDS padding), Step 5c (contiguous GDN state buffer),
+    Step 6a (compact `M=1` tail `GEMV_Q8_1`), and Step 6b (fused `Residual Add + RMSNorm
+    (+ Q8_1)`) all passed numerical checks but missed their repeatability or absolute
+    latency gates, so existing production routes were retained
+    ([08a](acceptance/08a-f16-lds-padding.md), [09](acceptance/09-contiguous-gdn-state.md),
+    [10a](acceptance/10a-compact-tail-gemv.md), [10b](acceptance/10b-residual-norm.md)).

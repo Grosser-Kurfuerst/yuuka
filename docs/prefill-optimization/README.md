@@ -5,14 +5,13 @@ organized into Phase 1 (synthetic power-of-two benchmark parity and lead over
 upstream `llama.cpp v1.0.0`) and Phase 2 (real-world arbitrary prompt lengths,
 tail chunks, and serving TTFT).
 
-## Phase 2: Real-world prefill optimization
+## Phase 2: Real-world prefill optimization (completed)
 
-- [Phase 2 priority roadmap](phase2/roadmap.md) — Diagnostic `rocprofv3` attribution, P1–P7 priority ranking, execution order, phased plan, and current `260094f` benchmark progress.
+- [Phase 2 priority roadmap](phase2/roadmap.md) — Diagnostic `rocprofv3` attribution, P1–P7 priority ranking, execution order, phased plan, and final `9aaf432` completion summary.
 - [Phase 2 progress and acceptance](phase2/acceptance/README.md) — Per-stage correctness, performance measurements, reviews and dispatch decisions.
 - [Stage 1a: Direct MMQ for arbitrary row counts](phase2/stage1a-direct-rows.md) — Design, change points, and acceptance gates for `rows >= 128` Direct MMQ (landed in `3caea06`).
 - [Stage 5a/5b: Prefix snapshot off the first-token path](phase2/stage5ab-snapshot-critical-path.md) — Server prefix-capture gating and post-emission ordering plan (landed in `6e267d7`, `c09cd06`).
-- [Stage 1b/1c: Sub-128-row projections and GDN preparation](phase2/stage1bc-sub128-rows.md) — Prepared GDN crossover (`260094f`) and sub-128 projection routes (currently blocked on `1b` numerical gates).
-
+- [Stage 1b/1c: Sub-128-row projections and GDN preparation](phase2/stage1bc-sub128-rows.md) — Prepared GDN crossover (`260094f`), FP32 streaming short tails (`ac659b7`), and Direct FP16 WMMA (`c7dc298`).
 - [Stage 1d — CLI chunk policy](phase2/stage1d-cli-chunk-policy.md) — Chunk-size sweep, memory costs, CLI overrides and boundary-prompt TTFT gates.
 - [Stage 2 — Narrow Q8_0 projections](phase2/stage2-narrow-q8-projections.md) — FP32 and Q8_1 paired gate projections, recurrent-state comparison and upstream timing gates.
 - [Stage 3 — Direct Q6_K MMQ](phase2/stage3-q6k-direct-mmq.md) — Per-16-value scaling, model-shape dispatch and independent kernel and prompt benchmarks.
