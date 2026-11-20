@@ -899,22 +899,25 @@ hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
         return hipSuccess;
     }
     if (partial != nullptr) {
-        const bool measured_rows = rows == 512 || rows == 1024 || rows == 2048;
-        const int measured_splits = measured_rows && position >= 6144 &&
-            position + rows <= 8192 ? 4 : 0;
+        const bool f16 = dtype == YUUKA_DTYPE_F16;
+        const bool measured_rows = rows == 512 || (f16 && (rows == 1024 || rows == 2048));
+        const bool measured_tail = f16 && (rows == 64 || rows == 513) &&
+            position >= 7680;
+        const int min_position = dtype == YUUKA_DTYPE_Q8_0 ? 8192 : 6144;
+        const int measured_splits = (measured_rows || measured_tail) &&
+            position >= min_position && position <= 14336 ? 4 : 0;
         const int splits = forced_splits != 0 ? forced_splits : measured_splits;
         if (splits != 0) {
-            return launch_attention_prefill_paged_split_f16(
+            return launch_attention_prefill_paged_split(
                 out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
-                kv_dim, rows, position, scale, partial, splits, stream);
+                kv_dim, rows, position, scale, partial, splits, dtype, stream);
         }
     }
     if (prefer_wmma &&
         attention_wmma_supported(heads, kv_heads, head_dim, block_size, dtype)) {
-        launch_attention_prefill_paged_wmma_f32(
+        return launch_attention_prefill_paged_wmma_f32(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
             head_dim, kv_dim, rows, position, scale, dtype, dense, stream);
-        return hipSuccess;
     }
     const int vec = (head_dim + 31) / 32;
     const size_t shared =

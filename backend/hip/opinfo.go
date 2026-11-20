@@ -53,6 +53,7 @@ const (
 	OpGemvResidual          uint32 = uint32(C.YUUKA_OP_GEMV_RESIDUAL)
 	OpGemvPair              uint32 = uint32(C.YUUKA_OP_GEMV_PAIR)
 	OpSiluMulQuantQ8_1      uint32 = uint32(C.YUUKA_OP_SILU_MUL_QUANT_Q8_1)
+	OpPrefillQ8Pair         uint32 = uint32(C.YUUKA_OP_PREFILL_Q8_0_PAIR)
 )
 
 // opFlagTail mirrors YUUKA_OP_FLAG_TAIL.
@@ -61,7 +62,7 @@ const opFlagTail = 0x1
 // MaxOpCode is the highest op code the bound ABI declares. The shadow covers
 // every code in 1..MaxOpCode, and opinfo_test.go fails when one of them has no
 // name or role.
-const MaxOpCode = OpSiluMulQuantQ8_1
+const MaxOpCode = OpPrefillQ8Pair
 
 // OpRole names what a plan operation holds in one of its buffer slots. The role
 // is a property of the ABI opcode, so it is recorded once per code in opRoles
@@ -213,6 +214,8 @@ func OpName(code uint32) string {
 		return "gemv_pair"
 	case OpSiluMulQuantQ8_1:
 		return "silu_mul_quant_q8_1"
+	case OpPrefillQ8Pair:
+		return "prefill_q8_0_pair"
 	default:
 		return "unknown"
 	}
@@ -224,8 +227,8 @@ func opRoles(code uint32) [3]OpRole {
 	switch code {
 	case OpGemv, OpGemvBatch, OpLMHead, OpGemvResidual:
 		return [3]OpRole{RoleWeight, RoleActivation, RoleOutput}
-	case OpGemvPair:
-		// Two weight matrices and one activation row; the outputs are buf[3]
+	case OpGemvPair, OpPrefillQ8Pair:
+		// Two weight matrices and their shared input; the outputs are buf[3]
 		// and buf[4].
 		return [3]OpRole{RoleWeight, RoleWeight, RoleActivation}
 	case OpGemvQ8_1:
