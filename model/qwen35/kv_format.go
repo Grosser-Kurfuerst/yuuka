@@ -9,8 +9,8 @@ import (
 )
 
 // KVFormat selects the storage format of full-attention key and value rows.
-// F32 is the default and preserves the reference path. F16 halves cache
-// capacity cost. Q8_0 stores each 32-value group with one FP16 scale and 32
+// F16 is the default and halves cache capacity cost. F32 preserves the
+// reference path. Q8_0 stores each 32-value group with one FP16 scale and 32
 // signed bytes; it is the higher-compression experimental format.
 type KVFormat uint8
 
@@ -23,12 +23,18 @@ const (
 	KVQ8_0
 )
 
+// DefaultKVFormat is the storage format used when no explicit format is
+// selected. Callers that need bit-exact reference logits pass KVF32.
+const DefaultKVFormat = KVF16
+
 // ParseKVFormat maps a configuration string to a KV format. The empty string
-// selects F32. Names are case-insensitive at the caller boundary; this function
-// accepts the canonical upper-case names.
+// selects DefaultKVFormat. Names are case-insensitive at the caller boundary;
+// this function accepts the canonical upper-case names.
 func ParseKVFormat(name string) (KVFormat, error) {
 	switch name {
-	case "", "f32", "F32":
+	case "":
+		return DefaultKVFormat, nil
+	case "f32", "F32":
 		return KVF32, nil
 	case "f16", "F16":
 		return KVF16, nil

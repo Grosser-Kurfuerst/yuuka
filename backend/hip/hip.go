@@ -1523,7 +1523,10 @@ func (p *Plan) addKVWritePaged(k, v, kPool, vPool, table *Buffer, kvDim, rows, c
 
 // AddAttentionPagedAt appends single-token attention through a block table.
 // scoreStride is the per-head stride of the scores workspace (usually the
-// maximum context); capacity bounds live positions. The pool is F32.
+// maximum context); capacity bounds live positions. The workspace also holds the
+// split-key partials, so it must be at least heads*ntiles*(headDim+2) floats with
+// ntiles = ceil(scoreStride / tile); see decodeAttentionScratch in engine/gpu.
+// The pool is F32.
 func (p *Plan) AddAttentionPagedAt(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32) error {
 	return p.AddAttentionPagedFormatAt(q, kPool, vPool, out, scores, table, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize, scale, tensor.F32)
 }

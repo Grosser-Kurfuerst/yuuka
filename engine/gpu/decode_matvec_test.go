@@ -196,60 +196,30 @@ func opDType(op hip.OpInfo) tensor.DType { return tensor.DType(op.U[0]) }
 // block's amax, which is the error the prefill int8 route already carries.
 func TestGPUInt8MatvecMatchesFp32(t *testing.T) {
 	reader, _, model, prompt := goldenPrompt(t)
-	int8RT, err := newRuntime(reader, model, 64, Options{Int8Matvec: true})
+	fp32RT, err := New(reader, model, 64)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
-	defer int8RT.Close()
-	fp32RT, err := New(reader, model, 64)
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer fp32RT.Close()
-
-	int8Ops := int8RT.session.plan.Ops()
-	if counts := countMatvec(int8Ops); counts.int8 == 0 {
-		t.Fatal("the default plan runs no int8 matvec")
-	}
-	checkDecodeRule(t, int8Ops, true)
 	if counts := countMatvec(fp32RT.session.plan.Ops()); counts.int8 != 0 {
 		t.Fatalf("the fp32 reference plan runs %d int8 matvecs", counts.int8)
-	}
-
-	logits, err := int8RT.Forward(prompt)
-	if err != nil {
-		t.Fatal(err)
 	}
 	refLogits, err := fp32RT.Forward(prompt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const steps = 8
-	tokens := make([]int32, 0, steps)
 	refTokens := make([]int32, 0, steps)
-	maxDiff := 0.0
-	for step := range steps {
-		token, refToken := argmax(logits), argmax(refLogits)
-		tokens = append(tokens, token)
+	refSteps := make([][]float32, 0, steps)
+	for range steps {
+		refToken := argmax(refLogits)
 		refTokens = append(refTokens, refToken)
-		if logits, err = int8RT.Step(token); err != nil {
-			t.Fatal(err)
-		}
+		refSteps = append(refSteps, append([]float32(nil), refLogits...))
 		if refLogits, err = fp32RT.Step(refToken); err != nil {
 			t.Fatal(err)
 		}
-		diff, _ := logitDiff(logits, refLogits)
-		t.Logf("step %d: max abs logit diff %.6g", step+1, diff)
-		if diff > maxDiff {
-			maxDiff = diff
-		}
 	}
-	t.Logf("tokens %v, max abs logit diff over %d steps %.6g", tokens, steps, maxDiff)
-	for i := range tokens {
-		if tokens[i] != refTokens[i] {
-			t.Fatalf("token %d: int8 route %d, fp32 route %d", i, tokens[i], refTokens[i])
-		}
-	}
+
 	// Recorded for this prompt: 0.2656 maximum absolute logit difference over
 	// eight greedy decode steps with identical tokens, against logits that reach
 	// about 30. The prefill int8 route records 0.0031 at a short prompt and
@@ -257,12 +227,55 @@ func TestGPUInt8MatvecMatchesFp32(t *testing.T) {
 	// both quantize the activation to 8 bits per 32 values, and a decode step
 	// feeds each step's logits into the next token, so the difference can
 	// accumulate. The gate is the recorded value with margin; the invariant the
-	// stage requires is the identical token sequence above.
+	// stage requires is the identical token sequence.
 	const tolerance = 0.6
-	if maxDiff > tolerance {
-		t.Fatalf("the int8 and fp32 routes differ by %.6g, tolerance %.6g", maxDiff,
-			tolerance)
+	for _, tc := range []struct {
+		name string
+		opts Options
+	}{
+		{name: "fused", opts: Options{Int8Matvec: true}},
+		{name: "prequantized", opts: Options{Int8Matvec: true, PrequantizedInt8: true}},
+	} {
+		int8RT, err := newRuntime(reader, model, 64, tc.opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		int8Ops := int8RT.session.plan.Ops()
+		if counts := countMatvec(int8Ops); counts.int8 == 0 {
+			int8RT.Close()
+			t.Fatalf("%s: the plan runs no int8 matvec", tc.name)
+		}
+		checkDecodeRule(t, int8Ops, true)
+		logits, err := int8RT.Forward(prompt)
+		if err != nil {
+			int8RT.Close()
+			t.Fatal(err)
+		}
+		maxDiff := 0.0
+		for step := range steps {
+			token := argmax(logits)
+			if token != refTokens[step] {
+				int8RT.Close()
+				t.Fatalf("%s token %d: int8 route %d, fp32 route %d", tc.name, step,
+					token, refTokens[step])
+			}
+			diff, _ := logitDiff(logits, refSteps[step])
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+			if step+1 < steps {
+				if logits, err = int8RT.Step(token); err != nil {
+					int8RT.Close()
+					t.Fatal(err)
+				}
+			}
+		}
+		int8RT.Close()
+		if maxDiff > tolerance {
+			t.Fatalf("%s: the int8 and fp32 routes differ by %.6g, tolerance %.6g",
+				tc.name, maxDiff, tolerance)
+		}
+		t.Logf("%s: %d steps, tokens %v, max abs logit diff %.6g (tolerance %.6g)",
+			tc.name, steps, refTokens, maxDiff, tolerance)
 	}
-	t.Logf("tokens %v, max abs logit diff over %d steps %.6g (tolerance %.6g)",
-		tokens, steps, maxDiff, tolerance)
 }

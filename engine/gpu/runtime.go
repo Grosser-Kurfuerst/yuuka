@@ -28,15 +28,15 @@ type Runtime struct {
 	closed      bool
 }
 
-// New uploads model weights and builds a single-request F32-KV session with a
-// contiguous block table covering capacity positions.
+// New uploads model weights and builds a single-request session with a
+// DefaultKVType pool and a contiguous block table covering capacity positions.
 func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, error) {
-	return NewWithKVType(reader, model, capacity, tensor.F32)
+	return NewWithKVType(reader, model, capacity, DefaultKVType)
 }
 
 // NewWithKVType is New with an explicit KV pool storage type.
 func NewWithKVType(reader *gguf.Reader, model *qwen35.Model, capacity int, kvType tensor.DType) (*Runtime, error) {
-	return newRuntime(reader, model, capacity, Options{KVType: kvType})
+	return newRuntime(reader, model, capacity, Options{KVType: kvType, KVTypeSet: true})
 }
 
 // newRuntime is NewWithKVType with dispatch overrides for tests and A/B
@@ -64,6 +64,7 @@ func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Opt
 		EnableGraph:         opts.EnableGraph,
 		GraphMinSteps:       opts.GraphMinSteps,
 		KVType:              opts.KVType,
+		KVTypeSet:           opts.KVTypeSet,
 		LegacyBlasAttention: opts.LegacyBlasAttention,
 		ForceTiledAttention: opts.ForceTiledAttention,
 		ForceDecodeGemv:     opts.ForceDecodeGemv,

@@ -31,7 +31,7 @@ resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
 token and position from device memory, and a versioned C ABI (currently version
 10) for device-to-device block copies and HIP Graph capture/replay. KV pools
-support F32 (default), F16, and Q8_0; see section 7.3. Prefill attention runs on
+support F16 (default), F32, and Q8_0 (section 7.3). Prefill attention runs on
 the FP16 MMA kernel (with split-key support for measured long-prefix windows)
 for F32, F16, and packed Q8_0 pools on covered shapes and position cutoffs, and
 on the scalar per-lane tiled kernel otherwise (section 7.5). On `gfx1151`,
@@ -40,9 +40,9 @@ prefill projections additionally use arbitrary-row Direct int8 MMQ (`Q4_K`,
 shapes), fused gate/up `SILU_MUL_QUANT_Q8_1`, paired `Q8_0` WMMA for narrow
 recurrent gates, Direct FP16 WMMA and fused SwiGLU (`17 <= M <= 127`), FP32
 streaming (`1 <= M <= 16`), and prepared gated delta-net recurrence (`M >= 2`).
-Continuous batching is scheduler-level interleaving of per-request plans;
-mixed-shape prefill/decode kernel batches and split-KV decode are not
-implemented.
+Decode attention uses split-key paged attention on covered shapes (section
+7.2). Continuous batching interleaves per-request plans at the scheduler
+level.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same
@@ -121,7 +121,8 @@ hard-coded from another GPU.
 
 | Kernel family | Main scenario | Optimization focus |
 | --- | --- | --- |
-| `lm_head_stream` | Decode matvec and both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
+| `gemv_row` / `gemv_row_pair` | Decode matvec (selected, one row, K % 512 == 0) | One wave per output row, sixteen K values per lane, two rows per wave, no shared staging and no barrier in K |
+| `lm_head_stream` | Decode matvec fallback, both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
 | `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
 | `lm_head_stream` epilogues | Decode matvec (selected) | Same streaming kernel with the residual add in the epilogue, or walking a second packed matrix to form the SwiGLU product (`GEMV_RESIDUAL`, `GEMV_PAIR`) |
 | `recurrent_token` | Gated delta-net per-token state (selected) | Head state in registers across four thread groups, decay and update fused in one pass, gated RMSNorm folded in |
@@ -133,7 +134,8 @@ hard-coded from another GPU.
 
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
 | `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
-| `paged_attention` | Decode | Block table, shared KV heads, long-context split |
+| `attention_paged_flash` / `attention_flash_combine` | Decode (selected) | Block table, one block per KV head and key tile, online softmax in registers, split partials merged by log-sum-exp |
+| `attention_paged` (serial) | Decode fallback and reference | One block per query head, sequential positions, per-head score workspace |
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
 | `moe_route` / `moe_expert_*` | Sparse MoE | Top-k routing, per-expert assignment bins, packed expert reads |
@@ -192,11 +194,18 @@ barrier sits inside the K loop. Measured 90-287 GB/s on the same shapes at 2.1-8
 instructions per weight fewer, and 0.16 LDS instructions per weight against up to
 2.66.
 
-The rule, in output width at `n_in = 2560` and one row: the streaming form wins
-from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1), so the
-selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the GEMV
-family, and 1-16 rows. Everything else keeps the per-row kernel. The 32-output
-recurrent projections are the only decode shapes that land on the fallback.
+**Remapped row** (`gemv_row_kernel`, section 5.4): the one-row decode form of
+the streaming family. One wave owns one output row, sixteen K values per lane
+over a 512-value step, no shared-memory staging and no barrier inside K.
+
+The rule, in output width at `n_in = 2560` and one row: the streaming family
+wins from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1),
+so the selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the
+GEMV family, and 1-16 rows. Within that, a block of exactly one row whose K is a
+multiple of 512 takes the remapped form and everything else takes the
+channel-parallel form. Shapes outside the family keep the per-row kernel. The
+32-output recurrent projections are the only decode shapes that land on the
+fallback.
 
 **Epilogues and the two-matrix form.** The same kernel carries two
 plan-selected extensions. `GEMV_RESIDUAL` adds a residual row to every output
@@ -217,15 +226,16 @@ slower than the templated decode, because the switch dominates a loop that runs
 (`q` and `k`) is also slower than two launches, because the grid follows the wider
 matrix.
 
-**Int8 variant, implemented and not selected.** `gemv_i8_kernel` keeps the same
-mapping but dots the four packed digits of a lane against the Q8_1 activation
-word with one `v_dot4`, applying the block scale and the Q4_K/Q5_K minimum once
-per sub-block instead of once per weight. It is reachable through
-`Options.Int8Matvec` and is measured slower end to end than the FP32 streaming
-kernel: 20.07 ms of matvec against 21.39 ms, plus 1.09 ms for the separate
-activation quantization, in a step where the fused variant costs 21.9 ms because
-every block re-quantizes the row. The decode step is not instruction bound at
-127 GB/s of a 244 GB/s read ceiling, so halving the arithmetic moves 6%. The
+**Int8 variant, implemented and not selected.** `gemv_i8_kernel` and the
+remapped `gemv_row_i8_kernel` keep the mapping but dot the four packed digits of
+a lane against the Q8_1 activation words with `v_dot4`, applying the block scale
+and the Q4_K/Q5_K minimum once per sub-block instead of once per weight. The
+route is reachable through `Options.Int8Matvec` (fused) and
+`Options.Int8Matvec` with `PrequantizedInt8` (one quantization operation per
+activation group, which takes the remapped one-row kernel). On the remapped
+mapping it measures 175.3 GB/s in step against 176.6 for the FP32 route and is
+0.67 ms slower per decode step, because it loses the gate/up pair fusion and
+pays for the activation quantizations. The FP32 route stays selected; the
 numbers are in [benchmarks.md](benchmarks.md#int8-decode-matvec).
 
 Numerics. The per-row kernel sums a strided set of K values per thread and
@@ -237,11 +247,52 @@ identical tokens, and `tests/hip/gemv_test.cpp` checks every dtype against the
 host dot product at 2e-3 relative and against the per-row kernel at 2.4e-4
 absolute.
 
+**Narrow pair.** The recurrent `beta` and `alpha` projections (Q8_0, 2560 -> 32)
+are below the streaming crossover on their own, but they read the same
+normalized row and share one `GEMV_PAIR` launch through the remapped pair
+kernel, which halves the launch count of the pair. `decodeMatmulPair` allows that
+one narrow case explicitly; every other below-threshold shape keeps the per-row
+kernel.
+
+### 5.4 Remapped one-row matvec
+
+`gemv_row_kernel` in `kernels/hip/gemv/gemv_row.hip` is the selected decode
+matvec. It changes the mapping rather than the arithmetic, so a regression is
+attributable to dispatch rather than to numerics:
+
+- Grid `ceil(n_out / 8)`: one block covers eight output rows (four waves, two
+  rows per wave), so a 1024-output projection launches 128 blocks instead of 32.
+- A lane owns sixteen consecutive K values and decodes them from one 8- to
+  16-byte span of the packed row through `decode_span16`, which is the wide form
+  of `decode_span4`: Q4_K and Q5_K spans are 16-byte aligned vector loads, F16
+  and F32 spans are 32- and 64-byte reads, and Q6_K, Q8_0, Q4_0, and Q5_0 rows
+  have strides that are not a multiple of sixteen bytes, so their spans are
+  copied with four 32-bit loads.
+- A wave steps K in 512-value steps, reads its sixteen activation values once
+  per step, and reuses them for both of its rows. The activation row is small
+  enough to stay in L1, so the kernel stages nothing in shared memory and has no
+  barrier inside the K loop; the only sync is the wave shuffle tree per row.
+- The epilogue adds the residual row when the plan fuses it, and
+  `gemv_row_pair_kernel` walks a second packed matrix over the same activation
+  values for the gate/up pair with the SwiGLU product folded in.
+
+Measured in step at a 7-token context (`TestGPUProfileDecode`, profiled, 176.6
+GB/s effective over the matvec family, against 130.3 GB/s before the remap):
+`ffn_gate` 193.6, `lm_head` 229.8, `ffn_down` Q6_K 189.7, `attn_qkv` 178.8,
+`ffn_down` Q4_K 158.4, `attn_q` 166.8, `attn_gate` 158.3, `ssm_out` 133.7,
+`attn_output` 125.5, and `attn_k` 93.3 GB/s. The narrow and short-K shapes keep
+a per-row cost that the wide shapes amortize: at 4096 input values a 2560-output
+projection spends roughly 27 ns per output row on top of its weight bytes, which
+is what leaves `attn_output` and `ssm_out` below the 190 GB/s target. The
+channel-parallel form stays compiled for other row counts and K widths and as
+the numerical reference.
+
 #### 5.3.1 Measured decode shapes
 
 One submission per plan, matrix resident, five warmups and twenty-five timed
 submissions; `kernel` is the traced kernel time from
-`scripts/decode_profile.sh`, which excludes the launch the host column includes:
+`scripts/decode_profile.sh`, which excludes the launch the host column includes.
+These cells predate the remap in 5.4 and describe the channel-parallel form:
 
 | Shape | dtype | per-row GB/s | streaming GB/s |
 | --- | --- | ---: | ---: |
@@ -695,8 +746,9 @@ every requested row through attention and FFN.
 [Validation and timings](prefill-optimization/phase1/acceptance/06-final-query.md)
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
-projection in the prefill and decode tails. It also serves decode matvecs
-when `SelectDecodeGemvPath` selects `DecodeGemvStreaming`:
+projection in the prefill and decode tails. A decode matvec with one row and a
+512-value K step takes the remapped one-row kernel of section 5.4 instead; the
+channel-parallel form below serves every other row count and K width:
 
 ```text
 out[m][n] = sum_k W[n][k] * x[m][k],   m in [0, rows), rows <= 16
@@ -824,14 +876,14 @@ Dynamic shared memory is `2 * 16 * 32 * (vec + 1) * 4` bytes, or 36 KiB at
 `head_dim = 256`. The kernels report 49-53 VGPRs, 48-63 SGPRs, no spills, and
 16 waves/SIMD. F16 KV is still loaded and staged as FP32; with the staged-V
 kernel it measured slightly slower than F32 KV at position 7680 (657.5 ms
-versus 643.1 ms), so F32 remains the default and F16 stays a capacity option.
+versus 643.1 ms). F16 is the project default; F32 remains available for the
+reference path and for that long-context tradeoff.
 The measured position-7680 attention time is 643 ms with F32 KV, down from
 2030 ms before this change.
 
 Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
-unsupported capability error above 256. Decode attention remains the
-per-head kernel described in section 7.2. Flash Attention is not used for
-decode.
+unsupported capability error above 256. Decode attention uses the split-key
+kernel described in section 7.2.
 
 Chunked prefill splits a prompt into at most `chunk-size` rows (runtime
 default 512, maximum 4096). On gfx1151, `yuuka run` and `yuuka bench`
@@ -844,21 +896,51 @@ KV writes for a chunk happen before its attention, so later chunks
 see the full causal prefix. The runtime builds and caches one plan per
 chunk length. Only the final chunk executes the output tail.
 
-### 7.2 Decode: Paged Attention
+### 7.2 Decode: Split-Key Paged Attention
 
-`attention_paged_f32_kernel` runs one workgroup per query head:
+`attention_paged_flash_kernel` in `kernels/hip/attention/attention.hip` is the
+decode attention kernel. It splits the key range so the cost follows the KV
+bytes instead of the position count:
 
-- The workgroup stages the query head in shared memory and reduces the score
-  dot product across 256 threads.
+- Grid `(kv_heads, ntiles)`. One block owns one KV head and one contiguous tile
+  of key positions, and all `heads / kv_heads` query heads that share that KV
+  head. A KV row is therefore read once per block rather than once per query
+  head; on Qwen3.5 that is four query heads per block.
+- The tile is 32 positions up to a 1024-position capacity and 64 above it, so a
+  short context gets more blocks and a long context writes fewer partials. The
+  tile length is a kernel argument and the shared-memory arrays are sized for
+  64.
+- Score phase: each warp owns one position of the tile, reads the lane's part of
+  the K row (16 bytes of F32, 8 bytes of F16, one Q8_0 group per lane), and
+  reduces the dot products for every query head of the block across the wave.
+- Online softmax: one thread per query head reduces the tile maximum, every
+  thread rescales its running maximum, normalizer, and accumulators, one warp
+  per head exponentiates the tile, and one warp shuffles the tile weight sum.
+  One barrier per phase, three per tile.
+- Value phase: each thread owns two output dims, so a warp covers a 32-value
+  span of the V row; the tile weights come from shared memory as one vector
+  load per position.
 - Each logical position `p` maps to
   `block_table[p / block_size] * block_size + p % block_size`; K and V are read
   from the pool through that row. The block table and pool are device buffers.
-- Scores for one head use a per-head stride so one scores workspace serves all
-  heads. The causal length is `position + 1`.
-- GQA maps query head `h` to KV head `h / (heads/kv_heads)`.
-- The attention gate is applied as `sigmoid(gate)` before the output write.
-- The dynamic variant reads `position` from a device parameter buffer so a
-  captured HIP Graph can be replayed without changing kernel arguments.
+- The block writes one partial output vector per head and tile plus its running
+  maximum and normalizer. `attention_flash_combine_kernel` merges them with the
+  log-sum-exp rescaling, one 64-dim slice of one head per block, and applies the
+  attention gate as `sigmoid(gate)` before the output write.
+- The dynamic variant reads `position` from a device parameter buffer for both
+  the split kernel and the merge, so a captured HIP Graph replays without
+  changing kernel arguments.
+
+The scores workspace is the partials arena: `heads * ntiles * (head_dim + 2)`
+floats with `ntiles = ceil(capacity / tile)`, the outputs first and then two
+floats per head and tile. `decodeAttentionScratch` in `engine/gpu/model.go`
+allocates it and must agree with `flash_tile` in the kernel.
+
+Shapes outside the tiled kernel's template set keep the serial reference
+implementation `attention_paged_f32_kernel`, one block per query head with a
+sequential position loop: head dimensions above 256, head dimensions not a
+multiple of four, and `heads / kv_heads` outside 1, 2, 4, 8. It is also the
+byte-for-byte reference the tiled kernel is compared against.
 
 `attention_prefill_paged_f32_kernel` keeps the same eight-query-row workgroup
 tiling and online softmax as the contiguous prefill kernel, but resolves each
@@ -879,8 +961,11 @@ size changes:
 | Q8_0 | `ceil(kv_dim/32)` groups of one FP16 scale plus 32 int8 values |
 
 `kv_write_paged` quantizes per 32-value group for Q8_0; attention kernels decode
-K and V through the same row format. Prefix-cache keys include the format so
-cached blocks are never reused across formats.
+K and V through the same row format. The split-key decode kernel reads one
+32-value Q8_0 group, one 8-byte F16 span, or one 16-byte F32 span per lane in
+the score phase, and a 4-value Q8_0 group, 4-byte F16 pair, or 8-byte F32 pair
+per lane in the value phase, so all three formats share one mapping. Prefix-cache
+keys include the format so cached blocks are never reused across formats.
 
 ### 7.4 Attention query layout
 

@@ -101,6 +101,7 @@ func run(cfg config) (err error) {
 		BlockSize:           blockSize,
 		PrefillChunk:        chunk,
 		KVType:              format.DType(),
+		KVTypeSet:           true,
 		ForceTiledAttention: cfg.forceTiled,
 	})
 	if err != nil {

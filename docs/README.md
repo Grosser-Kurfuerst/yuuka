@@ -172,8 +172,8 @@ Implemented and tested:
 - Paged KV with a block allocator, iteration-level continuous scheduling, a
   collision-safe prefix cache, opt-in HIP Graph replay, and an
   OpenAI-compatible server.
-- Opt-in F16 and Q8_0 KV formats with CPU and HIP write/attention kernels for
-  `qwen35`, and CPU support for `qwen35moe`.
+- Default F16 and opt-in F32/Q8_0 KV formats with CPU and HIP write/attention
+  kernels for `qwen35`, and CPU support for `qwen35moe`.
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
 - A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports

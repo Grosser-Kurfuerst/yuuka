@@ -47,6 +47,27 @@ func TestKVFormatRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDefaultKVFormatIsF16(t *testing.T) {
+	if DefaultKVFormat != KVF16 {
+		t.Fatalf("DefaultKVFormat = %s, want F16", DefaultKVFormat)
+	}
+	got, err := ParseKVFormat("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != KVF16 {
+		t.Fatalf("ParseKVFormat(\"\") = %s, want F16", got)
+	}
+	_, _, model := openTinyFixture(t)
+	state, err := NewState(model.Config, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format := state.Pool().Format(); format != KVF16 {
+		t.Fatalf("NewState pool format = %s, want F16", format)
+	}
+}
+
 func TestKVFormatPadsPartialQ8Block(t *testing.T) {
 	rowBytes, err := KVQ8_0.RowBytes(40)
 	if err != nil {

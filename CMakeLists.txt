@@ -41,6 +41,7 @@ if(YUUKA_ENABLE_HIP)
         kernels/hip/gemm/wmma_gemm.hip
         kernels/hip/gemm/mmq_gemm.hip
         kernels/hip/gemm/lm_head.hip
+        kernels/hip/gemv/gemv_row.hip
         kernels/hip/gemm/gemm_blas.hip
         kernels/hip/gemm/dequant.hip
         kernels/hip/moe/moe.hip

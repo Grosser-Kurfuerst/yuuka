@@ -56,10 +56,10 @@ type State struct {
 	owned    *memory.Allocator
 }
 
-// NewState allocates a private F32 KV pool and block table for capacity tokens.
-// capacity must not exceed the model context length.
+// NewState allocates a private KV pool in DefaultKVFormat and a block table for
+// capacity tokens. capacity must not exceed the model context length.
 func NewState(cfg *Config, capacity int) (*State, error) {
-	return NewStateWithFormat(cfg, capacity, KVF32)
+	return NewStateWithFormat(cfg, capacity, DefaultKVFormat)
 }
 
 // NewStateWithFormat allocates a private KV pool in format and a block table for

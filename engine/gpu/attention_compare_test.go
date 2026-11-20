@@ -66,9 +66,9 @@ func TestGPUAttentionPathsAgree(t *testing.T) {
 		blas bool
 	}
 	arms := []arm{
-		{name: "tiled", opts: Options{KVType: tensor.F16, ForceTiledAttention: true}},
-		{name: "mma", opts: Options{KVType: tensor.F16}, mma: true},
-		{name: "blas", opts: Options{KVType: tensor.F16, LegacyBlasAttention: true}, blas: true},
+		{name: "tiled", opts: Options{KVType: tensor.F16, KVTypeSet: true, ForceTiledAttention: true}},
+		{name: "mma", opts: Options{KVType: tensor.F16, KVTypeSet: true}, mma: true},
+		{name: "blas", opts: Options{KVType: tensor.F16, KVTypeSet: true, LegacyBlasAttention: true}, blas: true},
 	}
 	logits := make(map[string][]float32, len(arms))
 	for _, a := range arms {
@@ -286,7 +286,7 @@ func TestGPUQ8AttentionPathsAgree(t *testing.T) {
 			run := func(forceTiled bool) [][]float32 {
 				t.Helper()
 				rt, err := newRuntime(reader, model, tc.length+16, Options{
-					KVType: tensor.Q8_0, ForceTiledAttention: forceTiled,
+					KVType: tensor.Q8_0, KVTypeSet: true, ForceTiledAttention: forceTiled,
 				})
 				if err != nil {
 					t.Fatal(err)

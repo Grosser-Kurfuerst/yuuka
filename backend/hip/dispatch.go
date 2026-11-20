@@ -110,11 +110,15 @@ func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 }
 
 // lmHeadMinOutputs is the measured crossover below which the per-row GEMV is
-// still the better route. At 2560 input values the streaming kernel wins from
-// 512 outputs upward for Q4_K, Q5_K, and Q6_K and from 1536 upward for Q8_0 and
-// F16, where the vectorized GEMV is still ahead at 1024; 1024 is the smallest
-// width that covers every dtype without regressing one, and no output
-// projection sits between 512 and 1536. Sweeps: build/yuuka_prefill_sweep
+// still the better route. The threshold is shared by the one-row decode matvec
+// and the 1-16-row prefill tail, so it stays at the value measured for the
+// multi-row channel-parallel form: at 2560 input values that form wins from 512
+// outputs upward for Q4_K, Q5_K, and Q6_K and from 1536 upward for Q8_0 and F16.
+// After the one-row remap (gemv_row_kernel) the decode sweep measures the
+// streaming route ahead from 256 outputs for every dtype, but the shared
+// predicate cannot use that without a multi-row measurement for the same
+// widths; no supported model has an output projection between 512 and 1536, so
+// the difference is not reachable today. Sweeps: build/yuuka_prefill_sweep
 // (LMHEAD cells) and build/yuuka_gemv_decode_sweep --threshold.
 const lmHeadMinOutputs = 1024
 
@@ -127,11 +131,13 @@ const (
 	// is the fallback for shapes the streaming kernel does not cover and the
 	// reference the kernel test compares against.
 	DecodeGemvPerRow DecodeGemvPath = iota
-	// DecodeGemvStreaming is the channel-parallel streaming kernel: one wave
-	// owns four output channels and walks the K axis itself, every lane reads
-	// 16 bytes of packed weights per step, the activation row is staged in
-	// shared memory once per block, and the only reduction is one wave shuffle
-	// per channel.
+	// DecodeGemvStreaming is the streaming kernel family. A one-row block with
+	// a 512-value K step takes the remapped form (gemv_row_kernel): one wave per
+	// output row, sixteen K values per lane, no shared-memory staging and no
+	// barrier inside K. Other row counts and K widths take the channel-parallel
+	// form (lm_head_kernel): one wave owns four output channels over a
+	// 256-value staged activation step. Both reduce with one wave shuffle per
+	// output and keep the packed weights quantized.
 	DecodeGemvStreaming
 	// DecodeGemvInt8 is the same mapping over an int8 activation: the four
 	// packed digits of a lane are dotted against the Q8_1 activation word with
@@ -171,11 +177,12 @@ func (p DecodeGemvPath) String() string {
 // SelectDecodeGemvPath returns the measured decode matvec choice for a weight
 // dtype and shape. It shares the output projection's shape predicate: the
 // streaming mapping is bandwidth bound on every shape the decode graph
-// dispatches (measured 64-199 GB/s against 25-76 GB/s for the per-row form), and
-// the per-row GEMV stays below the crossover and for the shapes it cannot serve
-// (a K step that is not 256 values, or an unsupported dtype). Sharing one
-// predicate keeps the two tails and the layer matvecs from drifting apart; the
-// crossover measurement is in docs/benchmarks.md.
+// dispatches (measured 93-230 GB/s in step against 25-76 GB/s for the per-row
+// form), and the per-row GEMV stays below the crossover and for the shapes it
+// cannot serve (a K step that is not 512 values, an unsupported dtype, or more
+// than one row). Sharing one predicate keeps the two tails and the layer
+// matvecs from drifting apart; the crossover measurement is in
+// docs/benchmarks.md.
 //
 // The FP32 streaming kernel is the selected route for every dtype. The int8
 // route is implemented and reachable through int8Matvec, and it is measured

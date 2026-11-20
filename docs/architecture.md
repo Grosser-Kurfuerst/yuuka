@@ -321,7 +321,7 @@ block ID. A request owns a block table covering its prompt plus output budget;
 positions are resolved through that table by the CPU attention loop and by the
 paged HIP KV-write and attention kernels. Recurrent convolution and matrix
 state stay contiguous per session and are snapshotted for prefix reuse. The
-default block size is 16 tokens. F32 is the default KV storage; opt-in F16 and
+default block size is 16 tokens. F16 is the default KV storage; opt-in F32 and
 Q8_0 formats use the same block table and are selected through `--kv-type` for
 the `qwen35` CPU and HIP runtimes and the `qwen35moe` CPU runtime.
 The logical KV view exposed to model code does not expose physical block layout. Block allocation, reference counting, prefix sharing, cancellation, and

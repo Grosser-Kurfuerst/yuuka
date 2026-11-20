@@ -20,9 +20,9 @@ import (
 // TestGPUProfilePrefill attributes a prefill chunk (512 rows by default) at
 // several absolute positions with HIP events around every plan operation. It is
 // opt-in through YUUKA_TEST_MODEL because it loads the full model.
-// YUUKA_TEST_KV selects f32 (default) or f16 KV storage. The measurements are
-// diagnostic, not a benchmark under docs/testing.md: events add overhead and
-// clocks, power, and thermal state are not controlled.
+// YUUKA_TEST_KV selects f32 (the profile baseline) or f16 KV storage. These
+// diagnostic timings include HIP event overhead and use uncontrolled clocks,
+// power, and thermal conditions.
 // YUUKA_TEST_PROFILE_ROWS selects a comma-separated list of row counts.
 func TestGPUProfilePrefill(t *testing.T) {
 	path := os.Getenv("YUUKA_TEST_MODEL")

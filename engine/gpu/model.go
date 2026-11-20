@@ -14,6 +14,10 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
+// DefaultKVType is the full-attention KV pool storage used when
+// Options.KVTypeSet is false.
+const DefaultKVType = tensor.F16
+
 type weight struct {
 	buf   *hip.Buffer
 	dtype tensor.DType
@@ -85,9 +89,12 @@ type Options struct {
 	// reduced decode plan.
 	EnableGraph   bool
 	GraphMinSteps int
-	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
-	// Q8_0 are opt-in Phase 5 formats.
+	// KVType selects the full-attention KV pool storage when KVTypeSet is true.
+	// An unset selector uses DefaultKVType; tensor.F32 is the zero value, so it
+	// must set KVTypeSet to request the reference format explicitly.
 	KVType tensor.DType
+	// KVTypeSet distinguishes an explicit KVType from an unset selector.
+	KVTypeSet bool
 	// LegacyBlasAttention selects the rocBLAS prefill attention path for F16 KV
 	// pools. It is off by default: the FP16 MMA kernel covers the shapes this
 	// path can stage and is measured faster at every chunk length it accepts
@@ -199,7 +206,11 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 	if err := validateModelSupport(model); err != nil {
 		return nil, err
 	}
-	kvRow, err := hip.KVRowBytes(opts.KVType, int64(model.Config.KVHeadCount*model.Config.HeadDim))
+	kvType := opts.KVType
+	if !opts.KVTypeSet {
+		kvType = DefaultKVType
+	}
+	kvRow, err := hip.KVRowBytes(kvType, int64(model.Config.KVHeadCount*model.Config.HeadDim))
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +233,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		_ = device.Close()
 		return nil, err
 	}
-	useBlasAttention := opts.KVType == tensor.F16 && opts.LegacyBlasAttention
+	useBlasAttention := kvType == tensor.F16 && opts.LegacyBlasAttention
 	m := &Model{
 		attentionBlasCapable: useBlasAttention,
 		attentionBlasEnabled: useBlasAttention,
@@ -242,7 +253,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		blockSize:            opts.BlockSize,
 		blocks:               opts.Blocks,
 		capacity:             opts.Blocks * opts.BlockSize,
-		kvType:               opts.KVType,
+		kvType:               kvType,
 		kvRow:                kvRow,
 		poolK:                make([]*hip.Buffer, model.Config.BlockCount),
 		poolV:                make([]*hip.Buffer, model.Config.BlockCount),
@@ -327,6 +338,37 @@ func (m *Model) allocTransient(bytes uint64) (*hip.Buffer, error) {
 // buffers are not included; this is used by tests to detect growth.
 func (m *Model) Allocations() int { return len(m.all) }
 
+// decodeAttentionWideContext and decodeAttentionTile select the number of key
+// positions one split-key decode attention block owns, and must match
+// flash_tile in kernels/hip/attention/attention.hip: 32 positions below the
+// threshold, 64 above it.
+const (
+	decodeAttentionWideContext = 1024
+	decodeAttentionTile        = 32
+	decodeAttentionWideTile    = 64
+)
+
+// decodeAttentionScratch returns the float count of the decode attention
+// workspace. The tiled kernel writes one partial output vector per head and tile
+// plus a running max and normalizer per head and tile, laid out as
+// heads * ntiles * (headDim + 2) floats with ntiles = ceil(capacity / tile).
+// The serial fallback needs heads * scoreStride floats, so the workspace is the
+// larger of the two. scoreStride is the per-head score stride the plan passes
+// (the model capacity), which bounds capacity.
+func decodeAttentionScratch(heads, headDim, scoreStride, capacity int) uint64 {
+	tile := decodeAttentionTile
+	if capacity > decodeAttentionWideContext {
+		tile = decodeAttentionWideTile
+	}
+	tiles := (capacity + tile - 1) / tile
+	tiled := heads * tiles * (headDim + 2)
+	serial := heads * scoreStride
+	if tiled > serial {
+		return uint64(tiled)
+	}
+	return uint64(serial)
+}
+
 func (m *Model) allocActivations() error {
 	cfg := m.config
 	var err error
@@ -351,7 +393,7 @@ func (m *Model) allocActivations() error {
 		{&m.act.ffnGate, uint64(cfg.FFNSize)},
 		{&m.act.ffnUp, uint64(cfg.FFNSize)},
 		{&m.act.logits, uint64(cfg.VocabSize)},
-		{&m.act.scores, uint64(cfg.HeadCount * m.capacity)},
+		{&m.act.scores, decodeAttentionScratch(cfg.HeadCount, int(cfg.HeadDim), m.capacity, m.capacity)},
 	}
 	for _, entry := range sizes {
 		buf, err := m.allocDevice(entry.n * 4)

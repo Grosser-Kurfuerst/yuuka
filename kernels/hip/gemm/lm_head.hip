@@ -311,6 +311,16 @@ void launch_lm_head_pair(float * out0, float * out1, const float * x,
                          const uint8_t * w0, const uint8_t * w1, int64_t n_in,
                          int64_t n_out0, int64_t n_out1, int64_t row_bytes,
                          uint32_t dtype, bool swiglu, hipStream_t stream) {
+    // The pair form follows the single-row dispatch: a 512-value K step takes
+    // the remapped kernel and keeps the activation row shared by both matrices.
+    if (yuuka::gemv_row_available(dtype, static_cast<uint64_t>(n_in))) {
+        yuuka::launch_gemv_row_pair_f32out(
+            out0, out1, x, w0, w1, static_cast<uint64_t>(n_in),
+            static_cast<uint64_t>(n_out0), static_cast<uint64_t>(n_out1), dtype,
+            swiglu ? 1 : 0, stream);
+        return;
+    }
+    (void)row_bytes;
     switch (dtype) {
         case YUUKA_DTYPE_F32:
             launch_lm_head_pair_tile<YUUKA_DTYPE_F32>(out0, out1, x, w0, w1, n_in,
@@ -357,22 +367,6 @@ void launch_lm_head_pair(float * out0, float * out1, const float * x,
     }
 }
 
-// row_bytes_for returns the packed row width of one dtype, or zero when the
-// dtype has no packed row in this kernel.
-uint64_t row_bytes_for(uint32_t dtype, uint64_t n_in) {
-    switch (dtype) {
-        case YUUKA_DTYPE_F32: return n_in * 4;
-        case YUUKA_DTYPE_F16: return n_in * 2;
-        case YUUKA_DTYPE_Q4_0: return (n_in / 32) * 18;
-        case YUUKA_DTYPE_Q5_0: return (n_in / 32) * 22;
-        case YUUKA_DTYPE_Q8_0: return (n_in / 32) * 34;
-        case YUUKA_DTYPE_Q4_K: return (n_in / 256) * 144;
-        case YUUKA_DTYPE_Q5_K: return (n_in / 256) * 176;
-        case YUUKA_DTYPE_Q6_K: return (n_in / 256) * 210;
-        default: return 0;
-    }
-}
-
 } // namespace
 
 namespace {
@@ -382,6 +376,14 @@ namespace {
 void dispatch_lm_head_tile(float * out, const float * x, const uint8_t * w,
                            const float * res, int64_t n_in, int64_t n_out, int64_t rows,
                            int64_t row_bytes, uint32_t dtype, hipStream_t stream) {
+    // One row block on a 512-value K step takes the remapped kernel: one wave
+    // per output row, wide packed spans, no K-step barrier. Other row counts and
+    // K widths keep the streaming tile below.
+    if (rows == 1 && yuuka::gemv_row_available(dtype, static_cast<uint64_t>(n_in))) {
+        yuuka::launch_gemv_row_f32out(out, x, w, res, static_cast<uint64_t>(n_in),
+                               static_cast<uint64_t>(n_out), dtype, stream);
+        return;
+    }
     switch (dtype) {
         case YUUKA_DTYPE_F32:
             launch_lm_head_tile<YUUKA_DTYPE_F32>(out, x, w, res, n_in, n_out, rows,
@@ -438,7 +440,7 @@ void launch_lm_head_pair_f32out(float * out0, float * out1, const float * x,
     if (n_in == 0 || n_out0 == 0 || n_out1 == 0 || n_in % kStepK != 0) {
         return;
     }
-    const uint64_t row_bytes = row_bytes_for(dtype, n_in);
+    const uint64_t row_bytes = yuuka_packed_row_bytes(dtype, n_in);
     if (row_bytes == 0) {
         return;
     }
@@ -455,7 +457,7 @@ void launch_lm_head_residual_f32out(float * out, const float * x, const void * w
         n_in % kStepK != 0) {
         return;
     }
-    const uint64_t row_bytes = row_bytes_for(dtype, n_in);
+    const uint64_t row_bytes = yuuka_packed_row_bytes(dtype, n_in);
     if (row_bytes == 0) {
         return;
     }

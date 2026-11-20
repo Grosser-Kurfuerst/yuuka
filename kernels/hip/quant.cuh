@@ -386,3 +386,175 @@ __device__ __forceinline__ void decode_span4_i8(const uint8_t * row, int64_t k,
         bias = 0.0f;
     }
 }
+
+// yuuka_packed_row_bytes returns the byte width of one packed weight row, or zero for
+// a dtype this file does not decode. The kernel launchers and the Go planner
+// share the same table.
+inline uint64_t yuuka_packed_row_bytes(uint32_t dtype, uint64_t n_in) {
+    switch (dtype) {
+        case YUUKA_DTYPE_F32: return n_in * 4;
+        case YUUKA_DTYPE_F16: return n_in * 2;
+        case YUUKA_DTYPE_Q4_0: return (n_in / 32) * 18;
+        case YUUKA_DTYPE_Q5_0: return (n_in / 32) * 22;
+        case YUUKA_DTYPE_Q8_0: return (n_in / 32) * 34;
+        case YUUKA_DTYPE_Q4_K: return (n_in / 256) * 144;
+        case YUUKA_DTYPE_Q5_K: return (n_in / 256) * 176;
+        case YUUKA_DTYPE_Q6_K: return (n_in / 256) * 210;
+        default: return 0;
+    }
+}
+
+// load_span16 loads sixteen contiguous packed bytes into four words. Q6_K,
+// Q8_0, Q4_0, and Q5_0 rows have strides that are not a multiple of sixteen
+// bytes, so their span base is only two-byte aligned and the bytes are copied
+// rather than read as one vector; Q4_K and Q5_K are sixteen-byte aligned and use
+// a vector load directly.
+__device__ __forceinline__ void load_span16(const uint8_t * p, uint32_t words[4]) {
+    __builtin_memcpy(words, p, 16);
+}
+
+// decode_span16 writes the sixteen consecutive values of one packed weight row
+// that start at k. It is the wide form of decode_span4 for the remapped decode
+// matvec: a lane owns sixteen K values, so a warp covers 512 values with one
+// eight- to sixteen-byte load per lane, and the kernel never stages the
+// activation row. Every dtype reads the bytes of its quantization block that
+// cover the span, hoists the block scale and minimum out of the sixteen values,
+// and restates the same arithmetic as decode_span4.
+//
+// The contract is that k is a multiple of sixteen and that the span lies inside
+// one scale block, which a 512-value K step and a sixteen-values-per-lane
+// mapping guarantee for the dtypes served here.
+template <uint32_t DType>
+__device__ __forceinline__ void decode_span16(const uint8_t * row, int64_t k,
+                                              float w[16]) {
+    if constexpr (DType == YUUKA_DTYPE_F32) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 v = *reinterpret_cast<const float4 *>(row + (k + 4 * i) * 4);
+            w[4 * i + 0] = v.x;
+            w[4 * i + 1] = v.y;
+            w[4 * i + 2] = v.z;
+            w[4 * i + 3] = v.w;
+        }
+    } else if constexpr (DType == YUUKA_DTYPE_F16) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const __half2 h = *reinterpret_cast<const __half2 *>(row + (k + 2 * i) * 2);
+            const float2 v = __half22float2(h);
+            w[2 * i + 0] = v.x;
+            w[2 * i + 1] = v.y;
+        }
+    } else if constexpr (DType == YUUKA_DTYPE_Q8_0) {
+        const uint8_t * blk = row + (k / 32) * 34;
+        const int within = static_cast<int>(k & 31);
+        const float d = load_f16_device(blk);
+        uint32_t words[4];
+        load_span16(blk + 2 + within, words);
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t byte = (words[i / 4] >> (8 * (i % 4))) & 0xFF;
+            w[i] = d * static_cast<float>(static_cast<int8_t>(byte));
+        }
+    } else if constexpr (DType == YUUKA_DTYPE_Q4_0) {
+        const uint8_t * blk = row + (k / 32) * 18;
+        const int within = static_cast<int>(k & 31);
+        const float d = load_f16_device(blk);
+        uint32_t words[4];
+        load_span16(blk + 2, words);
+        const int shift = within < 16 ? 0 : 4;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int q = static_cast<int>((words[i / 4] >> (8 * (i % 4) + shift)) & 0xF);
+            w[i] = d * static_cast<float>(q - 8);
+        }
+    } else if constexpr (DType == YUUKA_DTYPE_Q5_0) {
+        const uint8_t * blk = row + (k / 32) * 22;
+        const int within = static_cast<int>(k & 31);
+        const float d = load_f16_device(blk);
+        uint32_t words[4];
+        load_span16(blk + 6, words);
+        uint32_t high = 0;
+        __builtin_memcpy(&high, blk + 2, 4);
+        high >>= within;
+        const int shift = within < 16 ? 0 : 4;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int q = static_cast<int>((words[i / 4] >> (8 * (i % 4) + shift)) & 0xF) |
+                          (static_cast<int>((high >> i) & 1) << 4);
+            w[i] = d * static_cast<float>(q - 16);
+        }
+    } else if constexpr (DType == YUUKA_DTYPE_Q4_K) {
+        const uint8_t * blk = row + (k / 256) * 144;
+        const int j = static_cast<int>(k & 255);
+        const int sub = j / 32;
+        const int within = j & 31;
+        uint8_t sc = 0;
+        uint8_t m = 0;
+        get_scale_min_k4(sub, blk + 4, sc, m);
+        const float ds = load_f16_device(blk) * static_cast<float>(sc);
+        const float dm = load_f16_device(blk + 2) * static_cast<float>(m);
+        const uint8_t * qs = blk + 16 + (sub / 2) * 32 + within;
+        // A Q4_K row stride is a multiple of 144 bytes and within is 0 or 16,
+        // so the span is sixteen-byte aligned.
+        const uint4 raw = *reinterpret_cast<const uint4 *>(qs);
+        const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+        const int shift = (sub & 1) ? 4 : 0;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int q = static_cast<int>((words[i / 4] >> (8 * (i % 4) + shift)) & 0xF);
+            w[i] = ds * static_cast<float>(q) - dm;
+        }
+    } else if constexpr (DType == YUUKA_DTYPE_Q5_K) {
+        const uint8_t * blk = row + (k / 256) * 176;
+        const int j = static_cast<int>(k & 255);
+        const int sub = j / 32;
+        const int within = j & 31;
+        uint8_t sc = 0;
+        uint8_t m = 0;
+        get_scale_min_k4(sub, blk + 4, sc, m);
+        const float ds = load_f16_device(blk) * static_cast<float>(sc);
+        const float dm = load_f16_device(blk + 2) * static_cast<float>(m);
+        const uint8_t * ql = blk + 48 + (sub / 2) * 32 + within;
+        const uint8_t * qh = blk + 16 + within;
+        // A Q5_K row stride is a multiple of 176 bytes and within is 0 or 16,
+        // so both spans are sixteen-byte aligned.
+        const uint4 raw = *reinterpret_cast<const uint4 *>(ql);
+        const uint4 hi = *reinterpret_cast<const uint4 *>(qh);
+        const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+        const uint32_t highs[4] = {hi.x, hi.y, hi.z, hi.w};
+        const int shift = (sub & 1) ? 4 : 0;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            int q = static_cast<int>((words[i / 4] >> (8 * (i % 4) + shift)) & 0xF);
+            if ((highs[i / 4] >> (8 * (i % 4))) & (1u << sub)) {
+                q += 16;
+            }
+            w[i] = ds * static_cast<float>(q) - dm;
+        }
+    } else {
+        static_assert(DType == YUUKA_DTYPE_Q6_K, "unsupported span dtype");
+        const uint8_t * blk = row + (k / 256) * 210;
+        const int j = static_cast<int>(k & 255);
+        const int half = j / 128;
+        const int l = j & 127;
+        const int seg = l / 32;
+        const int within = l & 31;
+        const uint8_t * ql = blk + half * 64 + 32 * (seg & 1) + within;
+        const uint8_t * qh = blk + 128 + half * 32 + within;
+        const int sc = static_cast<int>(reinterpret_cast<const int8_t *>(
+            blk + 192 + half * 8)[2 * seg + within / 16]);
+        const float d = load_f16_device(blk + 208) * static_cast<float>(sc);
+        uint32_t qlw[4];
+        uint32_t qhw[4];
+        load_span16(ql, qlw);
+        load_span16(qh, qhw);
+        const int nibble = (seg & 2) ? 4 : 0;
+        const int bits = 2 * seg;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int q = static_cast<int>((qlw[i / 4] >> (8 * (i % 4) + nibble)) & 0xF) |
+                          (static_cast<int>((qhw[i / 4] >> (8 * (i % 4) + bits)) & 3) << 4);
+            w[i] = d * static_cast<float>(q - 32);
+        }
+    }
+}

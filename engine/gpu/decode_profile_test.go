@@ -19,12 +19,15 @@ import (
 // decode kernel lands, because each change moves them by design: 97.6 ms before
 // the streaming matvec family, 89.4 ms after the streaming LM head, 31.6 ms
 // after the matvec family moved to the streaming kernel, 24.3 ms after the fused
-// gated delta-net, and the values below after the residual and gate/up fusions.
-// The measured history stays in docs/benchmarks.md.
+// gated delta-net, 23.4 ms after the residual and gate/up fusions, 17.3 ms after
+// decode attention was split over the key range and the matvec was remapped to
+// one wave per row, and 17.1 ms after the norms were rewritten around a wave
+// reduction and the beta/alpha projections were merged. The measured history
+// stays in docs/benchmarks.md.
 const (
-	decodeBaselineOps     = 379
-	decodeBaselineTotalMS = 23.400
-	decodeBaselineGemvMS  = 21.050
+	decodeBaselineOps     = 355
+	decodeBaselineTotalMS = 17.070
+	decodeBaselineGemvMS  = 15.400
 )
 
 // Gate bands. Device clocks are not pinned, so the absolute total is only gated
@@ -42,12 +45,47 @@ const (
 // a submission gap per operation, so the absolute numbers are a diagnosis, not
 // a release measurement; see docs/testing.md section 6.3.
 func TestGPUProfileDecode(t *testing.T) {
-	reader, _, model, prompt := goldenPrompt(t)
+	reader, tok, model, prompt := goldenPrompt(t)
+	// YUUKA_TEST_DECODE_CONTEXT extends the prompt so the same attribution can be
+	// produced at a longer decode context, which is how the split-key attention
+	// per-layer cost is gated. Unset profiles the short golden prompt.
+	context := 64
+	if value := os.Getenv("YUUKA_TEST_DECODE_CONTEXT"); value != "" {
+		if _, err := fmt.Sscanf(value, "%d", &context); err != nil || context < 8 {
+			t.Fatalf("YUUKA_TEST_DECODE_CONTEXT=%q is not a token count", value)
+		}
+	}
+	if context > len(prompt) {
+		ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", context/8+2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ids) < context {
+			t.Fatalf("tokenizer produced %d tokens, need %d", len(ids), context)
+		}
+		prompt = ids[:context]
+	}
 	// YUUKA_TEST_DECODE_INT8 selects the int8 decode matvec so the
 	// same attribution can be produced for each variant: "fused" quantizes inside
 	// the matvec block, "prequantized" submits one quantization operation per
 	// activation group. Unset keeps the default FP32 streaming route.
 	opts := Options{}
+	// YUUKA_TEST_DECODE_KV selects the KV pool format, so the same attribution and
+	// the same attention gate run for F32, F16, and Q8_0.
+	switch kv := os.Getenv("YUUKA_TEST_DECODE_KV"); kv {
+	case "":
+	case "f32":
+		opts.KVType = tensor.F32
+		opts.KVTypeSet = true
+	case "f16":
+		opts.KVType = tensor.F16
+		opts.KVTypeSet = true
+	case "q8_0":
+		opts.KVType = tensor.Q8_0
+		opts.KVTypeSet = true
+	default:
+		t.Fatalf("YUUKA_TEST_DECODE_KV=%q is not f32, f16, or q8_0", kv)
+	}
 	route := "fp32 streaming"
 	// YUUKA_TEST_DECODE_UNFUSED=1 builds the plan without the residual epilogue
 	// and gate/up pair, which is how the same-session A/B measured the fusions.
@@ -68,17 +106,24 @@ func TestGPUProfileDecode(t *testing.T) {
 	default:
 		t.Fatalf("YUUKA_TEST_DECODE_INT8=%q is not 'fused' or 'prequantized'", route8)
 	}
-	rt, err := newRuntime(reader, model, 64, opts)
+	rt, err := newRuntime(reader, model, context+64, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
-	t.Logf("decode matvec route: %s", route)
+	t.Logf("decode matvec route: %s, decode context %d", route, context)
 	defer rt.Close()
 	logits, err := rt.Forward(prompt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	token := argmax(logits)
+	// One unprofiled decode step warms the decode-only weight rows and the KV
+	// pages, so the attribution does not carry the first-touch fault of
+	// blk.0.ssm_beta, which is otherwise the slowest single operation.
+	warm, err := rt.Step(argmax(logits))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := argmax(warm)
 	times, err := rt.ProfileStep(token)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +140,41 @@ func TestGPUProfileDecode(t *testing.T) {
 	samples := decodeSamples(shadow, times, names)
 	report := newDecodeReport(samples)
 	printDecodeReport(t, rt, report)
-	checkDecodeGates(t, report)
+	// The operation count and the matvec share are recorded for the default
+	// route; the int8 and unfused variants add quantization operations and drop
+	// fusions by design, so they are reported without that gate.
+	if route == "fp32 streaming" {
+		checkDecodeGates(t, report)
+	}
+	checkDecodeAttentionGate(t, report, context)
+}
+
+// decodeAttentionPerLayerGate is the split-key attention cost a 512-token decode
+// context must stay under. The serial position loop cost 1.04 ms per layer at
+// that context.
+const decodeAttentionPerLayerGate = 0.05
+
+// checkDecodeAttentionGate enforces the split-key acceptance cost at the
+// 512-token context it was written for and reports the cost at longer contexts.
+// Those rows are measurements, not gates: the cost is the KV pool bytes, and at
+// 2048 tokens one F32 layer already moves 16 MB, which is 68 us per layer at the
+// 235 GB/s read ceiling regardless of the kernel.
+func checkDecodeAttentionGate(t *testing.T, r *decodeReport, context int) {
+	t.Helper()
+	for _, row := range r.codes {
+		if row.code != hip.OpAttentionPaged || row.ops == 0 {
+			continue
+		}
+		perLayer := row.ms / float64(row.ops)
+		if context == 512 && perLayer > decodeAttentionPerLayerGate {
+			t.Fatalf("decode attention costs %.4f ms per layer at a 512-token context,"+
+				" the gate is %.3f ms", perLayer, decodeAttentionPerLayerGate)
+		}
+		t.Logf("decode attention %.4f ms per layer at a %d-token context"+
+			" (%s %.3f ms)", perLayer, context,
+			map[bool]string{true: "gate", false: "recorded"}[context == 512],
+			decodeAttentionPerLayerGate)
+	}
 }
 
 // decodeSample is one profiled operation with the model buffer that produced it

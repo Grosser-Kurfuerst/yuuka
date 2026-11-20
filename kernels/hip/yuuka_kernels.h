@@ -191,6 +191,11 @@ void launch_attention_f32(float * out, const float * q, const float * k_cache,
                           const float * v_cache, float * scores,
                           int kv_heads, int heads, int head_dim, int kv_dim,
                           int position, int capacity, float scale, hipStream_t stream);
+/* launch_attention_paged_f32 runs single-token paged attention. The tiled path
+ * (one block per KV head and key tile, split-key online softmax) writes its
+ * partials into scores, which must hold
+ * heads * ceil(score_stride / tile) * (head_dim + 2) floats for the tile the
+ * launcher chooses; the serial fallback needs heads * score_stride floats. */
 void launch_attention_paged_f32(float * out, const float * q, const void * k_pool,
                                 const void * v_pool, float * scores,
                                 const int32_t * block_table, int block_size,
@@ -233,6 +238,26 @@ void launch_embedding_f32(float * out, const void * weights, int32_t token,
 void launch_embedding_dynamic_f32(float * out, const void * weights,
                                   const int32_t * dynamic, uint64_t row_bytes,
                                   int64_t cols, uint32_t dtype, hipStream_t stream);
+
+/* Remapped decode matvec: one wave per output row, sixteen K values per lane,
+ * no shared-memory staging and no barrier inside K. gemv_row_available reports
+ * whether the shape is covered (a 512-value K step and a supported dtype);
+ * the launchers are only valid when it returns true and rows is one. */
+bool gemv_row_available(uint32_t dtype, uint64_t n_in);
+void launch_gemv_row_f32out(float * out, const float * x, const void * w,
+                            const float * res, uint64_t n_in, uint64_t n_out,
+                            uint32_t dtype, hipStream_t stream);
+void launch_gemv_row_pair_f32out(float * out0, float * out1, const float * x,
+                                 const void * w0, const void * w1, uint64_t n_in,
+                                 uint64_t n_out0, uint64_t n_out1, uint32_t dtype,
+                                 int swiglu, hipStream_t stream);
+/* The same remapped mapping over a Q8_1 activation row: qs holds one int8 digit
+ * per activation value and ds one float2 block scale per 32 values. Only the
+ * dtypes whose per-value form is an integer plus an affine block scale are
+ * covered. */
+void launch_gemv_row_i8_f32out(float * out, const void * qs, const void * ds,
+                               const void * w, uint64_t n_in, uint64_t n_out,
+                               uint32_t dtype, hipStream_t stream);
 
 /* Chunked prefill operators. Every row-pointer argument is a contiguous
  * [rows, width] buffer in row-major order. position is the token position of

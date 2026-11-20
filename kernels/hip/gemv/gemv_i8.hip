@@ -301,6 +301,13 @@ void launch_gemv_i8_f32out(float * out, const void * qs, const void * ds,
     if (row_bytes == 0) {
         return;
     }
+    // A 512-value K step takes the remapped one-row mapping, which over a Q8_1
+    // activation is the fastest decode matvec measured; other K widths keep the
+    // channel-parallel form below.
+    if (n_in % 512 == 0) {
+        yuuka::launch_gemv_row_i8_f32out(out, qs, ds, w, n_in, n_out, dtype, stream);
+        return;
+    }
     const auto * weights = static_cast<const uint8_t *>(w);
     const auto * quantized = static_cast<const int8_t *>(qs);
     const auto * scales = static_cast<const float2 *>(ds);

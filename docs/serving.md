@@ -12,7 +12,7 @@ Current implementation:
   request, queue, batch, chunk, timeout, and concurrency limits.
 - Paged KV cache: a reference-counted block allocator, per-request immutable
   block tables, shared prefix blocks, and explicit release on cancellation and
-  failure. The pool defaults to FP32; F16 and Q8_0 are opt-in through
+  failure. The pool defaults to F16; F32 and Q8_0 are opt-in through
   `--kv-type`.
 - Prefix cache keyed by the model identity, block size, and exact token prefix.
   Entries retain KV blocks, the recurrent state snapshot, and the prompt logits.
@@ -216,8 +216,8 @@ Requirements and current behavior:
 
 ### 7.1 Configuration
 
-- F32 keys and values by default. `--kv-type f16` and `--kv-type q8_0` select
-  opt-in F16 and Q8_0 pools for the `qwen35` CPU and HIP backends and the
+- F16 keys and values by default. `--kv-type f32` and `--kv-type q8_0` select
+  opt-in F32 and Q8_0 pools for the `qwen35` CPU and HIP backends and the
   `qwen35moe` CPU backend. The prefix-cache model key includes the format, and
   the F32 path remains the numerical baseline.
 - HIP paged prefill attention runs the FP16 MMA kernel (and measured split-key
