@@ -498,7 +498,7 @@ static LDS, with no FP16 weight scratch. The launch requires a multiple
 of 256 input values, a multiple of 128 output channels, and 16-byte
 aligned activations. Q4_K and Q5_K weights require 16-byte alignment.
 Q6_K weights require two-byte alignment. All other calls use the legacy
-tile selection. See the [Direct FP16 acceptance record](prefill-optimization/phase2/acceptance/04b-direct-fp16-wmma.md).
+tile selection.
 
 ### 6.3 Int8 MMQ GEMM
 
@@ -609,7 +609,7 @@ The combined prefill and decode ABI 9 assigns it opcode 43 and assigns
 opcodes 38–42 to the fused decode operations. The fused quantizer
 uses the plain quantizer's scale, rounding and sum rules and skips
 materializing the activated FP32 tensor. The compact final FFN uses
-its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/phase1/acceptance/05-ffn-fusion.md)
+its parent chunk's dispatch.
 
 #### gfx1151 narrow Q8_0 pair
 
@@ -621,7 +621,7 @@ registers. A wave reuses the activation fragment across both WMMA
 products and preserves the legacy FP32 accumulation order.
 
 `PREFILL_Q8_0_PAIR` is opcode 44 in ABI 10. The old projection
-routes cover other shapes, dtypes and devices. [Narrow pair validation and timing](prefill-optimization/phase2/acceptance/06-narrow-q8-projections.md)
+routes cover other shapes, dtypes and devices.
 
 #### gfx1151 direct MMQ specialization
 
@@ -652,7 +652,7 @@ A workgroup returns before the first barrier if its half has no valid
 tokens. A partial half zeros invalid activation digits and scales and
 suppresses stores for those rows. Batches whose row count is a multiple
 of 128 use variants compiled without mask code. The shared-memory
-allocation is 30 KiB. [Workgroup mapping measurements](prefill-optimization/phase2/acceptance/11-direct-mmq-swizzle.md)
+allocation is 30 KiB.
 
 Within each 512-byte operand region, the specialized LDS layout stores
 two contiguous 16-value slices per row. Both halves of each wave load the
@@ -664,15 +664,13 @@ plane for each of the same subblocks. Each activation block uses
 staging thread writes the FP32 scale and scaled sum once. The kernel
 completes both integer WMMA instructions and
 FP32 scale/min correction of each fragment before consuming the next
-fragment. [FFN cell](prefill-optimization/phase1/acceptance/02-q4-ffn.md) ·
-[Additional projections](prefill-optimization/phase1/acceptance/04a-mmq-shapes.md)
+fragment.
 
 For Q6_K, eight packed four-byte operations unpack each 32-value
 region using two-byte-aligned loads. Two independent signed WMMA
 results use the Q6_K scale of their respective 16-value slices.
 The FP32 epilogue applies them in the original low-to-high K order
-with the shared Q8_1 activation scale. [FFN down validation](prefill-optimization/phase2/acceptance/07a-direct-q6k-ffn.md) ·
-[Attention V and full-prompt validation](prefill-optimization/phase2/acceptance/07b-direct-q6k-attention.md)
+with the shared Q8_1 activation scale.
 
 ### 6.4 Dispatch
 
@@ -699,7 +697,6 @@ the numeric gates. The short K-quant route uses `AddLMHeadAt` and retains
 FP32 activations. For complete 16-row blocks with aligned activations, the
 kernel stages four contiguous floats per load. Its point products and wave
 reduction use the same arithmetic as the scalar staging path.
-See the [short-tail acceptance record](prefill-optimization/phase2/acceptance/04a-streaming-short-tails.md).
 The K-quant MMQ route starts at 128 rows to keep the measured sub-128
 numerical contract. It requires `N >= 64` because narrower output tiles
 waste more than half the tile. It
@@ -743,7 +740,6 @@ projection and attention routes. RoPE and paged attention use the
 last prompt position via the ABI 7 token displacement. An intermediate
 chunk ends after the final K/V write. Speculative verification computes
 every requested row through attention and FFN.
-[Validation and timings](prefill-optimization/phase1/acceptance/06-final-query.md)
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
 projection in the prefill and decode tails. A decode matvec with one row and a
@@ -890,8 +886,7 @@ default 512, maximum 4096). On gfx1151, `yuuka run` and `yuuka bench`
 use 1024 for 1024–8192 input tokens on the Qwen3.5-4B Q4_K_M
 geometry with F16 KV when `--chunk-size` is omitted. The CLI uses
 the token count after chat rendering or benchmark truncation. An
-explicit value takes precedence. See the [CLI chunk sweep and
-validation](prefill-optimization/phase2/acceptance/05-cli-chunk-policy.md).
+explicit value takes precedence.
 KV writes for a chunk happen before its attention, so later chunks
 see the full causal prefix. The runtime builds and caches one plan per
 chunk length. Only the final chunk executes the output tail.
@@ -1001,7 +996,6 @@ reader addresses physical page rows in their packed byte stride. Each
 32-digit block has one FP16 scale. The gather multiplies the signed
 digits by the scale in FP32 and converts to half for the shared tile.
 Causal padding writes zeros without reading any masked key slots.
-[Q8_0 WMMA acceptance](prefill-optimization/phase2/acceptance/08c-q8-kv-wmma.md)
 
 Score orientation. The score product runs as `S^T = K Q^T` rather than
 `S = Q K^T`, so both operands are row major in shared memory: K keeps the
@@ -1071,15 +1065,12 @@ output tail use the unsplit policy. The F32 and Q8_0 paths stage K alone
 during the max scan. Their partials read the same KV storage format as
 unsplit WMMA. The merge applies the output gate once.
 
-[Cross-format split acceptance](prefill-optimization/phase2/acceptance/08d-cross-format-split.md)
-
 A score-only pass over the leading 512 keys supplies a starting maximum
 for the later ranges. Each range keeps its own online FP32 maximum, sum
 and value accumulator. A wave merges the records for each row and head,
 then applies the output gate. ABI 8 binds the optional FP32 records and
 prefix maxima in slot 6. The plan reuses this scratch across layers on
-the same stream. [Original F16 acceptance](prefill-optimization/phase1/acceptance/07-long-attention.md) ·
-[Expanded F16 cells](prefill-optimization/phase2/acceptance/08b-f16-split-cells.md)
+the same stream.
 
 The earlier group-of-four tiled kernel (`attention_prefill_paged_gqa_f32_kernel`)
 is removed: the MMA kernel serves the same group at every shape the tiled kernel
@@ -1162,8 +1153,7 @@ traffic without reducing occupancy:
   launch writes the normalized Q/K per token and key group, and the decay
   and beta per token and head. The core reads these FP32 arrays with no
   per-token block barriers. The FFN and recurrence use the scratch in stream
-  order. The [short-chunk sweep](prefill-optimization/phase2/acceptance/03-sub128-gdn.md)
-  measures the crossover. The scratch slot is available from C ABI 5 and is mutually exclusive
+  order. The scratch slot is available from C ABI 5 and is mutually exclusive
   with the triangular scratch slot. Without either span, the register core
   recomputes Q/K per column workgroup using two block barriers per row.
   Both cores sum `S^T k` and `S^T q` across the four lanes with shuffles.
@@ -1172,7 +1162,6 @@ traffic without reducing occupancy:
   per-head normalization domain. State sizes other than 128 use the fused
   one-column-per-thread kernel, which reads and writes the state for every row.
   Both paths keep the row-major state layout shared with the decode kernel.
-  [Prepared recurrence measurements](prefill-optimization/phase1/acceptance/04b-gdn.md)
 
 ## 9. Gated delta-net
 

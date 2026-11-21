@@ -88,7 +88,7 @@ Current tree, same commit:
 | --- | --- |
 | `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE, deltanet, plan validation; 10 / 10 at `9aaf432`, 9 / 9 at `d56ad88`) | 10 / 10 pass |
 | `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
-| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00004673` with [short-chunk FP32 streaming](prefill-optimization/phase2/acceptance/04a-streaming-short-tails.md), greedy tokens match |
+| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00004673` with short-chunk FP32 streaming, greedy tokens match |
 | `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.9e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
 | `tests/hip/prefill_test.cpp` LM head checks | every dtype within `1.3e-4` of the host dot products for 1/3/16 rows, bitwise reproducible |
 | `TestPlanLMHeadMatchesDequant` | Q8_0 bitwise equal to the dequantized CPU dot; Q6_K within `2e-6` |
@@ -122,8 +122,7 @@ streaming, `17..127` Direct FP16 WMMA, `>= 128` arbitrary-row Direct MMQ, `>= 2`
 prepared GDN), sped up `8192`-token `Q8_0` KV prefill from `1105 tok/s` to
 `2114–2122 tok/s` (unsplit WMMA + split-key), reduced `16384`-token `F32` KV
 prefill by `~6.3%` via split-key attention, and moved prefix-cache snapshots off
-the critical path of the first SSE token (`yuuka-server`). Detailed per-stage
-records live under [prefill-optimization/phase2/acceptance](prefill-optimization/phase2/acceptance/README.md).
+the critical path of the first SSE token (`yuuka-server`).
 
 ### Baseline prompt-length sweep (commit `d56ad88`)
 
@@ -146,9 +145,9 @@ gave 1345.1 / 1626.2 / 1673.9 / 1409.2 tok/s at the four lengths, so the stage i
 chunk, which is a larger share of the shorter prompts. F32 and F16 KV are within
 4% of each other at every length, because both run the same attention kernel;
 Q8_0 used tiled attention in these samples and diverged from 2048 tokens.
-The F16 and Q8_0 columns are the pre-LM-head measurements. See the later
-[Q8_0 WMMA measurements](prefill-optimization/phase2/acceptance/08c-q8-kv-wmma.md)
-for the paired packed-KV comparison.
+The F16 and Q8_0 columns are the pre-LM-head measurements. In later paired
+`Q8_0` WMMA runs at `8192` tokens (`chunk=512`), unsplit `Q8_0` WMMA reached
+`2114–2122 tok/s` against `1105 tok/s` on the tiled kernel.
 
 Before this stage the same table read 1380.1 / 1704.8 / 1715.2 / 1441.7 tok/s for
 F32 KV at `161fbba`. That earlier row was measured after the FP16 MMA prefill
@@ -159,26 +158,13 @@ current ones by 0.5-1.6% at the longer prompts, which is the run-to-run noise of
 an unpinned clock on this device, so the same-session A/B above is the number to
 compare the LM head stage against.
 
-The [Q4_K FFN specialization acceptance](prefill-optimization/phase1/acceptance/02-q4-ffn.md)
-records the 2026-11-19 gfx1151 prefill comparison using F16 KV,
-including isolated MMQ, complete FFN and prompt-length medians.
-The [final FFN acceptance](prefill-optimization/phase1/acceptance/03-final-ffn.md)
-records the next F16 KV comparison, with one FFN row in the ordinary
-prefill output tail.
-The [MMQ shape expansion](prefill-optimization/phase1/acceptance/04a-mmq-shapes.md)
-records projection shape medians and the short- and long-prompt A/B.
-The [prepared GDN comparison](prefill-optimization/phase1/acceptance/04b-gdn.md)
-records the recurrence timings and the model-state comparison by lane mapping.
-The [FFN fusion comparison](prefill-optimization/phase1/acceptance/05-ffn-fusion.md)
-records the isolated quantizer check, complete FFN time and prompt rates.
-The [final query crop comparison](prefill-optimization/phase1/acceptance/06-final-query.md)
-records K/V equivalence, output work per chunk and the resulting prompt rates.
-The [long attention comparison](prefill-optimization/phase1/acceptance/07-long-attention.md)
-records split-key numerics, merge costs, scratch and the 8K chunk sweep.
-The [official v1.0.0 matched-input comparison](prefill-optimization/phase1/acceptance/08-upstream-comparison.md)
-records host logit latency and the per-length gate. At measured chunk settings
-the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
-2048 and 8192 tokens respectively.
+Successive Phase 1 stages on `gfx1151` with F16 KV added `Q4_K` FFN MMQ
+specialization, final-layer FFN cropping, expanded Direct MMQ projection shapes,
+prepared GDN recurrence, fused `SwiGLU + Q8_1` activation quantization, final
+query cropping after KV write, and split-key long attention. At measured chunk
+settings, the Phase 1 matched-input comparison against official `llama.cpp v1.0.0`
+reached prefill leads of +0.61%, +6.61%, +9.04%, and +6.69% at 128, 512, 2048,
+and 8192 tokens respectively before the Phase 2 improvements above.
 
 ## Decode: output length
 

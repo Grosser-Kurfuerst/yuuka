@@ -12,7 +12,6 @@ import (
 )
 
 // The gfx1151 sweep found prepared recurrence faster from two rows onward.
-// See docs/prefill-optimization/phase2/acceptance/03-sub128-gdn.md.
 const gdnPreparedMinRows = 2
 
 // prefillMatmul appends the measured implementation for one prefill matmul.
